@@ -1,0 +1,21 @@
+# Deep Learning & Object Detection
+torch
+torchvision
+torchaudio
+ultralytics
+
+# PaddlePaddle CPU build (to avoid CUDA conflicts with PyTorch/YOLO)
+paddlepaddle
+paddleocr
+
+# Web Server & UI
+Flask
+
+# Image Processing & Data
+opencv-python>=4.8.0
+pillow>=10.0.0
+numpy>=1.24.0
+
+# PDF Report Generation
+reportlab>=4.0.0
+pyyaml>=6.0

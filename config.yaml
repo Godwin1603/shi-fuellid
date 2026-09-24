@@ -1,0 +1,56 @@
+# SSP Production Configuration File
+
+# --- AI & Vision Settings ---
+ai:
+  # Path to the trained YOLO model
+  model_path: "SHI_FUEL_V1.pt"
+  # Confidence threshold for detecting the OCR target regions (serial, back, etc.)
+  ocr_confidence_threshold: 0.10
+  # Fallback timeout (in seconds) before attempting to read the back panel if serial is missing
+  ocr_fallback_timeout: 3.5
+  # Per-class YOLO confidence thresholds. If a class is not listed, the default threshold below is used.
+  class_confidences:
+    front: 0.70
+    back: 0.85
+    serial: 0.10
+    serial_area: 0.10
+    line_mark: 0.50
+    hole: 0.50
+    back_hook: 0.50
+    lock_striker: 0.50
+    rod: 0.50
+    striker: 0.50
+  # Minimum bounding box area (in pixels) for a defect to be considered valid to prevent false positives quickly
+  min_defect_area: 200
+  # Default YOLO confidence threshold if a class is not specified above
+  default_yolo_confidence: 0.25
+  
+
+  # Post-processing thresholds to filter out empty blue foam trays
+  part_presence:
+    blue_thresh: 0.75
+    metal_min_ratio: 0.15
+    laplacian_variance_min: 150.0  # Threshold for texture/edge density
+
+  
+# --- Data Management ---
+storage:
+  # Number of days to keep old inspection reports and images before auto-deleting them
+  retention_days: 30
+
+# --- Web Server ---
+web:
+  host: "0.0.0.0"
+  port: 5000
+
+# --- Default Camera Connection Settings (Optional) ---
+# If you want the app to auto-connect on startup, fill these out. Otherwise leave blank.
+camera:
+  # For GigE Cameras
+  gige:
+    pixel_format: "BayerRG8" # UA5MEAGV-50C native color format (BGR8/RGB8 not supported by camera)
+    exposure: 60000.0
+    gain: 1.0
+  # For RTSP IP Cameras
+  rtsp:
+    url: ""
