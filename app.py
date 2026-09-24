@@ -243,20 +243,20 @@ def init_models():
     global YOLO_MODEL, OCR_ENGINE
     if YOLO_MODEL is None:
         print("Loading YOLO Model...")
-        if os.path.exists(MODEL_PATH):
-            YOLO_MODEL = YOLO(MODEL_PATH)
+        model_file = MODEL_PATH if os.path.exists(MODEL_PATH) else "yolov8n.pt"
+        YOLO_MODEL = YOLO(model_file)
+        # Enforce GPU for YOLO model
+        if torch.cuda.is_available():
+            try:
+                YOLO_MODEL.to('cuda:0')
+                print(f"[YOLO] Successfully transferred model to GPU: {torch.cuda.get_device_name(0)}")
+            except Exception as e:
+                print(f"[YOLO] Warning: Failed to transfer model to GPU: {e}")
         else:
-            YOLO_MODEL = YOLO("yolov8n.pt")  # Fallback
+            print("[YOLO] WARNING: GPU requested for YOLO inference, but CUDA is currently unavailable.")
     if OCR_ENGINE is None:
-        print("Loading PaddleOCR Engine...")
-        # Check for GPU for YOLO logging, but force PaddleOCR to CPU
-        has_gpu = torch.cuda.is_available()
-        print(f"System GPU Acceleration Available (YOLO): {has_gpu}")
-        OCR_ENGINE = PaddleOCR(
-            use_textline_orientation=False,
-            lang="en",
-            use_gpu=False
-        )
+        print("Connecting to PaddleOCR Microservice...")
+        OCR_ENGINE = PaddleOCR()
     print("Models Initialized.")
 
 # -------------------------------
@@ -763,11 +763,25 @@ class CameraStreamer:
         for i in range(numCameras):
             res, devInfo = IKapC.ItkManGetDeviceInfo(i)
             if res == IKapCDef.ITKSTATUS_OK:
+                model = devInfo.FullName.decode('utf-8', errors='ignore') if devInfo.FullName else "Unknown"
+                vendor = devInfo.VendorName.decode('utf-8', errors='ignore') if devInfo.VendorName else "I-TEK"
+                sn = devInfo.SerialNumber.decode('utf-8', errors='ignore') if hasattr(devInfo, 'SerialNumber') and devInfo.SerialNumber else "Unknown"
+                name = devInfo.UserDefinedName.decode('utf-8', errors='ignore') if devInfo.UserDefinedName else f"Cam{i}"
+                ip = ""
+                try:
+                    res_gige, gInfo = IKapC.ItkManGetGigEDeviceInfo(i)
+                    if res_gige == IKapCDef.ITKSTATUS_OK and hasattr(gInfo, 'Ip') and gInfo.Ip:
+                        ip = gInfo.Ip.decode('utf-8', errors='ignore')
+                except Exception:
+                    pass
                 cams.append({
                     "id": i,
-                    "model": devInfo.FullName.decode('utf-8', errors='ignore') if devInfo.FullName else "Unknown",
-                    "vendor": devInfo.VendorName.decode('utf-8', errors='ignore') if devInfo.VendorName else "I-TEK",
-                    "display_name": devInfo.UserDefinedName.decode('utf-8', errors='ignore') if devInfo.UserDefinedName else f"Cam{i}"
+                    "index": i,
+                    "model": model,
+                    "vendor": vendor,
+                    "serial": sn,
+                    "ip": ip,
+                    "display_name": name
                 })
         return cams
 
@@ -1262,7 +1276,7 @@ def video_processing_loop():
                     continue
 
                 # Loop video if source is a file
-                if isinstance(stream_source, str) and not stream_source.startswith("rtsp"):
+                if isinstance(stream_source, str) and stream_source != "gige" and not stream_source.startswith("rtsp") and video_cap is not None:
                     print("[Video Feed] Loop reached: Re-opening video file.")
                     with lock:
                         video_cap.release()
@@ -1359,8 +1373,8 @@ def video_processing_loop():
                 with lock:
                     latest_annotated_frame = buffer.tobytes()
 
-            # Speed throttle - read at true video FPS
-            if isinstance(stream_source, str) and not stream_source.startswith("rtsp"):
+            # Speed throttle - read at true video FPS (video files only)
+            if isinstance(stream_source, str) and stream_source != "gige" and not stream_source.startswith("rtsp") and video_cap is not None:
                 fps = video_cap.get(cv2.CAP_PROP_FPS) if video_cap else 30
                 if fps <= 0:
                     fps = 30
@@ -1378,7 +1392,7 @@ def video_processing_loop():
                 elapsed = time.time() - last_video_time
                 
                 # If we are falling behind (processing took too long), skip frames to catch up and keep it smooth
-                while elapsed > target_frame_time:
+                while elapsed > target_frame_time and video_cap is not None:
                     video_cap.grab()  # discard a frame instantly
                     elapsed -= target_frame_time
                 
@@ -1433,7 +1447,9 @@ def yolo_worker_loop():
             min_thresh = min(CLASS_CONF_THRESHOLDS.values()) if CLASS_CONF_THRESHOLDS else YOLO_CONF_THRESHOLD
             run_thresh = min(float(min_thresh), float(YOLO_CONF_THRESHOLD))
             
-            results = YOLO_MODEL(frame_resized, verbose=False, conf=run_thresh, task='segment', imgsz=448)
+            # Explicitly target GPU (device=0) for YOLO inference; fallback to cpu only if CUDA unavailable
+            yolo_dev = 0 if torch.cuda.is_available() else 'cpu'
+            results = YOLO_MODEL(frame_resized, verbose=False, conf=run_thresh, task='segment', imgsz=448, device=yolo_dev)
             new_detections = []
             frame_holes = 0
             frame_rod = 0
@@ -2055,17 +2071,23 @@ def scan_cameras():
 @app.route('/connect_gige', methods=['POST'])
 def connect_gige():
     global cam
-    if cam.is_connected:
-        return jsonify({"status": "success", "message": "GigE Camera already connected."})
-        
     data = request.json or {}
+    cam_id = data.get('camera_id', data.get('id', 0))
+    try:
+        cam_id = int(cam_id)
+    except (ValueError, TypeError):
+        cam_id = 0
+        
     exposure = data.get('exposure')
     gain = data.get('gain')
     gamma = data.get('gamma')
     pixel_format = data.get('pixel_format')
     trigger_mode = data.get('trigger_mode')
     
-    if cam.connect(0, exposure=exposure, gain=gain, gamma=gamma, pixel_format=pixel_format, trigger_mode=trigger_mode):
+    if cam.is_connected:
+        cam.disconnect()
+        
+    if cam.connect(cam_id, exposure=exposure, gain=gain, gamma=gamma, pixel_format=pixel_format, trigger_mode=trigger_mode):
         global stream_source, is_processing, video_cap
         if video_cap:
             video_cap.release()
@@ -2073,7 +2095,7 @@ def connect_gige():
         stream_source = "gige"
         is_processing = True
         reset_cycle_state()
-        return jsonify({"status": "success", "message": "GigE Camera connected successfully!"})
+        return jsonify({"status": "success", "message": f"GigE Camera ({data.get('model', f'Cam {cam_id}')}) connected successfully!"})
     else:
         return jsonify({"status": "error", "message": cam.last_error_msg})
 
@@ -2154,10 +2176,10 @@ if __name__ == '__main__':
     logger.info("[System] Automatically starting PaddleOCR Server...")
     try:
         ocr_log = open("logs/ocr_server.log", "w", buffering=1)
-        # Try specific Python 3.11 launcher first (this runs the server with global GPU python)
+        # Try specific Python 3.12 launcher first (runs OCR server on Python 3.12)
         try:
-            py311_path = subprocess.check_output(["py", "-3.11", "-c", "import sys; print(sys.executable)"]).decode().strip()
-            ocr_process = subprocess.Popen([py311_path, "paddleocr_server.py"], stdout=ocr_log, stderr=subprocess.STDOUT, env=dict(os.environ, PYTHONUNBUFFERED="1"))
+            py312_path = subprocess.check_output(["py", "-3.12", "-c", "import sys; print(sys.executable)"]).decode().strip()
+            ocr_process = subprocess.Popen([py312_path, "paddleocr_server.py"], stdout=ocr_log, stderr=subprocess.STDOUT, env=dict(os.environ, PYTHONUNBUFFERED="1"))
         except Exception:
             ocr_process = subprocess.Popen([sys.executable, "paddleocr_server.py"], stdout=ocr_log, stderr=subprocess.STDOUT, env=dict(os.environ, PYTHONUNBUFFERED="1"))
             

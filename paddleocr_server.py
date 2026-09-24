@@ -26,20 +26,37 @@ class FlushFileHandler(logging.StreamHandler):
 
 logging.getLogger().handlers = [FlushFileHandler(sys.stdout)]
 
-logging.info("Loading PaddleOCR model (this may take a moment)...")
+logging.info("Initializing PaddleOCR engine (targeting GPU, with CPU fallback)...")
 from paddleocr import PaddleOCR
 import paddle
-has_gpu = paddle.device.is_compiled_with_cuda()
-logging.info(f"GPU Acceleration Available: {has_gpu}")
 
-# Initialize using updated parameters for PaddleOCR >= 3.x
-ocr = PaddleOCR(
-    use_textline_orientation=False,
-    lang='en',
-    device="gpu" if has_gpu else "cpu",
-    enable_mkldnn=False
-)
-logging.info("PaddleOCR ready.")
+ocr = None
+try:
+    has_gpu = paddle.device.is_compiled_with_cuda() and paddle.device.cuda.device_count() > 0
+    if has_gpu:
+        paddle.device.set_device('gpu:0')
+        ocr = PaddleOCR(
+            use_angle_cls=False,
+            lang='en',
+            use_gpu=True,
+            enable_mkldnn=False
+        )
+        logging.info("PaddleOCR successfully initialized on GPU (CUDA).")
+    else:
+        raise RuntimeError("No active CUDA GPU device detected by Paddle runtime.")
+except Exception as e:
+    logging.warning(f"PaddleOCR GPU unavailable or failed ({e}). Falling back to CPU.")
+    try:
+        paddle.device.set_device('cpu')
+    except Exception:
+        pass
+    ocr = PaddleOCR(
+        use_angle_cls=False,
+        lang='en',
+        use_gpu=False,
+        enable_mkldnn=True
+    )
+    logging.info("PaddleOCR running on CPU fallback.")
 
 
 def run_ocr(image):

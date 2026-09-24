@@ -1027,10 +1027,12 @@
                     const sel = document.getElementById('gige-camera-select');
                     sel.innerHTML = '<option value="">— select a camera —</option>';
                     if (data.cameras && data.cameras.length > 0) {
-                        data.cameras.forEach(cam => {
+                        data.cameras.forEach((cam, idx) => {
                             const opt = document.createElement('option');
                             opt.value = JSON.stringify(cam);
-                            opt.textContent = `${cam.model} | ${cam.serial} | ${cam.ip}`;
+                            const ipStr = cam.ip ? cam.ip : 'Local';
+                            const snStr = cam.serial ? cam.serial : 'N/A';
+                            opt.textContent = `${cam.model} | SN: ${snStr} | IP: ${ipStr}`;
                             sel.appendChild(opt);
                         });
                         sel.addEventListener('change', () => {
@@ -1040,6 +1042,12 @@
                                 document.getElementById('gige-serial').value  = cam.serial || '';
                             }
                         });
+                        // Auto-select first camera if none selected
+                        if (data.cameras[0]) {
+                            sel.selectedIndex = 1;
+                            document.getElementById('gige-ip').value = data.cameras[0].ip || '';
+                            document.getElementById('gige-serial').value = data.cameras[0].serial || '';
+                        }
                         msgEl.textContent = `Found ${data.cameras.length} camera(s).`;
                     } else {
                         msgEl.textContent = 'No cameras found on the network.';
@@ -1055,8 +1063,16 @@
             msgEl.textContent  = 'Connecting...';
             btnCon.disabled    = true;
 
+            const camSel = document.getElementById('gige-camera-select');
+            let selectedCam = {};
+            try {
+                selectedCam = JSON.parse(camSel.value || '{}');
+            } catch(e) {}
+
             const expVal = document.getElementById('gige-exposure').value;
             const payload = {
+                camera_id   : (selectedCam.id !== undefined) ? selectedCam.id : 0,
+                model       : selectedCam.model || '',
                 camera_ip   : document.getElementById('gige-ip').value,
                 serial      : document.getElementById('gige-serial').value,
                 exposure    : expVal ? parseInt(expVal) : null,

@@ -4,8 +4,8 @@ torchvision
 torchaudio
 ultralytics
 
-# PaddlePaddle CPU build (to avoid CUDA conflicts with PyTorch/YOLO)
-paddlepaddle
+# PaddlePaddle (using paddlepaddle-gpu for CUDA)
+# paddlepaddle
 paddleocr
 
 # Web Server & UI
