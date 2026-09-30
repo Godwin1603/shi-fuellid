@@ -881,6 +881,9 @@ class CameraStreamer:
         if res != IKapCDef.ITKSTATUS_OK or numCameras == 0:
             return []
         
+        # Load target serial from config to highlight the correct camera in UI
+        target_serial = APP_CONFIG.get("camera", {}).get("gige", {}).get("target_serial", "").strip()
+        
         cams = []
         for i in range(numCameras):
             res, devInfo = IKapC.ItkManGetDeviceInfo(i)
@@ -896,6 +899,7 @@ class CameraStreamer:
                         ip = gInfo.Ip.decode('utf-8', errors='ignore')
                 except Exception:
                     pass
+                is_target = bool(target_serial and sn.strip() == target_serial)
                 cams.append({
                     "id": i,
                     "index": i,
@@ -903,28 +907,65 @@ class CameraStreamer:
                     "vendor": vendor,
                     "serial": sn,
                     "ip": ip,
-                    "display_name": name
+                    "display_name": name,
+                    "is_target": is_target  # True when this matches config target_serial
                 })
         return cams
 
+    def find_index_by_serial(self, serial):
+        """Returns the SDK device index matching the given serial number, or -1 if not found."""
+        if not sdk_available or not serial:
+            return -1
+        res, numCameras = IKapC.ItkManGetDeviceCount()
+        if res != IKapCDef.ITKSTATUS_OK or numCameras == 0:
+            return -1
+        serial = serial.strip()
+        for i in range(numCameras):
+            res, devInfo = IKapC.ItkManGetDeviceInfo(i)
+            if res == IKapCDef.ITKSTATUS_OK:
+                sn = devInfo.SerialNumber.decode('utf-8', errors='ignore') if hasattr(devInfo, 'SerialNumber') and devInfo.SerialNumber else ""
+                if sn.strip() == serial:
+                    logger.info(f"[Camera] Serial '{serial}' matched at SDK index {i}")
+                    return i
+        logger.warning(f"[Camera] Serial '{serial}' NOT found among {numCameras} detected cameras.")
+        return -1
+
     def connect(self, index=0, exposure=None, gain=None, gamma=None, pixel_format=None, trigger_mode=None):
-        self.last_connected_cam_id = index
         if not sdk_available:
             self.last_error_msg = "SDK unavailable."
             return False
-            
+
         if self.is_connected or (self.m_hDev and self.m_hDev.value != 0):
             # Protect connect() against a partially opened previous connection
             self.disconnect()
-            
+
+        # --- Serial-based index resolution ---
+        # If a target_serial is set in config, find its SDK index dynamically.
+        # This ensures we always connect the right camera regardless of enumeration order.
+        target_serial = APP_CONFIG.get("camera", {}).get("gige", {}).get("target_serial", "").strip()
+        if target_serial:
+            resolved_index = self.find_index_by_serial(target_serial)
+            if resolved_index == -1:
+                self.last_error_msg = (
+                    f"Target camera (SN: {target_serial}) not found. "
+                    f"It may be held by another application in EXCLUSIVE mode. "
+                    f"Please close the other application and try again."
+                )
+                logger.error(f"[Camera] {self.last_error_msg}")
+                return False
+            logger.info(f"[Camera] Serial '{target_serial}' resolved to SDK index {resolved_index} (requested index was {index})")
+            index = resolved_index
+
+        self.last_connected_cam_id = index
+
         print("\n--- DIAGNOSTIC: I-TEK SDK DEVICE OPENING ---")
-        
-        # 1. Device Enumeration Result
+
+        # Enumerate and log available cameras
         res, numCameras = IKapC.ItkManGetDeviceCount()
         print(f"DIAGNOSTIC: ItkManGetDeviceCount result code: {res}, Detected cameras: {numCameras}")
         print(f"DIAGNOSTIC: Attempting to open device index: {index}")
-        
-        # Initialize GigE specific info if applicable
+
+        # Log device info
         res, devInfo = IKapC.ItkManGetDeviceInfo(index)
         print(f"DIAGNOSTIC: ItkManGetDeviceInfo result code: {res}")
         if res == IKapCDef.ITKSTATUS_OK:
@@ -936,15 +977,24 @@ class CameraStreamer:
                 gige_res, gigeInfo = IKapC.ItkManGetGigEDeviceInfo(index)
                 print(f"DIAGNOSTIC: ItkManGetGigEDeviceInfo result code: {gige_res}")
 
-        # Open device
-        access_mode = IKapCDef.ITKDEV_VAL_ACCESS_MODE_EXCLUSIVE
-        print(f"DIAGNOSTIC: Calling ItkDevOpen with access_mode={access_mode} (EXCLUSIVE)")
-        res, self.m_hDev = IKapC.ItkDevOpen(index, access_mode)
-        print(f"DIAGNOSTIC: Exact ItkDevOpen return code: {res}")
-        print(f"DIAGNOSTIC: Device handle returned: {self.m_hDev}")
-        
+        # --- Open device: try EXCLUSIVE first, fall back to CONTROL ---
+        res, self.m_hDev = None, ctypes.c_void_p(None)
+        for mode_name, access_mode in [
+            ("EXCLUSIVE", IKapCDef.ITKDEV_VAL_ACCESS_MODE_EXCLUSIVE),
+            ("CONTROL",   IKapCDef.ITKDEV_VAL_ACCESS_MODE_CONTROL),
+        ]:
+            print(f"DIAGNOSTIC: Trying ItkDevOpen with access_mode={access_mode} ({mode_name})")
+            res, self.m_hDev = IKapC.ItkDevOpen(index, access_mode)
+            print(f"DIAGNOSTIC: ItkDevOpen [{mode_name}] return code: {res}, handle: {self.m_hDev}")
+            if res == IKapCDef.ITKSTATUS_OK and self.m_hDev and self.m_hDev.value != 0:
+                logger.info(f"[Camera] Opened device at index {index} in {mode_name} mode.")
+                break
+
         if res != IKapCDef.ITKSTATUS_OK or not self.m_hDev or self.m_hDev.value == 0:
-            self.last_error_msg = f"Failed to open device. SDK error code: {res}"
+            hint = ""
+            if res == 1114128:  # ITKSTATUS_TIME_OUT in DEVICE module
+                hint = " (Timeout — camera may be held by another application in EXCLUSIVE mode)"
+            self.last_error_msg = f"Failed to open device. SDK error code: {res}{hint}"
             print(self.last_error_msg)
             print("--- DIAGNOSTIC END ---\n")
             return False

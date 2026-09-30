@@ -49,6 +49,7 @@ web:
 camera:
   # For GigE Cameras
   gige:
+    target_serial: "73ABE004"  # Always connect this specific camera by serial number
     pixel_format: "BayerRG8" # UA5MEAGV-50C native color format (BGR8/RGB8 not supported by camera)
     exposure: 60000.0
     gain: 1.0
