@@ -1,10 +1,10 @@
 @echo off
 setlocal enabledelayedexpansion
-title SSP Vision System
+title SHI Vision System
 color 0B
 
 echo ===================================================
-echo        SSP VISION SYSTEM - STARTUP SEQUENCE
+echo        SHI VISION SYSTEM - STARTUP SEQUENCE
 echo ===================================================
 echo.
 echo [1/3] Checking system environment...
@@ -46,7 +46,7 @@ if %errorLevel% neq 0 (
     echo ===================================================
     echo                   CRITICAL ERROR
     echo ===================================================
-    echo The SSP Vision System encountered an error and stopped!
+    echo The SHI Vision System encountered an error and stopped!
     echo.
     echo Please scroll up to read the specific error message above.
     echo Take a photo/screenshot of this entire window and send it to support.

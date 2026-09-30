@@ -2,7 +2,7 @@
 setlocal enabledelayedexpansion
 
 echo ==============================================
-echo SSP Vision System - 1-Click Installer
+echo SHI Vision System - 1-Click Installer
 echo ==============================================
 echo.
 

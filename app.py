@@ -23,13 +23,13 @@ from logging.handlers import RotatingFileHandler
 # --- Initialization: Config & Logging ---
 os.makedirs("logs", exist_ok=True)
 log_formatter = logging.Formatter('%(asctime)s - %(levelname)s - %(message)s')
-log_file = "logs/ssp_app.log"
+log_file = "logs/shi_app.log"
 file_handler = RotatingFileHandler(log_file, maxBytes=10*1024*1024, backupCount=5)
 file_handler.setFormatter(log_formatter)
 console_handler = logging.StreamHandler(sys.stdout)
 console_handler.setFormatter(log_formatter)
 
-logger = logging.getLogger("SSP_App")
+logger = logging.getLogger("SHI_App")
 logger.setLevel(logging.INFO)
 logger.addHandler(file_handler)
 logger.addHandler(console_handler)
@@ -61,7 +61,7 @@ else:
 # Def config defaults
 OCR_CONF_THRESHOLD = APP_CONFIG.get("ai", {}).get("ocr_confidence_threshold", 0.20)
 OCR_FALLBACK_TIMEOUT = APP_CONFIG.get("ai", {}).get("ocr_fallback_timeout", 3.5)
-MODEL_PATH = APP_CONFIG.get("ai", {}).get("model_path", "ssp_yolov8-seg.pt")
+MODEL_PATH = APP_CONFIG.get("ai", {}).get("model_path", "SHI_FUEL_DOOR_V1.1.pt")
 RETENTION_DAYS = APP_CONFIG.get("storage", {}).get("retention_days", 30)
 
 
@@ -105,7 +105,7 @@ class _PaddleOCRClient:
     def predict_crop(self, img_bgr):
         """Send a BGR crop to the PaddleOCR server, returns list of {rec_text, rec_score}."""
         try:
-            _, buf = cv2.imencode('.png', img_bgr)
+            _, buf = cv2.imencode('.jpg', img_bgr, [cv2.IMWRITE_JPEG_QUALITY, 95])
             b64 = _base64.b64encode(buf).decode()
             payload = _json.dumps({"image": b64}).encode()
             req = _urllib_req.Request(self.PADDLE_URL, data=payload,
@@ -138,6 +138,13 @@ class _PaddleOCRClient:
             logger.info(f"raw response = {e}")
             logger.info(f"recognized texts = []")
             logger.error(f"[OCR ERROR] PaddleOCR request failed: {e}")
+            # Auto-attempt starting PaddleOCR server if connection was refused
+            try:
+                import subprocess
+                logger.info("Attempting to auto-start paddleocr_server.py in background...")
+                subprocess.Popen(["py", "-3.12", "paddleocr_server.py"], cwd=os.getcwd())
+            except Exception as launch_err:
+                logger.error(f"Failed to auto-launch paddleocr_server.py: {launch_err}")
             return []
 
 PaddleOCR = _PaddleOCRClient
@@ -190,6 +197,7 @@ current_cycle = {
     "confidence": "- -",
     "result": "Awaiting analysis...",
     "holes_count": 0,
+    "ring_bush_count": 0,
     "rod_count": 0,
     "striker_count": 0,
     "back_hook_count": 0,
@@ -212,6 +220,7 @@ active_cycle_data = {
     "ocr_thread_active": False,
     "defects_detected": set(),
     "max_holes_detected": 0,
+    "max_ring_bush_detected": 0,
     "max_rod_detected": 0,
     "max_striker_detected": 0,
     "max_back_hook_detected": 0,
@@ -233,8 +242,71 @@ active_cycle_data = {
 
 # Global placeholders for decoupled streaming speedup
 latest_raw_frame = None
+latest_unenhanced_frame = None
 current_detections = []
 latest_annotated_frame = None
+
+# -------------------------------
+# Automatic Brightness Enhancement
+# -------------------------------
+# Gamma lookup table pre-computed for gamma = 0.60
+# Formula: output = 255 * ((input / 255) ** gamma)
+_GAMMA_060_LUT = np.array(
+    [np.clip(255.0 * ((i / 255.0) ** 0.60), 0, 255) for i in range(256)],
+    dtype=np.uint8
+)
+
+# Mild CLAHE object with clipLimit = 1.5 and tileGridSize = (8, 8)
+_CLAHE_15 = cv2.createCLAHE(clipLimit=1.5, tileGridSize=(8, 8))
+
+def enhance_image(image, save_original_debug=False, debug_path=None):
+    """
+    Automatic brightness enhancement for captured camera frames before saving to disk.
+    
+    Processing Pipeline:
+      Camera Frame
+          ↓
+      Gamma Correction (gamma = 0.60) via cv2.LUT
+          ↓
+      LAB Conversion (BGR -> LAB)
+          ↓
+      CLAHE on L channel (clipLimit = 1.5, tileGridSize = 8x8)
+          ↓
+      BGR Conversion (LAB -> BGR)
+          ↓
+      Enhanced Image
+    """
+    if image is None:
+        return None
+
+    # Save original captured frame optionally for debugging
+    if save_original_debug and debug_path:
+        try:
+            os.makedirs(os.path.dirname(debug_path), exist_ok=True)
+            cv2.imwrite(debug_path, image, [cv2.IMWRITE_JPEG_QUALITY, 95])
+            logger.info(f"[Debug] Saved original un-enhanced camera frame to {debug_path}")
+        except Exception as e:
+            logger.warning(f"Failed to save debug original frame to {debug_path}: {e}")
+
+    # 1. Apply gamma correction (gamma = 0.60) using precalculated LUT
+    gamma_corrected = cv2.LUT(image, _GAMMA_060_LUT)
+
+    # 2. Convert BGR -> LAB
+    lab = cv2.cvtColor(gamma_corrected, cv2.COLOR_BGR2LAB)
+
+    # 3. Split L, A, B channels
+    l_chan, a_chan, b_chan = cv2.split(lab)
+
+    # 4. Apply CLAHE (clipLimit = 1.5, tileGridSize = 8x8) ONLY to L channel
+    l_enhanced = _CLAHE_15.apply(l_chan)
+
+    # 5. Merge L, A, B channels
+    lab_enhanced = cv2.merge((l_enhanced, a_chan, b_chan))
+
+    # 6. Convert LAB -> BGR
+    enhanced_frame = cv2.cvtColor(lab_enhanced, cv2.COLOR_LAB2BGR)
+
+    return enhanced_frame
 
 # -------------------------------
 # Initialization Helper
@@ -321,12 +393,16 @@ def run_ocr_on_crop(crop_rgb):
         print(f"raw text = {combined_text}")
         print(f"cleaned text = {clean_text}")
         
-        # 1st 6 digits (date) + 3 digits + 1 letter A/B/C + 4 digits (time)
-        match = re.search(r"(\d{9}[A-C]\d{4})", clean_text)
+        # 1st 6 digits (date) + 3 digits + 1 letter (A-Z) + 4 digits (time), or 14-char alphanumeric serial
+        match = re.search(r"(\d{9}[A-Z]\d{4})", clean_text)
+        if not match:
+            match = re.search(r"(\d{6}[A-Z0-9]{3,5}\d{4})", clean_text)
+        if not match and len(clean_text) >= 12:
+            match = re.search(r"([A-Z0-9]{13,15})", clean_text)
         
         if not match:
             print(f"accepted/rejected = rejected")
-            print(f"reason = Did not match format: 6 digits (date) + 3 digits + 1 letter (A/B/C) + 4 digits (time)\n")
+            print(f"reason = Did not match serial format\n")
         else:
             clean_text = match.group(1)
             if float(avg_conf) > best_conf:
@@ -338,8 +414,8 @@ def run_ocr_on_crop(crop_rgb):
                 print(f"accepted/rejected = rejected")
                 print(f"reason = Valid format but confidence ({avg_conf}) not higher than best ({best_conf})\n")
                 
-        # If we already found a very high-confidence result, stop trying rotations
-        if best_text and best_conf >= 0.88:
+        # If a valid serial regex match is found, break immediately to speed up reading by up to 4x!
+        if best_text:
             break
 
     if not best_text:
@@ -468,7 +544,7 @@ def finalize_report_and_rename(c_data):
                         current_cycle["confidence"] = f"{best_vote['confidence']:.1f}%"
                     logger.info(f"[Finalize] Using best OCR vote: {best_vote['text']} ({best_vote['confidence']:.1f}%)")
                     break
-            time.sleep(0.3)
+            time.sleep(0.02)
         
         # Last resort: if OCR still has nothing after waiting
         with lock:
@@ -501,9 +577,9 @@ def finalize_report_and_rename(c_data):
                 active_cycle_data["ocr_start_time"] = time.time()
                 active_cycle_data["serial_number"] = None
 
-            # Wait another 10 seconds for recheck
+            # Wait for recheck
             recheck_wait_start = time.time()
-            while time.time() - recheck_wait_start < 5.0:
+            while time.time() - recheck_wait_start < 2.5:
                 with lock:
                     if active_cycle_data["serial_number"] is not None and active_cycle_data["serial_number"] != "serial_missing":
                         break
@@ -514,7 +590,7 @@ def finalize_report_and_rename(c_data):
                         current_cycle["serial"] = best_vote["text"]
                         current_cycle["confidence"] = f"{best_vote['confidence']:.1f}%"
                         break
-                time.sleep(0.3)
+                time.sleep(0.02)
 
             with lock:
                 if active_cycle_data["serial_number"] is None:
@@ -544,8 +620,8 @@ def finalize_report_and_rename(c_data):
             defects = list(active_cycle_data["defects_detected"])
             if active_cycle_data["max_holes_detected"] < 3:
                 defects.append("missing_holes")
-            if active_cycle_data["max_rod_detected"] < 1:
-                defects.append("missing_rod")
+            if active_cycle_data.get("max_ring_bush_detected", 0) < 1 and active_cycle_data.get("max_rod_detected", 0) < 1:
+                defects.append("missing_ring_bush")
             if active_cycle_data["max_striker_detected"] < 2:
                 defects.append("missing_striker")
             if active_cycle_data["max_back_hook_detected"] < 2:
@@ -556,6 +632,19 @@ def finalize_report_and_rename(c_data):
             if serial == "serial_missing":
                 defects.append("serial_missing")
             current_cycle["defects"] = defects
+
+            # Update operator instruction to show NG (red big) if defective, or OK (green big) if no defects
+            if defects:
+                current_cycle["instruction"] = "NG"
+                current_cycle["instruction_color"] = "red"
+                current_cycle["result"] = "NG"
+                current_cycle["status"] = "NG - DEFECT DETECTED"
+            else:
+                current_cycle["instruction"] = "OK"
+                current_cycle["instruction_color"] = "green"
+                current_cycle["result"] = "OK"
+                current_cycle["status"] = "OK - INSPECTION PASSED"
+
         status = "FAIL" if defects else "PASS"
         
         # Check folder structure and resolve if serial folder already exists
@@ -644,8 +733,16 @@ def finalize_report_and_rename(c_data):
             else:
                 cycle_count += 1
 
-            current_cycle["result"] = status
-            current_cycle["status"] = "Finished Cycle for " + serial
+            if defects:
+                current_cycle["instruction"] = "NG"
+                current_cycle["instruction_color"] = "red"
+                current_cycle["result"] = "NG"
+                current_cycle["status"] = f"Finished Cycle: NG ({serial})"
+            else:
+                current_cycle["instruction"] = "OK"
+                current_cycle["instruction_color"] = "green"
+                current_cycle["result"] = "OK"
+                current_cycle["status"] = f"Finished Cycle: OK ({serial})"
             
         # Hold the final result on screen for 4 seconds so the operator can read it
         time.sleep(4.0)
@@ -678,6 +775,7 @@ def reset_cycle_state():
         current_cycle["confidence"] = "- -"
         current_cycle["result"] = "Awaiting analysis..."
         current_cycle["holes_count"] = 0
+        current_cycle["ring_bush_count"] = 0
         current_cycle["rod_count"] = 0
         current_cycle["striker_count"] = 0
         current_cycle["back_hook_count"] = 0
@@ -699,6 +797,7 @@ def reset_cycle_state():
             "ocr_thread_active": False,
             "defects_detected": set(),
             "max_holes_detected": 0,
+            "max_ring_bush_detected": 0,
             "max_rod_detected": 0,
             "max_striker_detected": 0,
             "max_back_hook_detected": 0,
@@ -1240,7 +1339,7 @@ cam = CameraStreamer()
 atexit.register(cam.disconnect)
 
 def video_processing_loop():
-    global video_cap, is_processing, stream_source, latest_raw_frame, latest_annotated_frame, current_detections
+    global video_cap, is_processing, stream_source, latest_raw_frame, latest_unenhanced_frame, latest_annotated_frame, current_detections
     consecutive_failures = 0
     _vloop_counter = 0
     print("[VideoLoop] Thread started!")
@@ -1290,9 +1389,16 @@ def video_processing_loop():
 
             consecutive_failures = 0
 
-            # Save raw frame for YOLO thread
+            # Retain original un-enhanced camera frame for debugging
+            raw_unenhanced_frame = frame.copy()
+
+            # Automatic brightness enhancement immediately after camera capture
+            enhanced_frame = enhance_image(frame)
+
+            # Save enhanced frame for YOLO worker thread & inspection pipeline, plus unenhanced frame for debugging
             with lock:
-                latest_raw_frame = frame.copy()
+                latest_raw_frame = enhanced_frame
+                latest_unenhanced_frame = raw_unenhanced_frame
 
             # Resize frame to standard 480px width first to speed up JPEG encoding and keep annotations crisp
             h_ann, w_ann = frame.shape[:2]
@@ -1452,6 +1558,7 @@ def yolo_worker_loop():
             results = YOLO_MODEL(frame_resized, verbose=False, conf=run_thresh, task='segment', imgsz=448, device=yolo_dev)
             new_detections = []
             frame_holes = 0
+            frame_ring_bush = 0
             frame_rod = 0
             frame_striker = 0
             frame_back_hook = 0
@@ -1528,7 +1635,7 @@ def yolo_worker_loop():
                     metal_t = presence_cfg.get("metal_min_ratio", 0.15)
                     lap_t = presence_cfg.get("laplacian_variance_min", 150.0)
                     
-                    if class_name not in ["dent", "bulge", "line_mark", "damage"]:
+                    if class_name not in ["dent", "bulge", "line_mark", "linemark", "line-mark", "damage"]:
                         roi = frame_to_process[y1:y2, x1:x2]
                         if not has_part(roi, blue_t, metal_t, lap_t):
                             logger.info(f"Filtered out empty tray misclassified as '{class_name}' (conf: {conf:.2f})")
@@ -1587,13 +1694,14 @@ def yolo_worker_loop():
                         elif class_name == "holes":
                             has_holes_detected = True
                     
-                    if class_name in ["dent", "bulge", "line_mark", "damage"]:
+                    if class_name in ["dent", "bulge", "line_mark", "linemark", "line-mark", "damage"]:
                         frame_defects.append(class_name)
                         
                     if class_name == "hole" or class_name == "holes":
                         if has_back_detected or (not has_front_detected and not has_back_detected):
                             frame_holes += 1
-                    elif class_name == "rod":
+                    elif class_name in ["ring_bush", "ringbush", "rod"]:
+                        frame_ring_bush += 1
                         frame_rod += 1
                     elif class_name == "striker":
                         frame_striker += 1
@@ -1665,8 +1773,8 @@ def yolo_worker_loop():
                     is_ocr_target = False
 
                     if class_name in ["serial", "serial_area"]:
-                        # Give the part 0.4 seconds to settle before taking the OCR crop to avoid motion blur on the long-exposure camera
-                        if time_elapsed >= 0.4:
+                        # Ultra-fast trigger: start OCR immediately upon detection (50ms stability check)
+                        if time_elapsed >= 0.05:
                             is_ocr_target = True
                     else:
                         is_ocr_target = False
@@ -1744,8 +1852,13 @@ def yolo_worker_loop():
                 # Strict State Machine Logic
                 if state == "WAITING_FRONT":
                     current_cycle["status"] = "Waiting for Front Panel"
-                    current_cycle["instruction"] = "PLACE FUEL DOOR (FRONT)"
-                    current_cycle["instruction_color"] = "blue"
+                    if not active_cycle_data.get("defects_detected"):
+                        current_cycle["instruction"] = "PLACE FUEL DOOR (FRONT)"
+                        current_cycle["instruction_color"] = "blue"
+                    else:
+                        current_cycle["instruction"] = "NG"
+                        current_cycle["instruction_color"] = "red"
+                        current_cycle["result"] = "NG"
                     
                     if front_box and not has_back_detected:
                         if active_cycle_data["temp_folder"] is None:
@@ -1777,9 +1890,18 @@ def yolo_worker_loop():
                         active_cycle_data["front_missing_frames"] = 0
                         
                         if time_stable >= 0.2:
-                            # Save full raw feed image without annotations and without cropping
+                            # Save full enhanced image without annotations and without cropping
                             full_image = frame_to_process.copy()
                             front_file = os.path.join(active_cycle_data["temp_folder"], "front.jpg")
+                            
+                            # Optionally retain original un-enhanced frame for debugging
+                            if active_cycle_data.get("save_debug_raw", False) or APP_CONFIG.get("storage", {}).get("save_debug_raw", False):
+                                debug_raw_file = os.path.join(active_cycle_data["temp_folder"], "front_raw_debug.jpg")
+                                with lock:
+                                    if latest_unenhanced_frame is not None:
+                                        cv2.imwrite(debug_raw_file, latest_unenhanced_frame, [cv2.IMWRITE_JPEG_QUALITY, 95])
+                                        logger.info(f"[Debug] Saved original un-enhanced front image: {debug_raw_file}")
+
                             cv2.imwrite(front_file, full_image, [cv2.IMWRITE_JPEG_QUALITY, 95])
                             
                             active_cycle_data["front_path"] = front_file
@@ -1790,6 +1912,15 @@ def yolo_worker_loop():
                             active_cycle_data["state"] = "WAITING_LOCK_STRIKER"
                             for d in frame_defects:
                                 active_cycle_data["defects_detected"].add(d)
+                            # Immediate missing component check on Front Panel capture
+                            if active_cycle_data.get("max_ring_bush_detected", 0) < 1 and frame_ring_bush < 1:
+                                active_cycle_data["defects_detected"].add("missing_ring_bush")
+                            if active_cycle_data.get("max_striker_detected", 0) < 2 and frame_striker < 2:
+                                active_cycle_data["defects_detected"].add("missing_striker")
+                            if active_cycle_data.get("defects_detected"):
+                                current_cycle["instruction"] = "NG"
+                                current_cycle["instruction_color"] = "red"
+                                current_cycle["result"] = "NG"
 
                     else:
                         active_cycle_data["front_missing_frames"] = active_cycle_data.get("front_missing_frames", 0) + 1
@@ -1799,27 +1930,42 @@ def yolo_worker_loop():
                             
                 elif state == "WAITING_LOCK_STRIKER":
                     current_cycle["status"] = "Waiting for Lock Striker"
-                    current_cycle["instruction"] = "SHOW LOCK STRIKER"
-                    current_cycle["instruction_color"] = "blue"
-                    
-                    is_back_visible = (back_box is not None) or has_serial_detected
-                    
-                    if is_back_visible:
-                        current_cycle["status"] = "Skipped Lock Striker!"
-                        current_cycle["instruction"] = "SHOW LOCK STRIKER FIRST"
+                    if not active_cycle_data.get("defects_detected"):
+                        current_cycle["instruction"] = "SHOW LOCK STRIKER"
+                        current_cycle["instruction_color"] = "blue"
+                    else:
+                        current_cycle["instruction"] = "NG"
                         current_cycle["instruction_color"] = "red"
+                        current_cycle["result"] = "NG"
                     
-                    # Check if the lock striker was captured
+                    ls_detected = (frame_lock_striker > 0) or (active_cycle_data.get("max_lock_striker_detected", 0) > 0)
+                    
                     with lock:
                         ls_saved = active_cycle_data.get("lock_striker_path") is not None
-                    if ls_saved:
+                    
+                    # Check if operator skipped Lock Striker and flipped directly to Back Side
+                    is_back_panel_visible = (back_box is not None) and (not has_front_detected)
+                    
+                    if ls_detected or ls_saved:
+                        logger.info("[Lock Striker] Lock Striker detected! Step 3 -> OK")
                         current_cycle["step3_status"] = "OK"
+                        active_cycle_data["defects_detected"].discard("missing_lock_striker")
+                        active_cycle_data["state"] = "WAITING_BACK"
+                    elif is_back_panel_visible:
+                        logger.warning("[Lock Striker Skip] Back panel detected before Lock Striker. Step 3 -> NG")
+                        active_cycle_data["defects_detected"].add("missing_lock_striker")
+                        current_cycle["step3_status"] = "NG"
                         active_cycle_data["state"] = "WAITING_BACK"
                         
                 elif state == "WAITING_BACK":
                     current_cycle["status"] = "Waiting for Back Panel"
-                    current_cycle["instruction"] = "FLIP TO BACK SIDE"
-                    current_cycle["instruction_color"] = "blue"
+                    if not active_cycle_data.get("defects_detected"):
+                        current_cycle["instruction"] = "FLIP TO BACK SIDE"
+                        current_cycle["instruction_color"] = "blue"
+                    else:
+                        current_cycle["instruction"] = "NG"
+                        current_cycle["instruction_color"] = "red"
+                        current_cycle["result"] = "NG"
                     
                     is_back_visible = (back_box is not None) or has_serial_detected
                     
@@ -1878,9 +2024,18 @@ def yolo_worker_loop():
                             if time_stable >= 0.0 or ocr_done:
                                 # Delay the transition to finalization until the OCR thread has actually successfully completed or timed out
                                 if ocr_done or ocr_timeout:
-                                    # Save full annotated image without cropping
+                                    # Save full enhanced image without cropping
                                     full_raw = frame_to_process.copy()
                                     back_file = os.path.join(active_cycle_data["temp_folder"], "back.jpg")
+
+                                    # Optionally retain original un-enhanced frame for debugging
+                                    if active_cycle_data.get("save_debug_raw", False) or APP_CONFIG.get("storage", {}).get("save_debug_raw", False):
+                                        debug_raw_file = os.path.join(active_cycle_data["temp_folder"], "back_raw_debug.jpg")
+                                        with lock:
+                                            if latest_unenhanced_frame is not None:
+                                                cv2.imwrite(debug_raw_file, latest_unenhanced_frame, [cv2.IMWRITE_JPEG_QUALITY, 95])
+                                                logger.info(f"[Debug] Saved original un-enhanced back image: {debug_raw_file}")
+
                                     cv2.imwrite(back_file, full_raw, [cv2.IMWRITE_JPEG_QUALITY, 95])
                                     active_cycle_data["back_path"] = back_file
                                     
@@ -1923,20 +2078,34 @@ def yolo_worker_loop():
                         active_cycle_data["remove_frames_count"] = 0
                         
                 # Update UI data outside state transitions
-                if state in ["WAITING_FRONT", "WAITING_BACK", "WAITING_REMOVE"]:
+                if state in ["WAITING_FRONT", "WAITING_LOCK_STRIKER", "WAITING_BACK", "WAITING_REMOVE"]:
                     current_cycle["holes_count"] = min(3, max(current_cycle["holes_count"], frame_holes))
-                    current_cycle["rod_count"] = min(1, max(current_cycle["rod_count"], frame_rod))
+                    current_cycle["ring_bush_count"] = min(1, max(current_cycle.get("ring_bush_count", 0), frame_ring_bush))
+                    current_cycle["rod_count"] = current_cycle["ring_bush_count"]
                     current_cycle["striker_count"] = min(2, max(current_cycle["striker_count"], frame_striker))
                     current_cycle["back_hook_count"] = min(2, max(current_cycle["back_hook_count"], frame_back_hook))
                     current_cycle["lock_striker_count"] = min(1, max(current_cycle["lock_striker_count"], frame_lock_striker))
+                    
+                    # Lock striker OK synchronization
+                    if (frame_lock_striker > 0) or (active_cycle_data.get("max_lock_striker_detected", 0) > 0) or (active_cycle_data.get("lock_striker_path") is not None):
+                        current_cycle["step3_status"] = "OK"
+                        active_cycle_data["defects_detected"].discard("missing_lock_striker")
                     
                     # Continuously accumulate defects from every frame (not just at capture time)
                     for d in frame_defects:
                         active_cycle_data["defects_detected"].add(d)
                     current_cycle["defects"] = list(active_cycle_data["defects_detected"])
+                    
+                    # If any defect is identified during live frames, immediately trigger NG (flashy red side signals)
+                    if active_cycle_data["defects_detected"]:
+                        current_cycle["instruction"] = "NG"
+                        current_cycle["instruction_color"] = "red"
+                        current_cycle["result"] = "NG"
+
                     if active_cycle_data["temp_folder"] is not None:
                         active_cycle_data["max_holes_detected"] = min(3, max(active_cycle_data["max_holes_detected"], frame_holes))
-                        active_cycle_data["max_rod_detected"] = min(1, max(active_cycle_data["max_rod_detected"], frame_rod))
+                        active_cycle_data["max_ring_bush_detected"] = min(1, max(active_cycle_data.get("max_ring_bush_detected", 0), frame_ring_bush))
+                        active_cycle_data["max_rod_detected"] = active_cycle_data["max_ring_bush_detected"]
                         active_cycle_data["max_striker_detected"] = min(2, max(active_cycle_data["max_striker_detected"], frame_striker))
                         active_cycle_data["max_back_hook_detected"] = min(2, max(active_cycle_data["max_back_hook_detected"], frame_back_hook))
                         active_cycle_data["max_lock_striker_detected"] = min(1, max(active_cycle_data["max_lock_striker_detected"], frame_lock_striker))

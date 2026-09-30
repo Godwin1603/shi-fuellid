@@ -95,8 +95,46 @@ active_cycle_data = {
 
 # Global placeholders for decoupled streaming speedup
 latest_raw_frame = None
+latest_unenhanced_frame = None
 current_detections = []
 latest_annotated_frame = None
+
+# -------------------------------
+# Automatic Brightness Enhancement
+# -------------------------------
+# Gamma lookup table pre-computed for gamma = 0.60
+_GAMMA_060_LUT = np.array(
+    [np.clip(255.0 * ((i / 255.0) ** 0.60), 0, 255) for i in range(256)],
+    dtype=np.uint8
+)
+
+# Mild CLAHE object with clipLimit = 1.5 and tileGridSize = (8, 8)
+_CLAHE_15 = cv2.createCLAHE(clipLimit=1.5, tileGridSize=(8, 8))
+
+def enhance_image(image, save_original_debug=False, debug_path=None):
+    """
+    Automatic brightness enhancement for vision system images before saving to disk.
+    
+    Processing Pipeline:
+      Camera Frame -> Gamma Correction (0.60) -> BGR to LAB -> CLAHE L channel (1.5, 8x8) -> LAB to BGR -> Enhanced Image
+    """
+    if image is None:
+        return None
+
+    if save_original_debug and debug_path:
+        try:
+            os.makedirs(os.path.dirname(debug_path), exist_ok=True)
+            cv2.imwrite(debug_path, image, [cv2.IMWRITE_JPEG_QUALITY, 95])
+        except Exception as e:
+            pass
+
+    gamma_corrected = cv2.LUT(image, _GAMMA_060_LUT)
+    lab = cv2.cvtColor(gamma_corrected, cv2.COLOR_BGR2LAB)
+    l_chan, a_chan, b_chan = cv2.split(lab)
+    l_enhanced = _CLAHE_15.apply(l_chan)
+    lab_enhanced = cv2.merge((l_enhanced, a_chan, b_chan))
+    enhanced_frame = cv2.cvtColor(lab_enhanced, cv2.COLOR_LAB2BGR)
+    return enhanced_frame
 
 # -------------------------------
 # Initialization Helper

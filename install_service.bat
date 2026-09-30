@@ -1,6 +1,6 @@
 @echo off
 echo ==============================================
-echo SSP Production - Windows Service Installer
+echo SHI Production - Windows Service Installer
 echo ==============================================
 echo.
 
@@ -22,28 +22,28 @@ if not exist "nssm.exe" (
     exit /b 1
 )
 
-set SERVICE_NAME=SSP_VisionSystem
+set SERVICE_NAME=SHI_VisionSystem
 set APP_PATH=%~dp0app.py
 
 :: We will assume Python 3.12 is in the system PATH
 echo Installing %SERVICE_NAME%...
 nssm install %SERVICE_NAME% "py" "-3.12 \"%APP_PATH%\""
 nssm set %SERVICE_NAME% AppDirectory "%~dp0"
-nssm set %SERVICE_NAME% Description "SSP Fuel Lid AI Vision Inspection System"
+nssm set %SERVICE_NAME% Description "SHI Fuel Lid AI Vision Inspection System"
 nssm set %SERVICE_NAME% Start SERVICE_AUTO_START
 nssm set %SERVICE_NAME% AppStdout "%~dp0logs\service_stdout.log"
 nssm set %SERVICE_NAME% AppStderr "%~dp0logs\service_stderr.log"
 
-echo Installing SSP_OCR_Service...
-nssm install SSP_OCR_Service "py" "-3.12 \"%~dp0paddleocr_server.py\""
-nssm set SSP_OCR_Service AppDirectory "%~dp0"
-nssm set SSP_OCR_Service Description "SSP OCR Microservice"
-nssm set SSP_OCR_Service Start SERVICE_AUTO_START
-nssm set SSP_OCR_Service AppStdout "%~dp0logs\ocr_stdout.log"
-nssm set SSP_OCR_Service AppStderr "%~dp0logs\ocr_stderr.log"
+echo Installing SHI_OCR_Service...
+nssm install SHI_OCR_Service "py" "-3.12 \"%~dp0paddleocr_server.py\""
+nssm set SHI_OCR_Service AppDirectory "%~dp0"
+nssm set SHI_OCR_Service Description "SHI OCR Microservice"
+nssm set SHI_OCR_Service Start SERVICE_AUTO_START
+nssm set SHI_OCR_Service AppStdout "%~dp0logs\ocr_stdout.log"
+nssm set SHI_OCR_Service AppStderr "%~dp0logs\ocr_stderr.log"
 
 echo Starting the services...
-nssm start SSP_OCR_Service
+nssm start SHI_OCR_Service
 nssm start %SERVICE_NAME%
 
 echo.

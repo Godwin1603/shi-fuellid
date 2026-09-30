@@ -26,62 +26,66 @@ class FlushFileHandler(logging.StreamHandler):
 
 logging.getLogger().handlers = [FlushFileHandler(sys.stdout)]
 
-logging.info("Initializing PaddleOCR engine (targeting GPU, with CPU fallback)...")
+logging.info("Initializing PaddleOCR engine...")
 from paddleocr import PaddleOCR
 import paddle
 
 ocr = None
 try:
-    has_gpu = paddle.device.is_compiled_with_cuda() and paddle.device.cuda.device_count() > 0
-    if has_gpu:
-        paddle.device.set_device('gpu:0')
-        ocr = PaddleOCR(
-            use_angle_cls=False,
-            lang='en',
-            use_gpu=True,
-            enable_mkldnn=False
-        )
-        logging.info("PaddleOCR successfully initialized on GPU (CUDA).")
-    else:
-        raise RuntimeError("No active CUDA GPU device detected by Paddle runtime.")
+    ocr = PaddleOCR(lang='en')
+    logging.info("PaddleOCR successfully initialized.")
 except Exception as e:
-    logging.warning(f"PaddleOCR GPU unavailable or failed ({e}). Falling back to CPU.")
+    logging.error(f"PaddleOCR initialization failed: {e}")
     try:
-        paddle.device.set_device('cpu')
-    except Exception:
-        pass
-    ocr = PaddleOCR(
-        use_angle_cls=False,
-        lang='en',
-        use_gpu=False,
-        enable_mkldnn=True
-    )
-    logging.info("PaddleOCR running on CPU fallback.")
+        ocr = PaddleOCR()
+        logging.info("PaddleOCR initialized with default config.")
+    except Exception as ex:
+        logging.error(f"Fallback PaddleOCR initialization failed: {ex}")
 
 
 def run_ocr(image):
-    """Run PaddleOCR and extract texts/scores."""
-    result = ocr.ocr(image)
-    results = []
-    if result and isinstance(result, list):
-        for res in result:
+    """Run PaddleOCR with fast recognition fallback for cropped serial regions."""
+    def parse_res(res_list):
+        parsed = []
+        if not res_list or not isinstance(res_list, list):
+            return parsed
+        for res in res_list:
             if not res:
                 continue
-                
-            # PaddleX 3.x OCRResult format (dict-like)
             if hasattr(res, 'keys') and 'rec_texts' in res:
                 texts = res.get('rec_texts', [])
                 scores = res.get('rec_scores', [])
                 for t, s in zip(texts, scores):
-                    results.append({"rec_text": t, "rec_score": float(s)})
-            # PaddleOCR 2.x format (list of lists)
+                    parsed.append({"rec_text": t, "rec_score": float(s)})
             elif isinstance(res, list):
                 for line in res:
                     if isinstance(line, list) and len(line) == 2 and isinstance(line[1], tuple):
-                        results.append({
+                        parsed.append({
                             "rec_text": line[1][0],
                             "rec_score": float(line[1][1])
                         })
+                    elif isinstance(line, tuple) and len(line) == 2:
+                        parsed.append({
+                            "rec_text": line[0],
+                            "rec_score": float(line[1])
+                        })
+        return parsed
+
+    # 1. Try standard detection + recognition
+    try:
+        raw_result = ocr.ocr(image, det=True, rec=True)
+        results = parse_res(raw_result)
+    except Exception:
+        results = []
+
+    # 2. If detection returned no text (common on tight bounding-box crops), run direct recognition (det=False)
+    if not results:
+        try:
+            rec_result = ocr.ocr(image, det=False, rec=True)
+            results = parse_res(rec_result)
+        except Exception:
+            results = []
+
     return results
 
 
