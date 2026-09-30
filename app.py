@@ -95,6 +95,20 @@ import urllib.error
 import base64 as _base64
 import json as _json
 
+def kill_process_on_port(port=5001):
+    """Cleanly terminates any zombie/stale process listening on target port before restarting microservice."""
+    try:
+        import subprocess
+        output = subprocess.check_output(f'netstat -ano | findstr :{port}', shell=True).decode('utf-8', errors='ignore')
+        for line in output.strip().splitlines():
+            parts = line.split()
+            if len(parts) >= 5 and 'LISTENING' in line:
+                pid = parts[-1]
+                logger.info(f"[OCR Recovery] Killing zombie process on port {port} (PID: {pid})...")
+                subprocess.run(f'taskkill /F /PID {pid}', shell=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    except Exception:
+        pass
+
 class _PaddleOCRClient:
     """HTTP client that calls the paddleocr_server.py microservice (py -3.12)."""
     PADDLE_URL = "http://127.0.0.1:5001/ocr"
@@ -110,7 +124,7 @@ class _PaddleOCRClient:
             payload = _json.dumps({"image": b64}).encode()
             req = _urllib_req.Request(self.PADDLE_URL, data=payload,
                                       headers={'Content-Type': 'application/json'})
-            resp = _urllib_req.urlopen(req, timeout=15)  # Increased to 5 to give back-side crops more time
+            resp = _urllib_req.urlopen(req, timeout=15)  # Increased to 15 to give back-side crops more time
             raw_data = resp.read()
             data = _json.loads(raw_data)
             results = data.get("results", [])
@@ -141,6 +155,7 @@ class _PaddleOCRClient:
             # Auto-attempt starting PaddleOCR server if connection was refused
             try:
                 import subprocess
+                kill_process_on_port(5001)
                 logger.info("Attempting to auto-start paddleocr_server.py in background...")
                 subprocess.Popen(["py", "-3.12", "paddleocr_server.py"], cwd=os.getcwd())
             except Exception as launch_err:
@@ -751,7 +766,12 @@ def finalize_report_and_rename(c_data):
         reset_cycle_state()
 
     except Exception as e:
-        print(f"[Finalize Thread] Error: {e}")
+        import traceback
+        logger.error(f"[Finalize Thread] Critical Error during finalization: {e}")
+        logger.error(traceback.format_exc())
+    finally:
+        with lock:
+            c_data["processing_thread_active"] = False
 
 def check_and_finalize_cycle(c_data):
     """Verifies if front and back have been captured, then triggers finalization."""
@@ -813,6 +833,7 @@ def reset_cycle_state():
             "front_first_seen_time": None,
             "back_first_seen_time": None,
             "remove_frames_count": 0,
+            "remove_state_start_time": None,
             "no_panel_frames_count": 0,
             "ocr_start_time": None,
             "front_type": None,  # "standard" if 'front' detected, "circle" if 'circle_front' detected
@@ -829,6 +850,8 @@ class CameraStreamer:
         self.m_hBufferConvert = ctypes.c_void_p(None)
         self.m_isNeedConvert = ctypes.c_bool(False)
         self.latest_frame = None
+        self.last_frame_time = time.time()
+        self.last_connected_cam_id = 0
         
         # Actual pixel format read back from camera after configuration
         self.actual_pixel_format = ""
@@ -885,6 +908,7 @@ class CameraStreamer:
         return cams
 
     def connect(self, index=0, exposure=None, gain=None, gamma=None, pixel_format=None, trigger_mode=None):
+        self.last_connected_cam_id = index
         if not sdk_available:
             self.last_error_msg = "SDK unavailable."
             return False
@@ -1252,6 +1276,20 @@ class CameraStreamer:
                                 pass
                     self.latest_frame = rawNp.copy()
 
+    def check_and_recover(self):
+        """Watchdog: Checks if frame feed has stalled for > 3.5 seconds. Reconnects camera if needed."""
+        if not self.is_connected:
+            return False
+        if time.time() - self.last_frame_time > 3.5:
+            print(f"[Camera Watchdog] GigE camera frame feed stalled (> 3.5s since last callback frame). Auto-reconnecting camera ID {self.last_connected_cam_id}...")
+            try:
+                self.connect(self.last_connected_cam_id)
+                return True
+            except Exception as e:
+                print(f"[Camera Watchdog] Reconnection error: {e}")
+                return False
+        return False
+
     def get_frame(self):
         with self.lock:
             if self.latest_frame is not None:
@@ -1354,6 +1392,7 @@ def video_processing_loop():
                 if not cam.is_connected:
                     time.sleep(0.05)
                     continue
+                cam.check_and_recover()
                 frame = cam.get_frame()
                 if frame is None:
                     time.sleep(0.01)
@@ -1538,6 +1577,9 @@ def yolo_worker_loop():
         if _debug_counter % 30 == 0:
             print(f"[YOLO] Running inference frame #{_debug_counter}, state={state}")
             
+        if _debug_counter % 300 == 0 and torch.cuda.is_available():
+            torch.cuda.empty_cache()
+            
         h_orig, w_orig = frame_to_process.shape[:2]
         
         # Resize frame for faster YOLO inference (user trained at 432x432, 448 is closest stride-32 multiple)
@@ -1555,7 +1597,8 @@ def yolo_worker_loop():
             
             # Explicitly target GPU (device=0) for YOLO inference; fallback to cpu only if CUDA unavailable
             yolo_dev = 0 if torch.cuda.is_available() else 'cpu'
-            results = YOLO_MODEL(frame_resized, verbose=False, conf=run_thresh, task='segment', imgsz=448, device=yolo_dev)
+            with torch.inference_mode():
+                results = YOLO_MODEL(frame_resized, verbose=False, conf=run_thresh, task='segment', imgsz=448, device=yolo_dev)
             new_detections = []
             frame_holes = 0
             frame_ring_bush = 0
@@ -2055,6 +2098,9 @@ def yolo_worker_loop():
 
                         
                 elif state == "WAITING_REMOVE":
+                    if active_cycle_data.get("remove_state_start_time") is None:
+                        active_cycle_data["remove_state_start_time"] = time.time()
+                    
                     # Check for ANY detection (panel or sub-features from circular shapes)
                     any_lid_visible = has_front_detected or has_back_detected or len(sub_feature_boxes) > 0
                     if not any_lid_visible:
@@ -2076,6 +2122,10 @@ def yolo_worker_loop():
                         needs_reset = True
                     else:
                         active_cycle_data["remove_frames_count"] = 0
+                        # Fail-safe: if operator removed part but ghost noise persists for > 8s after finalization, force reset
+                        if time.time() - active_cycle_data["remove_state_start_time"] > 8.0 and not active_cycle_data.get("processing_thread_active", False):
+                            logger.warning("[State Watchdog] Part removal timeout (8s elapsed). Auto-resetting for next cycle.")
+                            needs_reset = True
                         
                 # Update UI data outside state transitions
                 if state in ["WAITING_FRONT", "WAITING_LOCK_STRIKER", "WAITING_BACK", "WAITING_REMOVE"]:
