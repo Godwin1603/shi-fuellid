@@ -249,9 +249,9 @@
             position: absolute;
             top: 0;
             bottom: 0;
-            width: 28%;
-            max-width: 260px;
-            min-width: 100px;
+            width: 12%;
+            max-width: 120px;
+            min-width: 60px;
             z-index: 8;
             display: flex;
             align-items: center;
@@ -816,13 +816,22 @@
             </div>
         </div>
         <div class="header-right">
-            <button class="config-toggle-btn" id="header-connect-btn" onclick="connectGige()" style="background-color: var(--accent-blue); color: white; border: none; margin-right: 8px;">
-                <svg width="14" height="14" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24">
-                    <path stroke-linecap="round" stroke-linejoin="round" d="M6.827 6.175A2.31 2.31 0 0 1 5.186 7.23c-.38.054-.757.112-1.134.175C2.999 7.58 2.25 8.507 2.25 9.574V18a2.25 2.25 0 0 0 2.25 2.25h15A2.25 2.25 0 0 0 21.75 18V9.574c0-1.067-.75-1.994-1.802-2.169a47.865 47.865 0 0 0-1.134-.175 2.31 2.31 0 0 1-1.64-1.055l-.822-1.316a2.192 2.192 0 0 0-1.736-1.039 48.774 48.774 0 0 0-5.232 0 2.192 2.192 0 0 0-1.736 1.039l-.821 1.316Z" />
-                    <path stroke-linecap="round" stroke-linejoin="round" d="M16.5 12.75a4.5 4.5 0 1 1-9 0 4.5 4.5 0 0 1 9 0ZM18.75 10.5h.008v.008h-.008V10.5Z" />
-                </svg>
-                Connect Camera
-            </button>
+            <style>
+                @keyframes bounce-right {
+                    0%, 100% { transform: translateX(0); }
+                    50% { transform: translateX(-6px); }
+                }
+            </style>
+            <div style="position: relative; display: flex; align-items: center;">
+                <div id="top-tour-arrow" style="position: absolute; left: -32px; font-size: 24px; animation: bounce-right 1.5s infinite; filter: drop-shadow(0 2px 4px rgba(0,0,0,0.3)); pointer-events: none; z-index: 100;">👉</div>
+                <button class="config-toggle-btn tour-btn" id="header-connect-btn" onclick="connectGige()" style="background-color: var(--accent-blue); color: white; border: none; margin-right: 8px;">
+                    <svg width="14" height="14" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24">
+                        <path stroke-linecap="round" stroke-linejoin="round" d="M6.827 6.175A2.31 2.31 0 0 1 5.186 7.23c-.38.054-.757.112-1.134.175C2.999 7.58 2.25 8.507 2.25 9.574V18a2.25 2.25 0 0 0 2.25 2.25h15A2.25 2.25 0 0 0 21.75 18V9.574c0-1.067-.75-1.994-1.802-2.169a47.865 47.865 0 0 0-1.134-.175 2.31 2.31 0 0 1-1.64-1.055l-.822-1.316a2.192 2.192 0 0 0-1.736-1.039 48.774 48.774 0 0 0-5.232 0 2.192 2.192 0 0 0-1.736 1.039l-.821 1.316Z" />
+                        <path stroke-linecap="round" stroke-linejoin="round" d="M16.5 12.75a4.5 4.5 0 1 1-9 0 4.5 4.5 0 0 1 9 0ZM18.75 10.5h.008v.008h-.008V10.5Z" />
+                    </svg>
+                    Connect Camera
+                </button>
+            </div>
             <button class="config-toggle-btn" onclick="toggleConfigSidebar()">
                 <svg width="14" height="14" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24">
                     <path stroke-linecap="round" stroke-linejoin="round" d="M9.594 3.94c.09-.542.56-.94 1.11-.94h2.593c.55 0 1.02.398 1.11.94l.213 1.281c.063.374.313.686.645.87.074.04.147.083.22.127.324.196.72.257 1.075.124l1.217-.456a1.125 1.125 0 0 1 1.37.49l1.296 2.247a1.125 1.125 0 0 1-.26 1.43l-1.003.828c-.293.241-.438.613-.43.992a7.723 7.723 0 0 1 0 .255c-.008.378.137.75.43.991l1.004.827c.424.35.534.954.26 1.43l-1.298 2.247a1.125 1.125 0 0 1-1.369.491l-1.217-.456c-.355-.133-.75-.072-1.076.124a6.57 6.57 0 0 1-.22.128c-.331.183-.581.495-.644.869l-.213 1.28c-.09.543-.56.94-1.11.94h-2.594c-.55 0-1.02-.398-1.11-.94l-.213-1.281c-.062-.374-.312-.686-.644-.87a6.52 6.52 0 0 1-.22-.127c-.325-.196-.72-.257-1.076-.124l-1.217.456a1.125 1.125 0 0 1-1.369-.49l-1.297-2.247a1.125 1.125 0 0 1 .26-1.43l1.004-.827c.292-.24.437-.613.43-.992a6.932 6.932 0 0 1 0-.255c.007-.378-.138-.75-.43-.991l-1.004-.827a1.125 1.125 0 0 1-.26-1.43l1.297-2.247a1.125 1.125 0 0 1 1.37-.491l1.216.456c.356.133.751.072 1.076-.124.072-.044.146-.087.22-.128.332-.183.582-.495.644-.869l.214-1.281Z"/>
@@ -859,13 +868,29 @@
                     </svg>
                     <span>Camera Stream Standby</span>
                     <!-- One-click Connect Camera button — connects SN:73ABE004 directly, no scan needed -->
-                    <button id="main-connect-btn"
-                        onclick="connectDefaultGige()"
-                        style="margin-top:6px; padding:10px 24px; background:#2563eb; color:#fff; border:none; border-radius:8px; font-size:14px; font-weight:700; cursor:pointer; letter-spacing:0.4px; display:flex; align-items:center; gap:8px; box-shadow:0 2px 8px rgba(37,99,235,0.25); transition:background 0.2s;"
-                        onmouseover="this.style.background='#1d4ed8'" onmouseout="this.style.background='#2563eb'">
-                        <svg width="16" height="16" fill="none" stroke="currentColor" stroke-width="2.5" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" d="M5.636 5.636a9 9 0 1 0 12.728 0M12 3v9"/></svg>
-                        Connect Camera
-                    </button>
+                    <style>
+                        @keyframes bounce-arrow {
+                            0%, 100% { transform: translateY(0); }
+                            50% { transform: translateY(-8px); }
+                        }
+                        @keyframes pulse-glow {
+                            0% { box-shadow: 0 0 0 0 rgba(37, 99, 235, 0.7); }
+                            70% { box-shadow: 0 0 0 15px rgba(37, 99, 235, 0); }
+                            100% { box-shadow: 0 0 0 0 rgba(37, 99, 235, 0); }
+                        }
+                        .tour-btn {
+                            animation: pulse-glow 2s infinite;
+                        }
+                    </style>
+                    <div style="position: relative; margin-top: 15px;">
+                        <button id="main-connect-btn"
+                            onclick="connectDefaultGige()"
+                            style="padding:14px 32px; background:#2563eb; color:#fff; border:none; border-radius:8px; font-size:16px; font-weight:800; cursor:pointer; letter-spacing:0.5px; display:flex; align-items:center; gap:10px; transition:background 0.2s;"
+                            onmouseover="this.style.background='#1d4ed8'" onmouseout="this.style.background='#2563eb'">
+                            <svg width="20" height="20" fill="none" stroke="currentColor" stroke-width="2.5" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" d="M5.636 5.636a9 9 0 1 0 12.728 0M12 3v9"/></svg>
+                            Connect Camera
+                        </button>
+                    </div>
                     <div id="main-connect-msg" style="font-size:12px; color:#94a3b8; text-align:center;"></div>
                 </div>
 
@@ -1442,12 +1467,24 @@
                     // Hide main-screen connect button when connected
                     const mainBtn = document.getElementById('main-connect-btn');
                     if (mainBtn) mainBtn.style.display = 'none';
+                    
+                    // Remove top tour arrow and pulse animation when connected
+                    const topArrow = document.getElementById('top-tour-arrow');
+                    if (topArrow) topArrow.style.display = 'none';
+                    const topBtn = document.getElementById('header-connect-btn');
+                    if (topBtn) topBtn.classList.remove('tour-btn');
                 } else {
                     connEl.textContent  = s.status || 'Disconnected';
                     connEl.style.color  = '#dc2626';
                     // Show main-screen connect button again when disconnected
                     const mainBtn = document.getElementById('main-connect-btn');
                     if (mainBtn) { mainBtn.style.display = 'flex'; mainBtn.disabled = false; mainBtn.style.background = '#2563eb'; }
+                    
+                    // Show top tour arrow and pulse animation when disconnected
+                    const topArrow = document.getElementById('top-tour-arrow');
+                    if (topArrow) topArrow.style.display = 'block';
+                    const topBtn = document.getElementById('header-connect-btn');
+                    if (topBtn) topBtn.classList.add('tour-btn');
                 }
             })
             .catch(() => {});
@@ -1703,6 +1740,22 @@
 
         // Start polling status
         setInterval(pollStatus, 500);
+
+        // Apply UI config from config.yaml (side flash bar widths)
+        fetch('/ui_config')
+            .then(r => r.json())
+            .then(cfg => {
+                const pct     = cfg.side_flash_width_percent ?? 12;
+                const maxPx   = cfg.side_flash_max_width_px  ?? 120;
+                const minPx   = Math.round(maxPx * 0.5);          // min = half of max
+                document.querySelectorAll('.side-signal').forEach(el => {
+                    el.style.width    = pct + '%';
+                    el.style.maxWidth = maxPx + 'px';
+                    el.style.minWidth = minPx + 'px';
+                });
+            })
+            .catch(() => { /* server not up yet — CSS defaults remain */ });
+
     </script>
 </body>
 </html>

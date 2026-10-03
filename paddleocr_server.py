@@ -10,7 +10,7 @@ import base64
 import json
 import logging
 import traceback
-from http.server import BaseHTTPRequestHandler, HTTPServer
+from http.server import BaseHTTPRequestHandler, HTTPServer, ThreadingHTTPServer
 
 import cv2
 import numpy as np
@@ -56,6 +56,9 @@ logging.info("Initializing PaddleOCR engine...")
 from paddleocr import PaddleOCR
 import paddle
 
+# Thread lock so simultaneous requests share the PaddleOCR instance safely
+_ocr_lock = threading.Lock()
+
 ocr = None
 try:
     # Explicitly disable GPU to prevent crashes/hangs on legacy drivers
@@ -99,19 +102,21 @@ def run_ocr(image):
         return parsed
 
     # 1. Try standard detection + recognition
-    try:
-        raw_result = ocr.ocr(image, det=True, rec=True)
-        results = parse_res(raw_result)
-    except Exception:
-        results = []
-
-    # 2. If detection returned no text (common on tight bounding-box crops), run direct recognition (det=False)
-    if not results:
+    # Use a lock so concurrent requests from ThreadingHTTPServer don't corrupt the PaddleOCR state
+    with _ocr_lock:
         try:
-            rec_result = ocr.ocr(image, det=False, rec=True)
-            results = parse_res(rec_result)
+            raw_result = ocr.ocr(image, det=True, rec=True)
+            results = parse_res(raw_result)
         except Exception:
             results = []
+
+        # 2. If detection returned no text (common on tight bounding-box crops), run direct recognition (det=False)
+        if not results:
+            try:
+                rec_result = ocr.ocr(image, det=False, rec=True)
+                results = parse_res(rec_result)
+            except Exception:
+                results = []
 
     return results
 
@@ -157,7 +162,6 @@ class OCRHandler(BaseHTTPRequestHandler):
 
 
 if __name__ == '__main__':
-    server = HTTPServer(('127.0.0.1', 5001), OCRHandler)
-    logging.info("PaddleOCR server listening on http://127.0.0.1:5001")
+    server = ThreadingHTTPServer(('127.0.0.1', 5001), OCRHandler)
+    logging.info("PaddleOCR server listening on http://127.0.0.1:5001 (threaded)")
     server.serve_forever()
-

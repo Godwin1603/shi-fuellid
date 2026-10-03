@@ -3,7 +3,7 @@
 # --- AI & Vision Settings ---
 ai:
   # Path to the trained YOLO model
-  model_path: "SHI_FUEL_DOOR_V1.1.pt"
+  model_path: "SHI_FUEL_DOOR_V2.pt"
   # Confidence threshold for detecting the OCR target regions (serial, back, etc.)
   ocr_confidence_threshold: 0.10
   # Fallback timeout (in seconds) before attempting to read the back panel if serial is missing
@@ -15,12 +15,14 @@ ai:
     serial: 0.10
     serial_area: 0.10
     line_mark: 0.30
-    hole: 0.85
-    back_hook: 0.60
+    hole: 0.50
+    hole_spec_error: 0.70  # NEW in V2: hole specification error
+    back_hook: 0.50
     lock_striker: 0.20
-    ring_bush: 0.30
-    rod: 1.00
-    striker: 0.20
+    ring_bush: 0.40
+    striker: 0.60
+    buldge: 0.40            # NEW in V2: surface bulge defect
+    dent: 0.40              # NEW in V2: surface dent defect
   # Minimum bounding box area (in pixels) for a defect to be considered valid to prevent false positives quickly
   min_defect_area: 200
   # Default YOLO confidence threshold if a class is not specified above
@@ -33,6 +35,21 @@ ai:
     metal_min_ratio: 0.15
     laplacian_variance_min: 150.0  # Threshold for texture/edge density
 
+  ring_bush_verification:
+    debug_mode: true
+    lab_l_threshold: 200
+    min_contour_area: 50
+    max_contour_area: 5000
+    morph_kernel_size: 5
+    present_threshold: 0.7
+    absent_threshold: 0.3
+    weights:
+      brightness: 0.3
+      area: 0.3
+      position: 0.2
+      shape: 0.2
+
+
   
 # --- Data Management ---
 storage:
@@ -44,6 +61,14 @@ web:
   host: "0.0.0.0"
   port: 5000
 
+# --- UI Display Settings ---
+ui:
+  # Width of the side flash bars (OK / NG) as a percentage of the live camera view.
+  # Reduce this value if the bars overlap the camera feed. Range: 1–50 (%)
+  side_flash_width_percent: 30
+  # Hard maximum width cap for the side flash bars in pixels.
+  side_flash_max_width_px: 120
+
 # --- Default Camera Connection Settings (Optional) ---
 # If you want the app to auto-connect on startup, fill these out. Otherwise leave blank.
 camera:
@@ -51,7 +76,7 @@ camera:
   gige:
     target_serial: "73ABE004"  # Always connect this specific camera by serial number
     pixel_format: "BayerRG8" # UA5MEAGV-50C native color format (BGR8/RGB8 not supported by camera)
-    exposure: 60000.0
+    exposure: 65000.0
     gain: 1.0
   # For RTSP IP Cameras
   rtsp:

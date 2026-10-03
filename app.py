@@ -102,61 +102,139 @@ torch.load = _patched_load
 
 # ── GPU Detection & Thread Policy ─────────────────────────────────────────────
 # Detect CUDA once at startup. This result drives all device decisions app-wide.
+
+# NVIDIA Windows minimum driver version per CUDA toolkit version
+# Source: https://docs.nvidia.com/cuda/cuda-toolkit-release-notes/index.html
+_CUDA_MIN_DRIVER = {
+    "11.0": 451.48, "11.1": 456.81, "11.2": 461.09, "11.3": 465.89,
+    "11.4": 471.11, "11.5": 496.04, "11.6": 511.23, "11.7": 516.01,
+    "11.8": 522.06, "12.0": 527.41, "12.1": 531.14, "12.2": 536.25,
+    "12.3": 545.84, "12.4": 551.61, "12.5": 555.85, "12.6": 560.94,
+}
+
+def _get_nvidia_driver_version():
+    """Query nvidia-smi for the installed driver version. Returns float or 0.0."""
+    import subprocess
+    for smi_path in [
+        r"C:\Program Files\NVIDIA Corporation\NVSMI\nvidia-smi.exe",
+        "nvidia-smi",
+    ]:
+        try:
+            out = subprocess.check_output(
+                [smi_path, "--query-gpu=driver_version", "--format=csv,noheader"],
+                stderr=subprocess.DEVNULL, timeout=5
+            ).decode().strip()
+            if out:
+                return float(out.split()[0])
+        except Exception:
+            continue
+    return 0.0
+
 def _detect_gpu():
     """
     Returns (gpu_available: bool, device_str: str, info_msg: str).
-    Runs a real CUDA tensor op to confirm the GPU actually works,
-    not just that the driver is loaded.
+    Attempts up to 3 times with a short delay to handle transient CUDA init
+    failures at startup (e.g. driver not yet fully loaded, GPU briefly held
+    by another process from a previous crashed session).
+    Calls torch.cuda.init() before each check to force the runtime to load.
+    Uses correct per-CUDA-version minimum driver thresholds.
     """
-    if not torch.cuda.is_available():
-        # Diagnose WHY CUDA is not available
-        if torch.backends.cuda.is_built():
-            # PyTorch has CUDA support compiled in but can't init
-            try:
-                import subprocess
-                smi = subprocess.check_output(
-                    r'"C:\Program Files\NVIDIA Corporation\NVSMI\nvidia-smi.exe" '
-                    r'--query-gpu=driver_version --format=csv,noheader',
-                    shell=True, stderr=subprocess.DEVNULL
-                ).decode().strip()
-                drv = float(smi.split()[0]) if smi else 0.0
-            except Exception:
-                drv = 0.0
+    import time as _time
 
-            cu_ver = torch.version.cuda or "unknown"
-            if drv > 0 and drv < 452.39:
-                msg = (
-                    f"[GPU] CUDA DISABLED — Driver too old! "
-                    f"Installed: {drv}, Required for CUDA {cu_ver}: ≥452.39. "
-                    f"Update driver from: https://www.nvidia.com/Download/index.aspx "
-                    f"(Quadro K1200 → Quadro K-Series → latest R470 branch). "
-                    f"Falling back to CPU."
-                )
+    cu_ver = torch.version.cuda or "unknown"
+    # Look up required driver for this exact CUDA version (e.g. "11.8")
+    _min_drv = _CUDA_MIN_DRIVER.get(cu_ver)
+    if _min_drv is None:
+        # Try major version only (e.g. "11" from "11.8.0")
+        for key in sorted(_CUDA_MIN_DRIVER.keys(), reverse=True):
+            if cu_ver.startswith(key.rsplit(".", 1)[0] + "."):
+                _min_drv = _CUDA_MIN_DRIVER[key]
+                break
+    if _min_drv is None:
+        _min_drv = 452.39  # conservative fallback
+
+    MAX_ATTEMPTS = 3
+    RETRY_DELAY  = 1.5  # seconds between retries
+
+    for attempt in range(1, MAX_ATTEMPTS + 1):
+        # Force CUDA runtime initialisation before querying availability.
+        # This resolves "not available" false-negatives caused by lazy init.
+        try:
+            torch.cuda.init()
+        except Exception:
+            pass  # raises if CUDA is genuinely unavailable; caught below
+
+        if not torch.cuda.is_available():
+            if attempt < MAX_ATTEMPTS:
+                print(f"[GPU] CUDA not available on attempt {attempt}/{MAX_ATTEMPTS}. Retrying in {RETRY_DELAY}s...")
+                _time.sleep(RETRY_DELAY)
+                continue
+
+            # All attempts exhausted — give an actionable diagnosis
+            if torch.backends.cuda.is_built():
+                drv = _get_nvidia_driver_version()
+                if drv > 0 and drv < _min_drv:
+                    msg = (
+                        f"[GPU] CUDA DISABLED — Driver too old! "
+                        f"Installed: {drv}, Required for CUDA {cu_ver}: >={_min_drv}. "
+                        f"Update at: https://www.nvidia.com/Download/index.aspx "
+                        f"Falling back to CPU."
+                    )
+                elif drv == 0.0:
+                    msg = (
+                        f"[GPU] CUDA DISABLED — PyTorch {torch.__version__} built with CUDA {cu_ver} "
+                        f"but nvidia-smi not found (no NVIDIA GPU? missing PATH?). "
+                        f"Falling back to CPU."
+                    )
+                else:
+                    msg = (
+                        f"[GPU] CUDA DISABLED — PyTorch {torch.__version__} with CUDA {cu_ver} "
+                        f"could not initialize (driver={drv}, required>={_min_drv}). "
+                        f"Try: update driver, reinstall PyTorch, or reboot the PC. "
+                        f"Falling back to CPU."
+                    )
             else:
                 msg = (
-                    f"[GPU] CUDA DISABLED — PyTorch {torch.__version__} with CUDA {cu_ver} "
-                    f"could not initialize. Check driver compatibility. "
+                    f"[GPU] CUDA DISABLED — PyTorch {torch.__version__} was built WITHOUT CUDA. "
+                    f"Install CUDA PyTorch: pip install torch --index-url https://download.pytorch.org/whl/cu118 "
                     f"Falling back to CPU."
                 )
-        else:
-            msg = (
-                f"[GPU] CUDA DISABLED — PyTorch {torch.__version__} was built WITHOUT CUDA. "
-                f"Install a CUDA-enabled PyTorch build. Falling back to CPU."
-            )
-        return False, 'cpu', msg
+            return False, 'cpu', msg
 
-    # CUDA is reported available — do a quick smoke-test tensor op
-    try:
-        _t = torch.zeros(1, device='cuda:0')
-        del _t
-        torch.cuda.synchronize()
-        gpu_name = torch.cuda.get_device_name(0)
-        vram_gb  = round(torch.cuda.get_device_properties(0).total_memory / 1024**3, 1)
-        msg = f"[GPU] CUDA OK — {gpu_name} ({vram_gb} GB VRAM) — YOLO will use GPU:0"
-        return True, 'cuda:0', msg
-    except Exception as e:
-        msg = f"[GPU] CUDA reported available but smoke-test FAILED ({e}). Falling back to CPU."
-        return False, 'cpu', msg
+        # CUDA is reported available — run a real smoke-test to confirm
+        try:
+            _t = torch.zeros(1, device='cuda:0')
+            del _t
+            torch.cuda.synchronize()
+            
+            # Smoke test passed, but we must verify driver version can handle the compiled CUDA version
+            drv = _get_nvidia_driver_version()
+            if drv > 0 and drv < _min_drv:
+                msg = (
+                    f"[GPU] CUDA DISABLED — Driver too old! "
+                    f"Installed: {drv}, Required for CUDA {cu_ver}: >={_min_drv}. "
+                    f"Update at: https://www.nvidia.com/Download/index.aspx "
+                    f"Falling back to CPU."
+                )
+                return False, 'cpu', msg
+                
+            gpu_name = torch.cuda.get_device_name(0)
+            vram_gb  = round(torch.cuda.get_device_properties(0).total_memory / 1024**3, 1)
+            attempt_note = f" (initialized on attempt {attempt}/{MAX_ATTEMPTS})" if attempt > 1 else ""
+            msg = f"[GPU] CUDA OK — {gpu_name} ({vram_gb} GB VRAM) — YOLO will use GPU:0{attempt_note}"
+            return True, 'cuda:0', msg
+        except Exception as exc:
+            if attempt < MAX_ATTEMPTS:
+                print(f"[GPU] CUDA smoke-test failed on attempt {attempt}/{MAX_ATTEMPTS}: {exc}. Retrying...")
+                _time.sleep(RETRY_DELAY)
+            else:
+                msg = (
+                    f"[GPU] CUDA reported available but smoke-test FAILED after {MAX_ATTEMPTS} attempts "
+                    f"({exc}). Falling back to CPU."
+                )
+                return False, 'cpu', msg
+
+    return False, 'cpu', "[GPU] CUDA detection loop exhausted. Falling back to CPU."
 
 GPU_AVAILABLE, YOLO_DEVICE, _gpu_msg = _detect_gpu()
 
@@ -280,7 +358,7 @@ class _PaddleOCRClient:
             payload = _json.dumps({"image": b64}).encode()
             req = _urllib_req.Request(self.PADDLE_URL, data=payload,
                                       headers={'Content-Type': 'application/json'})
-            resp = _urllib_req.urlopen(req, timeout=15)  # Increased to 15 to give back-side crops more time
+            resp = _urllib_req.urlopen(req, timeout=8)  # 8s per rotation; OCR runs in background thread so this doesn't block UI
             raw_data = resp.read()
             data = _json.loads(raw_data)
             results = data.get("results", [])
@@ -351,6 +429,13 @@ lock = threading.RLock()
 stream_source = 0  # Default to Webcam
 is_processing = False
 video_cap = None
+
+# Global placeholders for decoupled streaming speedup
+latest_raw_frame = None
+latest_unenhanced_frame = None
+current_detections = []
+latest_annotated_frame = None
+latest_front_crop = None
 
 # Daily cycle count tracking
 cycle_count = 1
@@ -505,7 +590,171 @@ def init_models():
 # -------------------------------
 # Asynchronous Background Processing
 # -------------------------------
+import math
+import os
+import yaml
+
+# Cache config loading for performance
+_LAST_CONFIG_MTIME = 0
+_CACHED_CONFIG = None
+
+def verify_ring_bush(original_frame, front_box, yolo_conf):
+    """
+    OpenCV verification layer for ring bush detection relative to the fuel door (front_box).
+    Returns (decision_state, ring_score, debug_frame)
+    """
+    global _LAST_CONFIG_MTIME, _CACHED_CONFIG
+    try:
+        mtime = os.path.getmtime("config.yaml")
+        if mtime != _LAST_CONFIG_MTIME or _CACHED_CONFIG is None:
+            with open("config.yaml", "r") as f:
+                _CACHED_CONFIG = yaml.safe_load(f)
+            _LAST_CONFIG_MTIME = mtime
+    except Exception:
+        pass
+        
+    cfg = {}
+    if _CACHED_CONFIG:
+        cfg = _CACHED_CONFIG.get("ai", {}).get("ring_bush_verification", {})
+    else:
+        cfg = APP_CONFIG.get("ai", {}).get("ring_bush_verification", {})
+        
+    if not cfg:
+        return "UNCERTAIN", 0.0, None
+        
+    debug_mode = cfg.get("debug_mode", False)
+    fx1, fy1, fx2, fy2 = front_box
+    f_w, f_h = fx2 - fx1, fy2 - fy1
+    
+    if f_w <= 0 or f_h <= 0:
+        return "UNCERTAIN", 0.0, None
+        
+    rx1 = int(fx1 + cfg.get("roi_relative_x1", 0.40) * f_w)
+    ry1 = int(fy1 + cfg.get("roi_relative_y1", 0.40) * f_h)
+    rx2 = int(fx1 + cfg.get("roi_relative_x2", 0.60) * f_w)
+    ry2 = int(fy1 + cfg.get("roi_relative_y2", 0.60) * f_h)
+    
+    h_orig, w_orig = original_frame.shape[:2]
+    rx1, ry1 = max(0, rx1), max(0, ry1)
+    rx2, ry2 = min(w_orig, rx2), min(h_orig, ry2)
+    
+    if rx2 <= rx1 or ry2 <= ry1:
+        return "UNCERTAIN", 0.0, None
+        
+    roi = original_frame[ry1:ry2, rx1:rx2].copy()
+    
+    blur = cv2.GaussianBlur(roi, (5, 5), 0)
+    lab = cv2.cvtColor(blur, cv2.COLOR_BGR2LAB)
+    l_chan, a_chan, b_chan = cv2.split(lab)
+    
+    l_thresh = cfg.get("lab_l_threshold", 200)
+    _, mask = cv2.threshold(l_chan, l_thresh, 255, cv2.THRESH_BINARY)
+    
+    k_size = cfg.get("morph_kernel_size", 5)
+    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (k_size, k_size))
+    mask_clean = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel)
+    mask_clean = cv2.morphologyEx(mask_clean, cv2.MORPH_CLOSE, kernel)
+    
+    contours, _ = cv2.findContours(mask_clean, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    
+    min_a = cfg.get("min_contour_area", 50)
+    max_a = cfg.get("max_contour_area", 5000)
+    
+    valid_contours = []
+    total_valid_area = 0
+    for cnt in contours:
+        area = cv2.contourArea(cnt)
+        if min_a <= area <= max_a:
+            valid_contours.append(cnt)
+            total_valid_area += area
+            
+    roi_area = (rx2 - rx1) * (ry2 - ry1)
+    
+    brightness_score = min(1.0, np.mean(l_chan) / 255.0)
+    area_score = min(1.0, total_valid_area / (min_a * 5)) if total_valid_area > 0 else 0.0
+    
+    position_score = 0.0
+    if valid_contours:
+        largest_cnt = max(valid_contours, key=cv2.contourArea)
+        M = cv2.moments(largest_cnt)
+        if M["m00"] > 0:
+            cx = int(M["m10"] / M["m00"])
+            cy = int(M["m01"] / M["m00"])
+            dx = cx - (rx2 - rx1)/2
+            dy = cy - (ry2 - ry1)/2
+            max_dist = math.hypot((rx2 - rx1)/2, (ry2 - ry1)/2)
+            dist = math.hypot(dx, dy)
+            position_score = max(0.0, 1.0 - (dist / max_dist))
+            
+    shape_score = 0.5 
+    
+    w = cfg.get("weights", {})
+    ring_score = (
+        brightness_score * w.get("brightness", 0.3) +
+        area_score * w.get("area", 0.3) +
+        position_score * w.get("position", 0.2) +
+        shape_score * w.get("shape", 0.2)
+    )
+    
+    p_thresh = cfg.get("present_threshold", 0.7)
+    a_thresh = cfg.get("absent_threshold", 0.3)
+    
+    if ring_score >= p_thresh:
+        final_decision = "PRESENT"
+    elif ring_score <= a_thresh:
+        final_decision = "ABSENT"
+    else:
+        final_decision = "UNCERTAIN"
+        
+    debug_canvas = None
+    if debug_mode:
+        h_pad = 20
+        v_pad = 40
+        dashboard_w = 900
+        dashboard_h = 400
+        debug_canvas = np.zeros((dashboard_h, dashboard_w, 3), dtype=np.uint8)
+        
+        # 1. Original Image snippet (scaled)
+        disp_y1 = max(0, fy1 - 50)
+        disp_y2 = min(h_orig, fy2 + 50)
+        disp_x1 = max(0, fx1 - 50)
+        disp_x2 = min(w_orig, fx2 + 50)
+        if disp_y2 > disp_y1 and disp_x2 > disp_x1:
+            orig_disp = original_frame[disp_y1:disp_y2, disp_x1:disp_x2].copy()
+            cv2.rectangle(orig_disp, (rx1-disp_x1, ry1-disp_y1), (rx2-disp_x1, ry2-disp_y1), (0, 255, 255), 2)
+            cv2.rectangle(orig_disp, (fx1-disp_x1, fy1-disp_y1), (fx2-disp_x1, fy2-disp_y1), (255, 0, 0), 2)
+            orig_disp = cv2.resize(orig_disp, (300, 300))
+            debug_canvas[v_pad:v_pad+300, h_pad:h_pad+300] = orig_disp
+            cv2.putText(debug_canvas, "Fuel Door + ROI Box", (h_pad, v_pad-10), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255,255,255), 1)
+        
+        # 2. Cropped ROI
+        if roi.shape[0] > 0 and roi.shape[1] > 0:
+            roi_disp = cv2.resize(roi, (200, 200))
+            debug_canvas[v_pad:v_pad+200, h_pad+320:h_pad+520] = roi_disp
+            cv2.putText(debug_canvas, "Cropped ROI", (h_pad+320, v_pad-10), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255,255,255), 1)
+        
+        # 3. LAB L-Channel Mask
+        mask_disp = cv2.cvtColor(mask_clean, cv2.COLOR_GRAY2BGR)
+        cv2.drawContours(mask_disp, valid_contours, -1, (0, 0, 255), 2)
+        if mask_disp.shape[0] > 0 and mask_disp.shape[1] > 0:
+            mask_disp = cv2.resize(mask_disp, (200, 200))
+            debug_canvas[v_pad:v_pad+200, h_pad+540:h_pad+740] = mask_disp
+            cv2.putText(debug_canvas, "L-Mask & Contours", (h_pad+540, v_pad-10), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255,255,255), 1)
+        
+        # 4. Text Info
+        info_x = h_pad + 320
+        info_y = v_pad + 230
+        cv2.putText(debug_canvas, f"YOLO Conf: {yolo_conf:.2f}", (info_x, info_y), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255,255,255), 1)
+        cv2.putText(debug_canvas, f"Ring Score: {ring_score:.2f}", (info_x, info_y+30), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255,255,255), 1)
+        cv2.putText(debug_canvas, f"Valid Contours: {len(valid_contours)}", (info_x, info_y+60), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255,255,255), 1)
+        
+        col = (0,255,0) if final_decision == "PRESENT" else (0,0,255) if final_decision == "ABSENT" else (0,255,255)
+        cv2.putText(debug_canvas, f"Final: {final_decision}", (info_x, info_y+100), cv2.FONT_HERSHEY_SIMPLEX, 0.8, col, 2)
+        
+    return final_decision, ring_score, debug_canvas
+
 def has_part(roi_bgr, blue_thresh, metal_min_ratio, laplacian_min):
+
     hsv = cv2.cvtColor(roi_bgr, cv2.COLOR_BGR2HSV)
     h, w = hsv.shape[:2]
     total = h * w
@@ -535,8 +784,158 @@ def has_part(roi_bgr, blue_thresh, metal_min_ratio, laplacian_min):
     # Default to True to avoid incorrectly filtering out a part due to weird lighting
     return True
 
+def _correct_ocr_chars(text):
+    """Fix common OCR char substitutions in numeric context: O->0, I->1, S->5, B->8, Z->2, G->6."""
+    digit_fix = str.maketrans("OISBGZ", "015862")
+    return text.translate(digit_fix)
+
+
+def _validate_serial(serial_14):
+    """
+    Validate a 14-char serial DDMMYY(6) + NNN(3) + [ABC](1) + HHMM(4).
+    Returns True only if the date and time parts are mathematically valid:
+      DD: 01-31, MM: 01-12, YY: 20-40
+      HH: 00-23, MM: 00-59
+    """
+    if not serial_14 or len(serial_14) != 14:
+        return False
+    if not re.fullmatch(r"\d{6}\d{3}[ABC]\d{4}", serial_14):
+        return False
+    dd = int(serial_14[0:2])
+    mm = int(serial_14[2:4])
+    yy = int(serial_14[4:6])
+    hh = int(serial_14[10:12])
+    mi = int(serial_14[12:14])
+    if not (1 <= dd <= 31 and 1 <= mm <= 12 and 20 <= yy <= 40):
+        return False
+    if not (0 <= hh <= 23 and 0 <= mi <= 59):
+        return False
+    return True
+
+
+def _parse_serial_from_lines(results):
+    """
+    PRIMARY approach: parse the two OCR result lines separately.
+
+    The serial is printed on the part as two physical lines:
+      Line 1: DDMMYY NNN[ABC]   e.g. "220926 022A"
+      Line 2: HH:MM              e.g. "10:33"
+
+    By matching each OCR result line to its expected part we avoid
+    the combined-text digit contamination (spaces read as digits, etc.).
+
+    Returns (serial_14char, avg_conf) or (None, 0.0).
+    """
+    date_count_letter = None  # 10 chars: DDMMYY + NNN + [ABC]
+    time_part = None          # 4 chars: HHMM
+    conf_sum = 0.0
+    matched = 0
+
+    for res in results:
+        raw_text = res.get("rec_text", "").strip().upper()
+        conf     = res.get("rec_score", 0.0)
+
+        # Apply char correction before anything else
+        corrected = _correct_ocr_chars(raw_text)
+
+        # ── Try as Line 1: DDMMYY + space + NNN + [ABC] ──────────────────
+        # Keep only alphanumeric from this line
+        clean1 = re.sub(r"[^A-Z0-9]", "", corrected)
+        if date_count_letter is None:
+            # Strict: 6 digits + 3 digits + A/B/C  (exactly 10 chars)
+            m = re.search(r"(\d{6})(\d{3})([ABC])", clean1)
+            if m:
+                candidate = m.group(1) + m.group(2) + m.group(3)
+                # Validate date part before accepting
+                dd = int(candidate[0:2])
+                mm_val = int(candidate[2:4])
+                yy = int(candidate[4:6])
+                if 1 <= dd <= 31 and 1 <= mm_val <= 12 and 20 <= yy <= 40:
+                    date_count_letter = candidate
+                    conf_sum += conf
+                    matched += 1
+                    continue  # move to next OCR line
+                else:
+                    print(f"[OCR LINE1] Rejected '{candidate}': invalid date DD={dd} MM={mm_val} YY={yy}")
+
+        # ── Try as Line 2: HH:MM or HHMM ─────────────────────────────────
+        if time_part is None:
+            # Allow colon/dot separators in raw_text for time
+            time_clean = re.sub(r"[^0-9:]", "", raw_text)
+            mt = re.search(r"(\d{2})[:\.]?(\d{2})", time_clean)
+            if mt:
+                hh = int(mt.group(1))
+                mi = int(mt.group(2))
+                if 0 <= hh <= 23 and 0 <= mi <= 59:
+                    time_part = mt.group(1) + mt.group(2)
+                    conf_sum += conf
+                    matched += 1
+                    continue
+                else:
+                    print(f"[OCR LINE2] Rejected time '{mt.group(0)}': invalid HH={hh} MM={mi}")
+
+    if date_count_letter and time_part:
+        serial = date_count_letter + time_part
+        avg_conf = conf_sum / matched if matched > 0 else 0.0
+        return serial, avg_conf
+
+    return None, 0.0
+
+
+def _try_reconstruct_serial(raw_clean):
+    """
+    FALLBACK approach: reconstruct serial from combined cleaned text.
+    Serial format: DDMMYY(6) + NNN(3) + [A|B|C](1) + HHMM(4) = 14 chars.
+    Three-pass reconstruction + date/time validation.
+    """
+    s = _correct_ocr_chars(raw_clean.upper())
+
+    # Pass 1: strict regex
+    m = re.search(r"(\d{6})(\d{3})([ABC])(\d{4})", s)
+    if m:
+        candidate = m.group(1) + m.group(2) + m.group(3) + m.group(4)
+        if _validate_serial(candidate):
+            return candidate
+        else:
+            print(f"[OCR RECONSTRUCT P1] Rejected '{candidate}': failed date/time validation")
+
+    # Pass 2: find A/B/C letter, verify 9 digits before and 4 after
+    for letter in ("A", "B", "C"):
+        pos = s.find(letter)
+        if pos == -1:
+            continue
+        digits_before = re.sub(r"\D", "", s[:pos])
+        digits_after  = re.sub(r"\D", "", s[pos+1:])
+        if len(digits_before) >= 9 and len(digits_after) >= 4:
+            candidate = digits_before[-9:] + letter + digits_after[:4]
+            if len(candidate) == 14 and _validate_serial(candidate):
+                return candidate
+            elif len(candidate) == 14:
+                print(f"[OCR RECONSTRUCT P2] Rejected '{candidate}': failed date/time validation")
+
+    # Pass 3: all-digit string (13-15 chars), insert A/B/C at position 9
+    digits_only = re.sub(r"\D", "", s)
+    if 13 <= len(digits_only) <= 15:
+        for letter in ("A", "B", "C"):
+            candidate = digits_only[:9] + letter + digits_only[9:]
+            if len(candidate) >= 14 and _validate_serial(candidate[:14]):
+                return candidate[:14]
+
+    return None
+
+
 def run_ocr_on_crop(crop_rgb):
-    """Try OCR on a crop in all 4 rotations. Returns (text, confidence) or (None, 0)."""
+    """Try OCR on a crop in all 4 rotations. Returns (text, confidence) or (None, 0).
+
+    Serial format enforced: DDMMYY(6) + NNN(3) + [A|B|C](1) + HHMM(4) = 14 chars.
+    Only A, B, C accepted as the letter. Date and time mathematically validated.
+
+    Strategy:
+      Primary   - parse OCR lines SEPARATELY (line1=date+count+letter, line2=time)
+      Fallback  - reconstruct from concatenated cleaned text (3-pass)
+    Both paths enforce date validity (DD 01-31, MM 01-12) and time validity (HH 00-23, MM 00-59).
+    This rejects OCR misreads like MM=22 that look correct in format but are impossible dates.
+    """
     rotations = [None, cv2.ROTATE_90_COUNTERCLOCKWISE, cv2.ROTATE_180, cv2.ROTATE_90_CLOCKWISE]
     best_text = None
     best_conf = 0.0
@@ -548,51 +947,57 @@ def run_ocr_on_crop(crop_rgb):
         except Exception as e:
             print(f"[OCR Error] Prediction failed on rotation {rot}: {e}")
             continue
-        
+
         if not results:
             continue
-            
-        # Combine all detected text lines from the crop
-        combined_text = " ".join([res.get("rec_text", "") for res in results])
+
+        raw_lines = [res.get("rec_text", "") for res in results]
+        combined_text = " ".join(raw_lines)
         avg_conf = sum([res.get("rec_score", 0.0) for res in results]) / len(results)
-        
-        # Keep only alphanumeric characters for the serial number
+
+        print(f"\n[OCR VALIDATION] rotation={rot}")
+        print(f"raw lines  = {raw_lines}")
+
+        # ── PRIMARY: per-line parsing ─────────────────────────────────────
+        serial_candidate, line_conf = _parse_serial_from_lines(results)
+        if serial_candidate:
+            eff_conf = line_conf if line_conf > 0 else avg_conf
+            print(f"per-line   = {serial_candidate} (conf={eff_conf:.3f}) ✓")
+            if eff_conf > best_conf:
+                best_text = serial_candidate
+                best_conf = eff_conf
+                print(f"accepted/rejected = accepted (per-line, conf {eff_conf:.3f} > {best_conf:.3f})")
+            else:
+                print(f"accepted/rejected = rejected (per-line, conf {eff_conf:.3f} not > {best_conf:.3f})")
+            break  # per-line match is highest quality, stop rotating
+
+        # ── FALLBACK: combined-text reconstruction ────────────────────────
         text_sub = combined_text.strip().upper()
         clean_text = re.sub(r"[^A-Z0-9]", "", text_sub)
-        
-        print(f"\n[OCR VALIDATION]")
-        print(f"raw text = {combined_text}")
-        print(f"cleaned text = {clean_text}")
-        
-        # 1st 6 digits (date) + 3 digits + 1 letter (A-Z) + 4 digits (time), or 14-char alphanumeric serial
-        match = re.search(r"(\d{9}[A-Z]\d{4})", clean_text)
-        if not match:
-            match = re.search(r"(\d{6}[A-Z0-9]{3,5}\d{4})", clean_text)
-        if not match and len(clean_text) >= 12:
-            match = re.search(r"([A-Z0-9]{13,15})", clean_text)
-        
-        if not match:
-            print(f"accepted/rejected = rejected")
-            print(f"reason = Did not match serial format\n")
+        print(f"clean text = {clean_text} (fallback reconstruction)")
+
+        serial_candidate = _try_reconstruct_serial(clean_text)
+        if not serial_candidate:
+            print(f"accepted/rejected = rejected (no valid DDMMYY+NNN+[ABC]+HHMM found)\n")
+            continue
+
+        print(f"reconstructed = {serial_candidate}")
+        if float(avg_conf) > best_conf:
+            print(f"accepted/rejected = accepted (fallback, conf {avg_conf:.3f} > {best_conf:.3f})\n")
+            best_text = serial_candidate
+            best_conf = float(avg_conf)
         else:
-            clean_text = match.group(1)
-            if float(avg_conf) > best_conf:
-                print(f"accepted/rejected = accepted")
-                print(f"reason = Valid format and higher confidence ({avg_conf} > {best_conf})\n")
-                best_text = clean_text
-                best_conf = float(avg_conf)
-            else:
-                print(f"accepted/rejected = rejected")
-                print(f"reason = Valid format but confidence ({avg_conf}) not higher than best ({best_conf})\n")
-                
-        # If a valid serial regex match is found, break immediately to speed up reading by up to 4x!
+            print(f"accepted/rejected = rejected (fallback, conf {avg_conf:.3f} not > {best_conf:.3f})\n")
+
         if best_text:
             break
 
     if not best_text:
-        print(f"[OCR ERROR] OCR text rejected by serial validation")
+        print(f"[OCR ERROR] All rotations rejected — expected DDMMYY+NNN+[ABC]+HHMM with valid date/time")
 
     return best_text, best_conf * 100 if best_text else 0.0
+
+
 # -------------------------------
 # Asynchronous Background Processing
 # -------------------------------
@@ -1702,10 +2107,10 @@ def video_processing_loop():
             overlay = None
             for det in dets:
                 class_name = det["class_name"]
-                if class_name in ["line_mark", "dent", "bulge", "damage"]:
+                if class_name in ["line_mark", "dent", "buldge", "bulge", "damage"]:
                     mask_pts = det.get("mask")
                     if mask_pts is not None:
-                        color = (0, 0, 255) if class_name in ["dent", "bulge", "damage"] else (0, 255, 255)
+                        color = (0, 0, 255) if class_name in ["dent", "buldge", "bulge", "damage"] else (0, 255, 255)
                         pts = np.array(mask_pts, np.int32)
                         pts[:, 0] = (pts[:, 0] * scale_ann).astype(int)
                         pts[:, 1] = (pts[:, 1] * scale_ann).astype(int)
@@ -1736,12 +2141,12 @@ def video_processing_loop():
                     color = (255, 0, 255)
                 elif class_name in ["serial", "serial_area"]:
                     color = (255, 255, 0)
-                elif class_name in ["dent", "bulge", "damage"]:
+                elif class_name in ["dent", "buldge", "bulge", "damage"]:
                     color = (0, 0, 255)
                 elif class_name == "line_mark":
                     color = (0, 255, 255)
 
-                if class_name in ["line_mark", "dent", "bulge", "damage"] and det.get("mask") is not None:
+                if class_name in ["line_mark", "dent", "buldge", "bulge", "damage"] and det.get("mask") is not None:
                     pts = np.array(det["mask"], np.int32)
                     pts[:, 0] = (pts[:, 0] * scale_ann).astype(int)
                     pts[:, 1] = (pts[:, 1] * scale_ann).astype(int)
@@ -1823,8 +2228,8 @@ def yolo_worker_loop():
         if _debug_counter % 30 == 0:
             print(f"[YOLO] Running inference frame #{_debug_counter}, state={state}")
             
-        if _debug_counter % 300 == 0 and GPU_AVAILABLE:
-            torch.cuda.empty_cache()
+        # if _debug_counter % 300 == 0 and GPU_AVAILABLE:
+        #     torch.cuda.empty_cache() # Commented out to prevent CUDA TDR freezes
             
         h_orig, w_orig = frame_to_process.shape[:2]
         
@@ -1842,7 +2247,8 @@ def yolo_worker_loop():
             run_thresh = min(float(min_thresh), float(YOLO_CONF_THRESHOLD))
             
             with torch.inference_mode():
-                results = YOLO_MODEL(frame_resized, verbose=False, conf=run_thresh, task='segment', imgsz=448, device=YOLO_DEVICE)
+                with lock:
+                    results = YOLO_MODEL(frame_resized, verbose=False, conf=run_thresh, task='segment', imgsz=448, device=YOLO_DEVICE)
             new_detections = []
             frame_holes = 0
             frame_ring_bush = 0
@@ -1881,9 +2287,20 @@ def yolo_worker_loop():
                         
                     if class_name in ["front", "circle_front"]:
                         has_front_detected = True
+                        xyxy_f = box.xyxy[0].cpu().numpy()
+                        front_box = (
+                            max(0, int(xyxy_f[0] / scale)),
+                            max(0, int(xyxy_f[1] / scale)),
+                            min(w_orig, int(xyxy_f[2] / scale)),
+                            min(h_orig, int(xyxy_f[3] / scale))
+                        )
+                        # Record the first time front class appears this cycle (used for 1-sec settle)
+                        if active_cycle_data.get("front_first_seen_time") is None:
+                            active_cycle_data["front_first_seen_time"] = time.time()
                     elif class_name in ["back", "circle_back", "cricle_back", "serial", "serial_area"]:
                         has_back_detected = True
                 
+                processed_boxes = {}
                 for box_idx, box in enumerate(boxes):
                     xyxy_resized = box.xyxy[0].cpu().numpy().astype(int)
                     cls_id = int(box.cls[0].cpu().item())
@@ -1914,6 +2331,41 @@ def yolo_worker_loop():
                     x1, y1 = max(0, x1), max(0, y1)
                     x2, y2 = min(w_orig, x2), min(h_orig, y2)
                     
+                    # --- Custom Duplicate Filter (IoU > 0.5) ---
+                    # Prevents double-counting if YOLO predicts two overlapping boxes for the same class
+                    is_duplicate = False
+                    for px1, py1, px2, py2 in processed_boxes.get(class_name, []):
+                        ix1, iy1 = max(x1, px1), max(y1, py1)
+                        ix2, iy2 = min(x2, px2), min(y2, py2)
+                        i_area = max(0, ix2 - ix1) * max(0, iy2 - iy1)
+                        u_area = (x2 - x1) * (y2 - y1) + (px2 - px1) * (py2 - py1) - i_area
+                        if u_area > 0 and (i_area / u_area) > 0.5:
+                            is_duplicate = True
+                            break
+                    if is_duplicate:
+                        continue
+                    if class_name not in processed_boxes:
+                        processed_boxes[class_name] = []
+                    processed_boxes[class_name].append((x1, y1, x2, y2))
+                    
+                    # --- NEW LOGIC: OpenCV Ring Bush Verification ---
+                    if class_name in ["ring_bush", "ringbush"]:
+                        if front_box is not None:
+                            decision, score, dbg_canvas = verify_ring_bush(frame_to_process, front_box, conf)
+                            if dbg_canvas is not None:
+                                cv2.imwrite("logs/ring_bush_debug.jpg", dbg_canvas)
+                            
+                            if decision == "ABSENT":
+                                logger.info(f"OpenCV rejected ring_bush (Score: {score:.2f})")
+                                continue
+                            elif decision == "UNCERTAIN":
+                                logger.info(f"OpenCV uncertain about ring_bush (Score: {score:.2f}) - retaining YOLO decision")
+                                # Pass through
+                            else:
+                                logger.info(f"OpenCV verified ring_bush (Score: {score:.2f})")
+                        else:
+                            logger.info("ring_bush detected but no front_box found for ROI verification - retaining YOLO decision")
+                    
                     # --- NEW LOGIC: Empty Tray Filter ---
                     # Apply empty tray filtering to all classes
                     # Load config values
@@ -1922,7 +2374,7 @@ def yolo_worker_loop():
                     metal_t = presence_cfg.get("metal_min_ratio", 0.15)
                     lap_t = presence_cfg.get("laplacian_variance_min", 150.0)
                     
-                    if class_name not in ["dent", "bulge", "line_mark", "linemark", "line-mark", "damage"]:
+                    if class_name not in ["dent", "buldge", "bulge", "line_mark", "linemark", "line-mark", "damage", "hole_spec_error"]:
                         roi = frame_to_process[y1:y2, x1:x2]
                         if not has_part(roi, blue_t, metal_t, lap_t):
                             logger.info(f"Filtered out empty tray misclassified as '{class_name}' (conf: {conf:.2f})")
@@ -1951,10 +2403,11 @@ def yolo_worker_loop():
                     if class_name in ["front", "circle_front"]: color = (0, 165, 255)
                     elif class_name in ["back", "circle_back", "cricle_back"]: color = (255, 0, 255)
                     elif class_name in ["serial", "serial_area"]: color = (255, 255, 0)
-                    elif class_name in ["dent", "bulge", "damage"]: color = (0, 0, 255)
+                    elif class_name in ["dent", "buldge", "bulge", "damage"]: color = (0, 0, 255)
+                    elif class_name == "hole_spec_error": color = (0, 128, 255)  # Orange for hole spec errors
                     elif class_name == "line_mark": color = (0, 255, 255)
                     
-                    if class_name in ["line_mark", "dent", "bulge", "damage"]:
+                    if class_name in ["line_mark", "dent", "buldge", "bulge", "damage"]:
                         if mask_polygon is not None:
                             pts = np.array(mask_polygon, np.int32).reshape((-1, 1, 2))
                             overlay = annotated_frame.copy()
@@ -1981,19 +2434,30 @@ def yolo_worker_loop():
                         elif class_name == "holes":
                             has_holes_detected = True
                     
-                    if class_name in ["dent", "bulge", "line_mark", "linemark", "line-mark", "damage"]:
+                    if class_name in ["dent", "buldge", "bulge", "line_mark", "linemark", "line-mark", "damage", "hole_spec_error"]:
                         frame_defects.append(class_name)
                         
                     if class_name == "hole" or class_name == "holes":
                         if has_back_detected:
                             frame_holes += 1
-                    elif class_name in ["ring_bush", "ringbush", "rod"]:
+                    elif class_name in ["ring_bush", "ringbush"]:
                         if has_front_detected:
-                            frame_ring_bush += 1
-                            frame_rod += 1
+                            # Record the first moment the front class was seen this cycle
+                            if active_cycle_data.get("front_first_seen_time") is None:
+                                active_cycle_data["front_first_seen_time"] = time.time()
+                            # Only count ring_bush AFTER a 1-second settle delay
+                            front_settle_elapsed = time.time() - active_cycle_data["front_first_seen_time"]
+                            if front_settle_elapsed >= 1.0:
+                                frame_ring_bush += 1
                     elif class_name == "striker":
                         if has_front_detected:
-                            frame_striker += 1
+                            # Record the first moment the front class was seen this cycle
+                            if active_cycle_data.get("front_first_seen_time") is None:
+                                active_cycle_data["front_first_seen_time"] = time.time()
+                            # Only count striker AFTER a 1-second settle delay
+                            front_settle_elapsed = time.time() - active_cycle_data["front_first_seen_time"]
+                            if front_settle_elapsed >= 1.0:
+                                frame_striker += 1
                     elif class_name == "back_hook":
                         if has_back_detected:
                             frame_back_hook += 1
@@ -2002,6 +2466,8 @@ def yolo_worker_loop():
                     elif class_name in ["front", "circle_front"]:
                         front_box = (x1, y1, x2, y2)
                         front_class = class_name  # Track whether it's 'front' or 'circle_front'
+                        global latest_front_crop
+                        latest_front_crop = frame_to_process[y1:y2, x1:x2].copy()
                     elif class_name in ["back", "circle_back", "cricle_back"]:
                         back_box = (x1, y1, x2, y2)
                         back_class = class_name  # Track the actual detected back class
@@ -2092,6 +2558,26 @@ def yolo_worker_loop():
                                     best_serial = max(serial_matches, key=lambda x: x["conf"])
                                     x1, y1, x2, y2 = best_serial["box"]
                                     print(f"[OCR] Using tighter 'serial' box inside serial_area: {best_serial['box']}")
+                                else:
+                                    # Try to recover 'serial' from raw YOLO results even if conf < 0.10
+                                    low_conf_matches = []
+                                    if results:
+                                        for b in results[0].boxes:
+                                            cid = int(b.cls[0].cpu().item())
+                                            cname = results[0].names[cid].lower()
+                                            c_conf = float(b.conf[0].cpu().item())
+                                            if cname == "serial":
+                                                low_conf_matches.append((b, c_conf))
+                                    if low_conf_matches:
+                                        best_low = max(low_conf_matches, key=lambda x: x[1])[0]
+                                        xyxy_r = best_low.xyxy[0].cpu().numpy().astype(int)
+                                        x1, y1 = max(0, int(xyxy_r[0] / scale)), max(0, int(xyxy_r[1] / scale))
+                                        x2, y2 = min(w_orig, int(xyxy_r[2] / scale)), min(h_orig, int(xyxy_r[3] / scale))
+                                        print(f"[OCR] Recovered 'serial' box from raw YOLO (conf {float(best_low.conf[0].cpu().item()):.2f}): {[x1, y1, x2, y2]}")
+                                    else:
+                                        # Blind crop: Serial is always in the bottom 40% of the serial_area
+                                        y1 = y1 + int((y2 - y1) * 0.60)
+                                        print(f"[OCR] Blind crop: using bottom 40% of serial_area: {[x1, y1, x2, y2]}")
                             
                             # Extract the expected serial-number region from this back-side crop
                             # If it's the whole back, we still use the bounding box as the source region
@@ -2130,10 +2616,22 @@ def yolo_worker_loop():
                         if class_name in ["circle_back", "cricle_back", "back"]:
                             print(f"[OCR ERROR] Back-side detection found but OCR crop was not generated")
                 else:
-                    with lock:
-                        t_start = active_cycle_data["ocr_start_time"]
-                    if t_start is not None and (time.time() - t_start) > 3.5:
-                        print(f"[OCR ERROR] OCR was never triggered")
+                    # Serial box temporarily lost or conf dropped. Just wait.
+                    pass
+
+            # Per-iteration flags for post-lock file I/O (avoids holding lock during disk writes)
+            _do_front_write = False
+            _front_capture_frame = None
+            _front_capture_folder = None
+            _front_capture_type = None
+            _front_save_debug_raw = False
+            _front_unenhanced = None
+            _do_back_write = False
+            _back_capture_frame = None
+            _back_capture_folder = None
+            _back_save_debug_raw = False
+            _back_unenhanced = None
+            _back_finalize_data = None
 
             with lock:
                 current_detections = new_detections
@@ -2179,30 +2677,21 @@ def yolo_worker_loop():
                         
                         active_cycle_data["front_missing_frames"] = 0
                         
-                        components_ok = (active_cycle_data.get("max_ring_bush_detected", 0) >= 1) and (active_cycle_data.get("max_striker_detected", 0) >= 2)
-                        if (components_ok and time_stable >= 0.2) or time_stable >= 4.0:
-                            # Save full enhanced image without annotations and without cropping
-                            full_image = frame_to_process.copy()
-                            front_file = os.path.join(active_cycle_data["temp_folder"], "front.jpg")
-                            
-                            # Optionally retain original un-enhanced frame for debugging
-                            if active_cycle_data.get("save_debug_raw", False) or APP_CONFIG.get("storage", {}).get("save_debug_raw", False):
-                                debug_raw_file = os.path.join(active_cycle_data["temp_folder"], "front_raw_debug.jpg")
-                                with lock:
-                                    if latest_unenhanced_frame is not None:
-                                        cv2.imwrite(debug_raw_file, latest_unenhanced_frame, [cv2.IMWRITE_JPEG_QUALITY, 95])
-                                        logger.info(f"[Debug] Saved original un-enhanced front image: {debug_raw_file}")
+                        if time_stable >= 0.5:
+                            # --- Capture front image (file I/O done OUTSIDE lock below) ---
+                            _front_capture_frame   = frame_to_process.copy()
+                            _front_capture_folder  = active_cycle_data["temp_folder"]
+                            _front_capture_type    = "circle" if front_class == "circle_front" else "standard"
+                            _front_save_debug_raw  = active_cycle_data.get("save_debug_raw", False) or APP_CONFIG.get("storage", {}).get("save_debug_raw", False)
+                            _front_unenhanced      = latest_unenhanced_frame.copy() if latest_unenhanced_frame is not None else None
 
-                            cv2.imwrite(front_file, full_image, [cv2.IMWRITE_JPEG_QUALITY, 95])
-                            
-                            active_cycle_data["front_path"] = front_file
-                            # Record which front panel type was seen so back-panel mismatch can be detected
-                            active_cycle_data["front_type"] = "circle" if front_class == "circle_front" else "standard"
-                            logger.info(f"[State] Front captured as type='{active_cycle_data['front_type']}' (class='{front_class}')")
+                            active_cycle_data["front_type"] = _front_capture_type
+                            logger.info(f"[State] Front captured as type='{_front_capture_type}' (class='{front_class}')")
                             current_cycle["step2_status"] = "OK"
-                            if components_ok:
-                                active_cycle_data["flash_end_time"] = time.time() + 1.0
-                                active_cycle_data["flash_message"] = "FRONT OK"
+                            
+                            active_cycle_data["flash_end_time"] = time.time() + 1.0
+                            active_cycle_data["flash_message"] = "FRONT OK"
+                                
                             active_cycle_data["state"] = "WAITING_LOCK_STRIKER"
                             for d in frame_defects:
                                 active_cycle_data["defects_detected"].add(d)
@@ -2211,6 +2700,8 @@ def yolo_worker_loop():
                                 # current_cycle["instruction"] = "NG"  # Removed per user request to keep operator instructions
                                 current_cycle["instruction_color"] = "red"
                                 current_cycle["result"] = "NG"
+                            # Flag that we need to write the front image (done outside lock after the block)
+                            _do_front_write = True
 
                     else:
                         active_cycle_data["front_missing_frames"] = active_cycle_data.get("front_missing_frames", 0) + 1
@@ -2318,33 +2809,21 @@ def yolo_worker_loop():
                             ocr_start = active_cycle_data.get("ocr_start_time")
                             ocr_timeout = (ocr_start is not None) and (time.time() - ocr_start > 8.0)
                             
-                            components_ok = (active_cycle_data.get("max_holes_detected", 0) >= 3) and (active_cycle_data.get("max_back_hook_detected", 0) >= 2)
-                            
-                            if (ocr_done or ocr_timeout) and ((components_ok and time_stable >= 0.2) or time_stable >= 4.0):
-                            # Save full enhanced image without cropping
-                                full_raw = frame_to_process.copy()
-                                back_file = os.path.join(active_cycle_data["temp_folder"], "back.jpg")
+                            if (ocr_done or ocr_timeout) and time_stable >= 0.5:
+                                # --- Capture back image (file I/O done OUTSIDE lock below) ---
+                                _do_back_write = True
+                                _back_capture_frame = frame_to_process.copy()
+                                _back_capture_folder = active_cycle_data["temp_folder"]
+                                _back_save_debug_raw = active_cycle_data.get("save_debug_raw", False) or APP_CONFIG.get("storage", {}).get("save_debug_raw", False)
+                                _back_unenhanced = latest_unenhanced_frame.copy() if latest_unenhanced_frame is not None else None
+                                _back_finalize_data = active_cycle_data  # reference for check_and_finalize_cycle
 
-                                # Optionally retain original un-enhanced frame for debugging
-                                if active_cycle_data.get("save_debug_raw", False) or APP_CONFIG.get("storage", {}).get("save_debug_raw", False):
-                                    debug_raw_file = os.path.join(active_cycle_data["temp_folder"], "back_raw_debug.jpg")
-                                    with lock:
-                                        if latest_unenhanced_frame is not None:
-                                            cv2.imwrite(debug_raw_file, latest_unenhanced_frame, [cv2.IMWRITE_JPEG_QUALITY, 95])
-                                            logger.info(f"[Debug] Saved original un-enhanced back image: {debug_raw_file}")
-
-                                cv2.imwrite(back_file, full_raw, [cv2.IMWRITE_JPEG_QUALITY, 95])
-                                active_cycle_data["back_path"] = back_file
-                                
                                 current_cycle["step4_status"] = "OK"
                                 for d in frame_defects:
                                     active_cycle_data["defects_detected"].add(d)
-                                    
-                                # Immediate missing checks removed to allow 1.5s detection time before flashing NG
-                                
-                                # Go straight to finalization
+
+                                # Go straight to finalization (called outside lock, after file write)
                                 active_cycle_data["state"] = "WAITING_REMOVE"
-                                check_and_finalize_cycle(active_cycle_data)
                             else:
                                 current_cycle["instruction"] = "DETECTING SERIAL NUMBER..."
                                 active_cycle_data["back_frames_count"] = 1 # Keep it below threshold until serial is seen
@@ -2414,16 +2893,20 @@ def yolo_worker_loop():
                                     active_cycle_data["defects_detected"].add(d)
                         
                         active_cycle_data["max_holes_detected"] = min(3, max(active_cycle_data["max_holes_detected"], frame_holes))
-                        active_cycle_data["max_ring_bush_detected"] = min(1, max(active_cycle_data.get("max_ring_bush_detected", 0), frame_ring_bush))
-                        active_cycle_data["max_rod_detected"] = active_cycle_data["max_ring_bush_detected"]
                         active_cycle_data["max_striker_detected"] = min(2, max(active_cycle_data["max_striker_detected"], frame_striker))
                         active_cycle_data["max_back_hook_detected"] = min(2, max(active_cycle_data["max_back_hook_detected"], frame_back_hook))
                         active_cycle_data["max_lock_striker_detected"] = min(1, max(active_cycle_data["max_lock_striker_detected"], frame_lock_striker))
                         
                         if frame_holes >= 3:
                             active_cycle_data["holes_time"] = active_cycle_data.get("holes_time", 0.0) + dt
-                        if frame_ring_bush >= 1 or active_cycle_data.get("max_rod_detected", 0) >= 1:
+                        
+                        # Stabilize ring_bush: require 0.15s of visibility before latching it as 'found' to prevent 1-frame flashes
+                        if frame_ring_bush >= 1:
                             active_cycle_data["ring_bush_time"] = active_cycle_data.get("ring_bush_time", 0.0) + dt
+                        if active_cycle_data.get("ring_bush_time", 0.0) >= 0.15:
+                            active_cycle_data["max_ring_bush_detected"] = 1
+                            active_cycle_data["max_rod_detected"] = 1
+                            
                         if frame_striker >= 2:
                             active_cycle_data["striker_time"] = active_cycle_data.get("striker_time", 0.0) + dt
                         if frame_back_hook >= 2:
@@ -2431,14 +2914,20 @@ def yolo_worker_loop():
                         if frame_lock_striker >= 1:
                             active_cycle_data["lock_striker_time"] = active_cycle_data.get("lock_striker_time", 0.0) + dt
                         
-                        # Dynamically add missing defects only after 1.5s of panel visibility
+                        # Dynamically add missing defects for front-class components.
+                        # Logic: wait for front to appear, then give 1-second settle time,
+                        # then accumulate front_visible_time. Flag missing after 1.5 s of
+                        # SETTLED front visibility (i.e., total gate = 1s settle + 1.5s window).
                         if has_front_detected:
-                            active_cycle_data["front_visible_time"] = active_cycle_data.get("front_visible_time", 0.0) + dt
-                            if active_cycle_data["front_visible_time"] >= 1.5:
-                                if active_cycle_data.get("max_ring_bush_detected", 0) < 1:
-                                    active_cycle_data["defects_detected"].add("missing_ring_bush")
-                                if active_cycle_data.get("max_striker_detected", 0) < 2:
-                                    active_cycle_data["defects_detected"].add("missing_striker")
+                            front_settle_start = active_cycle_data.get("front_first_seen_time")
+                            if front_settle_start is not None and (time.time() - front_settle_start) >= 1.0:
+                                # 1-second settle has passed — now accumulate settled visibility time
+                                active_cycle_data["front_visible_time"] = active_cycle_data.get("front_visible_time", 0.0) + dt
+                                if active_cycle_data["front_visible_time"] >= 1.5:
+                                    if active_cycle_data.get("max_ring_bush_detected", 0) < 1:
+                                        active_cycle_data["defects_detected"].add("missing_ring_bush")
+                                    if active_cycle_data.get("max_striker_detected", 0) < 2:
+                                        active_cycle_data["defects_detected"].add("missing_striker")
                         
                         if has_back_detected:
                             active_cycle_data["back_visible_time"] = active_cycle_data.get("back_visible_time", 0.0) + dt
@@ -2480,6 +2969,41 @@ def yolo_worker_loop():
                             current_cycle["result"] = "OK"
             if needs_reset:
                 reset_cycle_state()
+
+            # --- Post-lock file I/O: write front image ---
+            # (Deliberately outside the lock to avoid blocking YOLO/VideoLoop threads during disk write)
+            if _do_front_write and _front_capture_frame is not None and _front_capture_folder is not None:
+                try:
+                    front_file = os.path.join(_front_capture_folder, "front.jpg")
+                    if _front_save_debug_raw and _front_unenhanced is not None:
+                        debug_raw_file = os.path.join(_front_capture_folder, "front_raw_debug.jpg")
+                        cv2.imwrite(debug_raw_file, _front_unenhanced, [cv2.IMWRITE_JPEG_QUALITY, 95])
+                        logger.info(f"[Debug] Saved original un-enhanced front image: {debug_raw_file}")
+                    cv2.imwrite(front_file, _front_capture_frame, [cv2.IMWRITE_JPEG_QUALITY, 95])
+                    with lock:
+                        active_cycle_data["front_path"] = front_file
+                    logger.info(f"[State] Front image written: {front_file}")
+                except Exception as _write_err:
+                    logger.error(f"[State] Front image write failed: {_write_err}")
+
+            # --- Post-lock file I/O: write back image ---
+            if _do_back_write and _back_capture_frame is not None and _back_capture_folder is not None:
+                try:
+                    back_file = os.path.join(_back_capture_folder, "back.jpg")
+                    if _back_save_debug_raw and _back_unenhanced is not None:
+                        debug_raw_file = os.path.join(_back_capture_folder, "back_raw_debug.jpg")
+                        cv2.imwrite(debug_raw_file, _back_unenhanced, [cv2.IMWRITE_JPEG_QUALITY, 95])
+                        logger.info(f"[Debug] Saved original un-enhanced back image: {debug_raw_file}")
+                    cv2.imwrite(back_file, _back_capture_frame, [cv2.IMWRITE_JPEG_QUALITY, 95])
+                    with lock:
+                        if _back_finalize_data is not None:
+                            _back_finalize_data["back_path"] = back_file
+                    logger.info(f"[State] Back image written: {back_file}")
+                    # Trigger finalization now that the back image is on disk
+                    if _back_finalize_data is not None:
+                        check_and_finalize_cycle(_back_finalize_data)
+                except Exception as _write_err:
+                    logger.error(f"[State] Back image write failed: {_write_err}")
                 
         except Exception as e:
             import traceback
@@ -2777,6 +3301,16 @@ def status():
     resp["is_processing"] = is_processing
     resp["capture_state"] = active_cycle_data.get("state", "WAITING_FRONT")
     return jsonify(resp)
+
+@app.route('/ui_config', methods=['GET'])
+def ui_config():
+    """Serve UI display settings from config.yaml to the frontend."""
+    ui_cfg = APP_CONFIG.get("ui", {})
+    return jsonify({
+        "side_flash_width_percent": ui_cfg.get("side_flash_width_percent", 12),
+        "side_flash_max_width_px":  ui_cfg.get("side_flash_max_width_px", 120),
+    })
+
 
 if __name__ == '__main__':
     # Initialize workspace folders
