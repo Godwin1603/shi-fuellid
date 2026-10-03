@@ -33,8 +33,7 @@ echo ---------------------------------------------------
 echo DO NOT CLOSE THIS WINDOW. 
 echo The system is running as long as this window is open.
 echo ---------------------------------------------------
-:: Start the OCR microservice in the background
-start "OCR Server" /MIN py -3.12 paddleocr_server.py
+:: The OCR server is now automatically spawned invisibly by app.py in the background
 
 :: Run the application in this exact window so errors are visible
 py -3.12 app.py

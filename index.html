@@ -576,7 +576,7 @@
 
         .trace-value {
             font-family: monospace;
-            font-size: 18px;
+            font-size: 36px;
             font-weight: 700;
             letter-spacing: 1.5px;
             color: var(--text-main);
@@ -816,6 +816,13 @@
             </div>
         </div>
         <div class="header-right">
+            <button class="config-toggle-btn" id="header-connect-btn" onclick="connectGige()" style="background-color: var(--accent-blue); color: white; border: none; margin-right: 8px;">
+                <svg width="14" height="14" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24">
+                    <path stroke-linecap="round" stroke-linejoin="round" d="M6.827 6.175A2.31 2.31 0 0 1 5.186 7.23c-.38.054-.757.112-1.134.175C2.999 7.58 2.25 8.507 2.25 9.574V18a2.25 2.25 0 0 0 2.25 2.25h15A2.25 2.25 0 0 0 21.75 18V9.574c0-1.067-.75-1.994-1.802-2.169a47.865 47.865 0 0 0-1.134-.175 2.31 2.31 0 0 1-1.64-1.055l-.822-1.316a2.192 2.192 0 0 0-1.736-1.039 48.774 48.774 0 0 0-5.232 0 2.192 2.192 0 0 0-1.736 1.039l-.821 1.316Z" />
+                    <path stroke-linecap="round" stroke-linejoin="round" d="M16.5 12.75a4.5 4.5 0 1 1-9 0 4.5 4.5 0 0 1 9 0ZM18.75 10.5h.008v.008h-.008V10.5Z" />
+                </svg>
+                Connect Camera
+            </button>
             <button class="config-toggle-btn" onclick="toggleConfigSidebar()">
                 <svg width="14" height="14" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24">
                     <path stroke-linecap="round" stroke-linejoin="round" d="M9.594 3.94c.09-.542.56-.94 1.11-.94h2.593c.55 0 1.02.398 1.11.94l.213 1.281c.063.374.313.686.645.87.074.04.147.083.22.127.324.196.72.257 1.075.124l1.217-.456a1.125 1.125 0 0 1 1.37.49l1.296 2.247a1.125 1.125 0 0 1-.26 1.43l-1.003.828c-.293.241-.438.613-.43.992a7.723 7.723 0 0 1 0 .255c-.008.378.137.75.43.991l1.004.827c.424.35.534.954.26 1.43l-1.298 2.247a1.125 1.125 0 0 1-1.369.491l-1.217-.456c-.355-.133-.75-.072-1.076.124a6.57 6.57 0 0 1-.22.128c-.331.183-.581.495-.644.869l-.213 1.28c-.09.543-.56.94-1.11.94h-2.594c-.55 0-1.02-.398-1.11-.94l-.213-1.281c-.062-.374-.312-.686-.644-.87a6.52 6.52 0 0 1-.22-.127c-.325-.196-.72-.257-1.076-.124l-1.217.456a1.125 1.125 0 0 1-1.369-.49l-1.297-2.247a1.125 1.125 0 0 1 .26-1.43l1.004-.827c.292-.24.437-.613.43-.992a6.932 6.932 0 0 1 0-.255c.007-.378-.138-.75-.43-.991l-1.004-.827a1.125 1.125 0 0 1-.26-1.43l1.297-2.247a1.125 1.125 0 0 1 1.37-.491l1.216.456c.356.133.751.072 1.076-.124.072-.044.146-.087.22-.128.332-.183.582-.495.644-.869l.214-1.281Z"/>
@@ -846,11 +853,20 @@
                 <!-- Clean Center Stream Panel -->
                 <img id="video-stream" src="/video_feed" style="width: 100%; height: 100%; object-fit: contain; position: absolute; inset: 0; z-index: 1;" onerror="this.style.display='none'; document.getElementById('no-signal-msg').style.display='flex';" onload="this.style.display='block'; document.getElementById('no-signal-msg').style.display='none';" alt="Live Camera Feed">
                 
-                <div class="no-signal-msg" id="no-signal-msg" style="position: relative; z-index: 2; display: none;">
+                <div class="no-signal-msg" id="no-signal-msg" style="position: relative; z-index: 2; display: none; flex-direction: column; gap: 14px;">
                     <svg fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24">
                         <path stroke-linecap="round" stroke-linejoin="round" d="m15.75 10.5 4.72-4.72a.75.75 0 0 1 1.28.53v11.38a.75.75 0 0 1-1.28.53l-4.72-4.72M4.5 18.75h9a2.25 2.25 0 0 0 2.25-2.25v-9a2.25 2.25 0 0 0-2.25-2.25h-9A2.25 2.25 0 0 0 2.25 7.5v9a2.25 2.25 0 0 0 2.25 2.25Z"/>
                     </svg>
                     <span>Camera Stream Standby</span>
+                    <!-- One-click Connect Camera button — connects SN:73ABE004 directly, no scan needed -->
+                    <button id="main-connect-btn"
+                        onclick="connectDefaultGige()"
+                        style="margin-top:6px; padding:10px 24px; background:#2563eb; color:#fff; border:none; border-radius:8px; font-size:14px; font-weight:700; cursor:pointer; letter-spacing:0.4px; display:flex; align-items:center; gap:8px; box-shadow:0 2px 8px rgba(37,99,235,0.25); transition:background 0.2s;"
+                        onmouseover="this.style.background='#1d4ed8'" onmouseout="this.style.background='#2563eb'">
+                        <svg width="16" height="16" fill="none" stroke="currentColor" stroke-width="2.5" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" d="M5.636 5.636a9 9 0 1 0 12.728 0M12 3v9"/></svg>
+                        Connect Camera
+                    </button>
+                    <div id="main-connect-msg" style="font-size:12px; color:#94a3b8; text-align:center;"></div>
                 </div>
 
                 <!-- Side Signal Bars (Flashy Red NG / Flashy Green OK) -->
@@ -1045,7 +1061,7 @@
                             </div>
                             <div class="form-group">
                                 <label for="gige-serial">Serial Number</label>
-                                <input type="text" id="gige-serial" class="input-text" placeholder="737EV002" value="737EV002">
+                                <input type="text" id="gige-serial" class="input-text" placeholder="73ABE004" value="73ABE004" readonly style="background:#f1f5f9; color:#475569; cursor:not-allowed;" title="Fixed to camera SN: 73ABE004">
                             </div>
                         </div>
 
@@ -1152,6 +1168,98 @@
             const streamImg = document.getElementById('video-stream');
             streamImg.src = '/video_feed?' + new Date().getTime(); // Prevent caching
             streamImg.style.display = 'block';
+        }
+
+        // ─── One-click Connect from main screen (SN: 73ABE004, no scan needed) ───
+        function connectDefaultGige() {
+            const btn    = document.getElementById('main-connect-btn');
+            const msgEl  = document.getElementById('main-connect-msg');
+            // Hide any previous force button
+            const oldForce = document.getElementById('main-force-btn');
+            if (oldForce) oldForce.remove();
+
+            btn.disabled = true;
+            btn.style.background = '#64748b';
+            msgEl.textContent = 'Connecting to camera SN: 73ABE004…';
+            msgEl.style.color = '#94a3b8';
+
+            fetch('/connect_default_gige', {
+                method : 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body   : JSON.stringify({})
+            })
+            .then(r => r.json())
+            .then(data => {
+                if (data.status === 'success') {
+                    msgEl.textContent = '✓ ' + data.message;
+                    msgEl.style.color = '#22c55e';
+                    btn.style.display = 'none';
+                    activateStream();
+                    // Also sync the sidebar status
+                    document.getElementById('gige-connect-btn').disabled    = true;
+                    document.getElementById('gige-disconnect-btn').disabled  = false;
+                    document.getElementById('gige-save-btn').disabled        = false;
+                } else {
+                    msgEl.textContent = '✗ ' + data.message;
+                    msgEl.style.color = '#ef4444';
+                    btn.disabled = false;
+                    btn.style.background = '#2563eb';
+                    // If timeout / exclusive lock: show Force Release button
+                    if (data.message && (data.message.includes('1114128') || data.message.includes('Timeout') || data.message.includes('EXCLUSIVE'))) {
+                        const forceBtn = document.createElement('button');
+                        forceBtn.id = 'main-force-btn';
+                        forceBtn.textContent = '⚡ Force Release & Connect';
+                        forceBtn.style.cssText = 'margin-top:8px;padding:9px 20px;background:#dc2626;color:#fff;border:none;border-radius:8px;font-size:13px;font-weight:700;cursor:pointer;display:flex;align-items:center;gap:6px;box-shadow:0 2px 8px rgba(220,38,38,0.3);';
+                        forceBtn.onclick = forceConnectGige;
+                        btn.parentNode.insertBefore(forceBtn, msgEl);
+                    }
+                }
+            })
+            .catch(err => {
+                msgEl.textContent = 'Connection error: ' + err;
+                msgEl.style.color = '#ef4444';
+                btn.disabled = false;
+                btn.style.background = '#2563eb';
+            });
+        }
+
+        function forceConnectGige() {
+            const forceBtn = document.getElementById('main-force-btn');
+            const btn      = document.getElementById('main-connect-btn');
+            const msgEl    = document.getElementById('main-connect-msg');
+            if (forceBtn) { forceBtn.disabled = true; forceBtn.textContent = '⏳ Releasing camera…'; }
+            msgEl.textContent = 'Force-releasing camera lock (killing holder processes)…';
+            msgEl.style.color = '#f59e0b';
+
+            fetch('/force_connect_gige', {
+                method : 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body   : JSON.stringify({})
+            })
+            .then(r => r.json())
+            .then(data => {
+                if (data.status === 'success') {
+                    msgEl.textContent = '✓ ' + data.message;
+                    msgEl.style.color = '#22c55e';
+                    if (forceBtn) forceBtn.remove();
+                    btn.style.display = 'none';
+                    activateStream();
+                    document.getElementById('gige-connect-btn').disabled    = true;
+                    document.getElementById('gige-disconnect-btn').disabled  = false;
+                    document.getElementById('gige-save-btn').disabled        = false;
+                } else {
+                    msgEl.textContent = '✗ ' + data.message;
+                    msgEl.style.color = '#ef4444';
+                    if (forceBtn) { forceBtn.disabled = false; forceBtn.textContent = '⚡ Force Release & Connect'; }
+                    btn.disabled = false;
+                    btn.style.background = '#2563eb';
+                }
+            })
+            .catch(err => {
+                msgEl.textContent = 'Force connect error: ' + err;
+                msgEl.style.color = '#ef4444';
+                if (forceBtn) { forceBtn.disabled = false; forceBtn.textContent = '⚡ Force Release & Connect'; }
+            });
         }
 
         // Camera connection handler — replaced by GigE
@@ -1331,9 +1439,15 @@
                         document.getElementById('gige-disconnect-btn').disabled = false;
                         document.getElementById('gige-save-btn').disabled = false;
                     }
+                    // Hide main-screen connect button when connected
+                    const mainBtn = document.getElementById('main-connect-btn');
+                    if (mainBtn) mainBtn.style.display = 'none';
                 } else {
                     connEl.textContent  = s.status || 'Disconnected';
                     connEl.style.color  = '#dc2626';
+                    // Show main-screen connect button again when disconnected
+                    const mainBtn = document.getElementById('main-connect-btn');
+                    if (mainBtn) { mainBtn.style.display = 'flex'; mainBtn.disabled = false; mainBtn.style.background = '#2563eb'; }
                 }
             })
             .catch(() => {});
@@ -1476,9 +1590,12 @@
                 backhookEl.textContent = (data.back_hook_count !== undefined ? data.back_hook_count : 0) + ' / 2';
                 lockstrikerEl.textContent = (data.lock_striker_count !== undefined ? data.lock_striker_count : 0) + ' / 1';
                 
+                const warningEl = document.getElementById('ui-defect-warning');
+                const defectsSection = document.getElementById('defects-section');
                 let warningMessages = [];
                 
                 if (data.defects) {
+                    const knownDefects = ['missing_holes', 'missing_ring_bush', 'missing_rod', 'missing_striker', 'missing_back_hook', 'missing_lock_striker', 'dent', 'bulge', 'line_mark', 'linemark', 'line-mark', 'damage', 'serial_missing'];
                     if (data.defects.includes('missing_holes')) warningMessages.push("MISSING HOLES");
                     if (data.defects.includes('missing_ring_bush') || data.defects.includes('missing_rod')) warningMessages.push("MISSING RING BUSH");
                     if (data.defects.includes('missing_striker')) warningMessages.push("MISSING STRIKER");
@@ -1488,6 +1605,14 @@
                     if (data.defects.includes('bulge')) warningMessages.push("BULGE DETECTED");
                     if (data.defects.includes('line_mark') || data.defects.includes('linemark') || data.defects.includes('line-mark')) warningMessages.push("LINE MARK DETECTED");
                     if (data.defects.includes('damage')) warningMessages.push("DAMAGE DETECTED");
+                    if (data.defects.includes('serial_missing')) warningMessages.push("SERIAL MISSING");
+                    
+                    data.defects.forEach(defect => {
+                        if (!knownDefects.includes(defect)) {
+                            let formatted = defect.replace(/[_-]/g, ' ').toUpperCase() + " DETECTED";
+                            warningMessages.push(formatted);
+                        }
+                    });
                 }
                 
                 if (warningMessages.length > 0) {

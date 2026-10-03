@@ -10,17 +10,17 @@ ai:
   ocr_fallback_timeout: 3.5
   # Per-class YOLO confidence thresholds. If a class is not listed, the default threshold below is used.
   class_confidences:
-    front: 0.70
-    back: 0.85
+    front: 0.50
+    back: 0.50
     serial: 0.10
     serial_area: 0.10
-    line_mark: 0.50
-    hole: 0.50
-    back_hook: 0.50
-    lock_striker: 0.50
+    line_mark: 0.30
+    hole: 0.85
+    back_hook: 0.60
+    lock_striker: 0.20
     ring_bush: 0.50
-    rod: 0.50
-    striker: 0.50
+    rod: 1.00
+    striker: 0.20
   # Minimum bounding box area (in pixels) for a defect to be considered valid to prevent false positives quickly
   min_defect_area: 200
   # Default YOLO confidence threshold if a class is not specified above

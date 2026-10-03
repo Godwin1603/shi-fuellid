@@ -26,19 +26,46 @@ class FlushFileHandler(logging.StreamHandler):
 
 logging.getLogger().handlers = [FlushFileHandler(sys.stdout)]
 
+
+# Watchdog to close server when parent dies
+import threading
+import time
+import os
+import ctypes
+
+parent_pid = None
+if "--parent-pid" in sys.argv:
+    parent_pid = int(sys.argv[sys.argv.index("--parent-pid") + 1])
+
+def watchdog():
+    if not parent_pid: return
+    kernel32 = ctypes.windll.kernel32
+    SYNCHRONIZE = 0x00100000
+    while True:
+        process = kernel32.OpenProcess(SYNCHRONIZE, False, parent_pid)
+        if not process:
+            logging.info("Parent process terminated. Shutting down OCR microservice.")
+            os._exit(1)
+        kernel32.CloseHandle(process)
+        time.sleep(2)
+
+if parent_pid:
+    threading.Thread(target=watchdog, daemon=True).start()
+
 logging.info("Initializing PaddleOCR engine...")
 from paddleocr import PaddleOCR
 import paddle
 
 ocr = None
 try:
-    ocr = PaddleOCR(lang='en')
-    logging.info("PaddleOCR successfully initialized.")
+    # Explicitly disable GPU to prevent crashes/hangs on legacy drivers
+    ocr = PaddleOCR(lang='en', use_gpu=False, show_log=False)
+    logging.info("PaddleOCR successfully initialized (CPU mode).")
 except Exception as e:
     logging.error(f"PaddleOCR initialization failed: {e}")
     try:
-        ocr = PaddleOCR()
-        logging.info("PaddleOCR initialized with default config.")
+        ocr = PaddleOCR(use_gpu=False, show_log=False)
+        logging.info("PaddleOCR initialized with default config (CPU mode).")
     except Exception as ex:
         logging.error(f"Fallback PaddleOCR initialization failed: {ex}")
 
@@ -133,3 +160,4 @@ if __name__ == '__main__':
     server = HTTPServer(('127.0.0.1', 5001), OCRHandler)
     logging.info("PaddleOCR server listening on http://127.0.0.1:5001")
     server.serve_forever()
+

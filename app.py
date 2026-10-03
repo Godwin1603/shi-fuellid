@@ -1,10 +1,18 @@
 import os
-# Configure CPU threads before imports to prevent PyTorch/PaddlePaddle thread thrashing
-os.environ["OMP_NUM_THREADS"] = "1"
-os.environ["MKL_NUM_THREADS"] = "1"
-os.environ["OPENBLAS_NUM_THREADS"] = "1"
-os.environ["VECLIB_MAXIMUM_THREADS"] = "1"
-os.environ["NUMEXPR_NUM_THREADS"] = "1"
+import multiprocessing as _mp
+
+# ── GPU / CPU thread policy ───────────────────────────────────────────────────
+# When CUDA is available PyTorch offloads heavy math to GPU, so limiting
+# OpenMP/MKL to 1 thread prevents CPU thrashing from competing thread pools.
+# When running CPU-only we want ALL physical cores for YOLO inference.
+# We resolve this after torch is imported (see GPU_AVAILABLE below).
+# For now, set a safe default that doesn't hurt either path at import time.
+_CPU_CORES = _mp.cpu_count()
+os.environ.setdefault("OMP_NUM_THREADS",      str(_CPU_CORES))
+os.environ.setdefault("MKL_NUM_THREADS",      str(_CPU_CORES))
+os.environ.setdefault("OPENBLAS_NUM_THREADS", str(_CPU_CORES))
+os.environ.setdefault("VECLIB_MAXIMUM_THREADS", str(_CPU_CORES))
+os.environ.setdefault("NUMEXPR_NUM_THREADS",  str(_CPU_CORES))
 
 import re
 import cv2
@@ -24,7 +32,7 @@ from logging.handlers import RotatingFileHandler
 os.makedirs("logs", exist_ok=True)
 log_formatter = logging.Formatter('%(asctime)s - %(levelname)s - %(message)s')
 log_file = "logs/shi_app.log"
-file_handler = RotatingFileHandler(log_file, maxBytes=10*1024*1024, backupCount=5)
+file_handler = RotatingFileHandler(log_file, maxBytes=10*1024*1024, backupCount=5, encoding='utf-8')
 file_handler.setFormatter(log_formatter)
 console_handler = logging.StreamHandler(sys.stdout)
 console_handler.setFormatter(log_formatter)
@@ -39,9 +47,16 @@ class StreamToLogger(object):
         self.logger = logger
         self.log_level = log_level
         self.linebuf = ''
+        self._writing = False
     def write(self, buf):
-        for line in buf.rstrip().splitlines():
-            self.logger.log(self.log_level, line.rstrip())
+        if self._writing:
+            return
+        self._writing = True
+        try:
+            for line in buf.rstrip().splitlines():
+                self.logger.log(self.log_level, line.rstrip())
+        finally:
+            self._writing = False
     def flush(self):
         pass
 
@@ -84,7 +99,86 @@ def _patched_load(*args, **kwargs):
     kwargs['weights_only'] = False
     return _orig_load(*args, **kwargs)
 torch.load = _patched_load
-import torch
+
+# ── GPU Detection & Thread Policy ─────────────────────────────────────────────
+# Detect CUDA once at startup. This result drives all device decisions app-wide.
+def _detect_gpu():
+    """
+    Returns (gpu_available: bool, device_str: str, info_msg: str).
+    Runs a real CUDA tensor op to confirm the GPU actually works,
+    not just that the driver is loaded.
+    """
+    if not torch.cuda.is_available():
+        # Diagnose WHY CUDA is not available
+        if torch.backends.cuda.is_built():
+            # PyTorch has CUDA support compiled in but can't init
+            try:
+                import subprocess
+                smi = subprocess.check_output(
+                    r'"C:\Program Files\NVIDIA Corporation\NVSMI\nvidia-smi.exe" '
+                    r'--query-gpu=driver_version --format=csv,noheader',
+                    shell=True, stderr=subprocess.DEVNULL
+                ).decode().strip()
+                drv = float(smi.split()[0]) if smi else 0.0
+            except Exception:
+                drv = 0.0
+
+            cu_ver = torch.version.cuda or "unknown"
+            if drv > 0 and drv < 452.39:
+                msg = (
+                    f"[GPU] CUDA DISABLED — Driver too old! "
+                    f"Installed: {drv}, Required for CUDA {cu_ver}: ≥452.39. "
+                    f"Update driver from: https://www.nvidia.com/Download/index.aspx "
+                    f"(Quadro K1200 → Quadro K-Series → latest R470 branch). "
+                    f"Falling back to CPU."
+                )
+            else:
+                msg = (
+                    f"[GPU] CUDA DISABLED — PyTorch {torch.__version__} with CUDA {cu_ver} "
+                    f"could not initialize. Check driver compatibility. "
+                    f"Falling back to CPU."
+                )
+        else:
+            msg = (
+                f"[GPU] CUDA DISABLED — PyTorch {torch.__version__} was built WITHOUT CUDA. "
+                f"Install a CUDA-enabled PyTorch build. Falling back to CPU."
+            )
+        return False, 'cpu', msg
+
+    # CUDA is reported available — do a quick smoke-test tensor op
+    try:
+        _t = torch.zeros(1, device='cuda:0')
+        del _t
+        torch.cuda.synchronize()
+        gpu_name = torch.cuda.get_device_name(0)
+        vram_gb  = round(torch.cuda.get_device_properties(0).total_memory / 1024**3, 1)
+        msg = f"[GPU] CUDA OK — {gpu_name} ({vram_gb} GB VRAM) — YOLO will use GPU:0"
+        return True, 'cuda:0', msg
+    except Exception as e:
+        msg = f"[GPU] CUDA reported available but smoke-test FAILED ({e}). Falling back to CPU."
+        return False, 'cpu', msg
+
+GPU_AVAILABLE, YOLO_DEVICE, _gpu_msg = _detect_gpu()
+
+# Apply correct thread count now that we know GPU status
+if GPU_AVAILABLE:
+    # GPU handles heavy math — limit CPU threads to 1 to prevent thrashing
+    torch.set_num_threads(1)
+    for _env_key in ("OMP_NUM_THREADS","MKL_NUM_THREADS","OPENBLAS_NUM_THREADS",
+                     "VECLIB_MAXIMUM_THREADS","NUMEXPR_NUM_THREADS"):
+        os.environ[_env_key] = "1"
+else:
+    # CPU-only: let PyTorch use all physical cores for YOLO inference
+    torch.set_num_threads(_CPU_CORES)
+    for _env_key in ("OMP_NUM_THREADS","MKL_NUM_THREADS","OPENBLAS_NUM_THREADS",
+                     "VECLIB_MAXIMUM_THREADS","NUMEXPR_NUM_THREADS"):
+        os.environ[_env_key] = str(_CPU_CORES)
+
+# Log GPU status immediately (visible in logs/shi_app.log)
+# Note: logger not yet configured here; will be printed again after logger init
+print(_gpu_msg)
+# ──────────────────────────────────────────────────────────────────────────────
+
 from datetime import datetime
 from flask import Flask, render_template, Response, request, jsonify
 import logging
@@ -94,6 +188,7 @@ import urllib.request as _urllib_req
 import urllib.error
 import base64 as _base64
 import json as _json
+
 
 def kill_process_on_port(port=5001):
     """Cleanly terminates any zombie/stale process listening on target port before restarting microservice."""
@@ -108,6 +203,67 @@ def kill_process_on_port(port=5001):
                 subprocess.run(f'taskkill /F /PID {pid}', shell=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     except Exception:
         pass
+
+def kill_camera_holders():
+    """
+    Force-release any processes holding the GigE camera in EXCLUSIVE mode.
+    Kills:
+      1. Known I-TEK IKap viewer/tool processes
+      2. Other app.py instances (not the current process) that may hold the camera
+    Returns list of killed process names for logging.
+    """
+    import subprocess
+    import os as _os
+    killed = []
+    my_pid = _os.getpid()
+
+    # Known I-TEK camera applications that grab the camera in exclusive mode
+    itek_procs = [
+        "IKapCViewer.exe", "IKapExpert.exe", "IKTool.exe",
+        "GeneralConfigurator.exe", "FeatureImportExportTool.exe",
+        "IPConfigurator.exe", "ComManager.exe", "VirtualCamera.exe",
+        "FirmwareUpdateTool.exe",
+    ]
+    for proc_name in itek_procs:
+        try:
+            result = subprocess.run(
+                f'taskkill /F /IM "{proc_name}"',
+                shell=True, capture_output=True, text=True
+            )
+            if "SUCCESS" in result.stdout or "terminated" in result.stdout.lower():
+                logger.info(f"[ForceRelease] Killed {proc_name}")
+                killed.append(proc_name)
+        except Exception:
+            pass
+
+    # Kill other app.py instances (not this process)
+    try:
+        import ctypes as _ctypes
+        from ctypes import wintypes as _wt
+        output = subprocess.check_output(
+            'wmic process where "name=\'python.exe\' or name=\'py.exe\'" get ProcessId,CommandLine /format:csv',
+            shell=True
+        ).decode('utf-8', errors='ignore')
+        for line in output.strip().splitlines():
+            parts = line.split(',')
+            if len(parts) < 3:
+                continue
+            cmd = parts[1] if len(parts) > 1 else ''
+            pid_str = parts[-1].strip()
+            if 'app.py' in cmd and pid_str.isdigit():
+                pid = int(pid_str)
+                if pid != my_pid:
+                    try:
+                        subprocess.run(f'taskkill /F /PID {pid}', shell=True,
+                                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                        logger.warning(f"[ForceRelease] Killed competing app.py PID {pid}")
+                        killed.append(f"app.py(PID:{pid})")
+                    except Exception:
+                        pass
+    except Exception as e:
+        logger.warning(f"[ForceRelease] Could not scan for competing app.py processes: {e}")
+
+    return killed
 
 class _PaddleOCRClient:
     """HTTP client that calls the paddleocr_server.py microservice (py -3.12)."""
@@ -157,7 +313,7 @@ class _PaddleOCRClient:
                 import subprocess
                 kill_process_on_port(5001)
                 logger.info("Attempting to auto-start paddleocr_server.py in background...")
-                subprocess.Popen(["py", "-3.12", "paddleocr_server.py"], cwd=os.getcwd())
+                subprocess.Popen(["py", "-3.12", "paddleocr_server.py", "--parent-pid", str(os.getpid())], cwd=os.getcwd(), creationflags=0x08000000)
             except Exception as launch_err:
                 logger.error(f"Failed to auto-launch paddleocr_server.py: {launch_err}")
             return []
@@ -166,8 +322,8 @@ PaddleOCR = _PaddleOCRClient
 
 from ultralytics import YOLO
 
-# Limit PyTorch CPU threads
-torch.set_num_threads(1)
+# Log the GPU status determined at startup
+logger.info(_gpu_msg)
 
 # Import report generator
 from generate_report import create_inspection_report
@@ -332,15 +488,15 @@ def init_models():
         print("Loading YOLO Model...")
         model_file = MODEL_PATH if os.path.exists(MODEL_PATH) else "yolov8n.pt"
         YOLO_MODEL = YOLO(model_file)
-        # Enforce GPU for YOLO model
-        if torch.cuda.is_available():
+        # Move YOLO to the detected target device
+        if GPU_AVAILABLE:
             try:
-                YOLO_MODEL.to('cuda:0')
-                print(f"[YOLO] Successfully transferred model to GPU: {torch.cuda.get_device_name(0)}")
+                YOLO_MODEL.to(YOLO_DEVICE)
+                logger.info(f"[YOLO] Successfully transferred model to {YOLO_DEVICE}")
             except Exception as e:
-                print(f"[YOLO] Warning: Failed to transfer model to GPU: {e}")
+                logger.warning(f"[YOLO] Failed to transfer model to {YOLO_DEVICE}: {e}. Falling back to CPU.")
         else:
-            print("[YOLO] WARNING: GPU requested for YOLO inference, but CUDA is currently unavailable.")
+            logger.info(f"[YOLO] Model loaded for CPU inference. ({_gpu_msg})")
     if OCR_ENGINE is None:
         print("Connecting to PaddleOCR Microservice...")
         OCR_ENGINE = PaddleOCR()
@@ -633,13 +789,13 @@ def finalize_report_and_rename(c_data):
         # Read defects and verify holes
         with lock:
             defects = list(active_cycle_data["defects_detected"])
-            if active_cycle_data["max_holes_detected"] < 3:
+            if active_cycle_data.get("max_holes_detected", 0) < 3:
                 defects.append("missing_holes")
             if active_cycle_data.get("max_ring_bush_detected", 0) < 1 and active_cycle_data.get("max_rod_detected", 0) < 1:
                 defects.append("missing_ring_bush")
-            if active_cycle_data["max_striker_detected"] < 2:
+            if active_cycle_data.get("max_striker_detected", 0) < 2:
                 defects.append("missing_striker")
-            if active_cycle_data["max_back_hook_detected"] < 2:
+            if active_cycle_data.get("max_back_hook_detected", 0) < 2:
                 defects.append("missing_back_hook")
             if active_cycle_data["max_lock_striker_detected"] < 1:
                 defects.append("missing_lock_striker")
@@ -650,12 +806,12 @@ def finalize_report_and_rename(c_data):
 
             # Update operator instruction to show NG (red big) if defective, or OK (green big) if no defects
             if defects:
-                current_cycle["instruction"] = "NG"
+                # current_cycle["instruction"] = "NG"  # Removed per user request to keep operator instructions
                 current_cycle["instruction_color"] = "red"
                 current_cycle["result"] = "NG"
                 current_cycle["status"] = "NG - DEFECT DETECTED"
             else:
-                current_cycle["instruction"] = "OK"
+                # current_cycle["instruction"] = "OK"  # Removed per user request
                 current_cycle["instruction_color"] = "green"
                 current_cycle["result"] = "OK"
                 current_cycle["status"] = "OK - INSPECTION PASSED"
@@ -749,12 +905,12 @@ def finalize_report_and_rename(c_data):
                 cycle_count += 1
 
             if defects:
-                current_cycle["instruction"] = "NG"
+                # current_cycle["instruction"] = "NG"  # Removed per user request to keep operator instructions
                 current_cycle["instruction_color"] = "red"
                 current_cycle["result"] = "NG"
                 current_cycle["status"] = f"Finished Cycle: NG ({serial})"
             else:
-                current_cycle["instruction"] = "OK"
+                # current_cycle["instruction"] = "OK"  # Removed per user request
                 current_cycle["instruction_color"] = "green"
                 current_cycle["result"] = "OK"
                 current_cycle["status"] = f"Finished Cycle: OK ({serial})"
@@ -869,6 +1025,12 @@ class CameraStreamer:
         self.last_error_msg = ""
         
         if sdk_available:
+            # Finalize first to release any stale handles left by a previous crashed session
+            # (prevents error 1114141 = SYSTEM_ERROR on first connect attempt)
+            try:
+                IKapC.ItkManFinalize()
+            except Exception:
+                pass
             res = IKapC.ItkManInitialize()
             if res != IKapCDef.ITKSTATUS_OK:
                 self.last_error_msg = f"Failed to initialize IKap SDK: {res}"
@@ -991,13 +1153,57 @@ class CameraStreamer:
                 break
 
         if res != IKapCDef.ITKSTATUS_OK or not self.m_hDev or self.m_hDev.value == 0:
-            hint = ""
-            if res == 1114128:  # ITKSTATUS_TIME_OUT in DEVICE module
-                hint = " (Timeout — camera may be held by another application in EXCLUSIVE mode)"
-            self.last_error_msg = f"Failed to open device. SDK error code: {res}{hint}"
-            print(self.last_error_msg)
-            print("--- DIAGNOSTIC END ---\n")
-            return False
+            # ── Error code decoder ────────────────────────────────────────────
+            # IKap packs errors as: (module<<20)|(level<<16)|base_code
+            # 1114141 = 0x11001D = module=DEVICE, level=ERR, code=29 (SYSTEM_ERROR)
+            #   → camera handle still held by a previous crashed session.
+            #     Fix: reinitialize the SDK to force-release stale handles, then retry.
+            # 1114128 = 0x110010 = module=DEVICE, level=ERR, code=16 (TIME_OUT)
+            #   → camera locked by another application in EXCLUSIVE mode.
+            # ─────────────────────────────────────────────────────────────────
+            SYSTEM_ERROR_CODE = (1 << 20) | (1 << 16) | 29   # 1114141
+            TIMEOUT_CODE       = (1 << 20) | (1 << 16) | 16   # 1114128
+
+            if res == SYSTEM_ERROR_CODE:
+                logger.warning("[Camera] SDK SYSTEM_ERROR (1114141) — stale device handle detected. "
+                               "Re-initializing SDK and retrying...")
+                try:
+                    IKapC.ItkManFinalize()
+                    time.sleep(0.5)
+                    IKapC.ItkManInitialize()
+                    time.sleep(0.3)
+                except Exception as reinit_err:
+                    logger.warning(f"[Camera] SDK reinit warning: {reinit_err}")
+
+                # One retry after SDK reset
+                for mode_name2, access_mode2 in [
+                    ("EXCLUSIVE", IKapCDef.ITKDEV_VAL_ACCESS_MODE_EXCLUSIVE),
+                    ("CONTROL",   IKapCDef.ITKDEV_VAL_ACCESS_MODE_CONTROL),
+                ]:
+                    print(f"DIAGNOSTIC: [Retry after SDK reinit] Trying {mode_name2}")
+                    res, self.m_hDev = IKapC.ItkDevOpen(index, access_mode2)
+                    print(f"DIAGNOSTIC: [Retry] ItkDevOpen [{mode_name2}] = {res}, handle = {self.m_hDev}")
+                    if res == IKapCDef.ITKSTATUS_OK and self.m_hDev and self.m_hDev.value != 0:
+                        logger.info(f"[Camera] Retry succeeded — opened in {mode_name2} mode.")
+                        break
+
+            if res != IKapCDef.ITKSTATUS_OK or not self.m_hDev or self.m_hDev.value == 0:
+                hint = ""
+                if res == TIMEOUT_CODE:
+                    hint = (" (Timeout — camera is held by another application in EXCLUSIVE mode. "
+                            "Close all other camera software and retry.)")
+                elif res == SYSTEM_ERROR_CODE:
+                    hint = (" (System error — SDK reinit attempted but failed. "
+                            "Try: 1) Restart this app.  2) Unplug and replug the GigE cable.  "
+                            "3) Reboot the PC if the problem persists.)")
+                elif res == 10:   # ITKSTATUS_DEVICE_PERMISSION_DENY
+                    hint = " (Permission denied — run the app as Administrator.)"
+                elif res == 32:   # ITKSTATUS_DEVICE_BUSY
+                    hint = " (Device busy — close all other GigE applications and retry.)"
+                self.last_error_msg = f"Failed to open device. SDK error code: {res}{hint}"
+                print(self.last_error_msg)
+                print("--- DIAGNOSTIC END ---\n")
+                return False
             
         print("--- DIAGNOSTIC END ---\n")
 
@@ -1137,6 +1343,7 @@ class CameraStreamer:
         if res == IKapCDef.ITKSTATUS_OK:
             self.is_connected = True
             self.last_error_msg = ""
+            self.last_frame_time = time.time()  # Reset watchdog timer on new connection
             print("Successfully connected to IKap GigE Camera via IKapC.")
             return True
         else:
@@ -1151,6 +1358,9 @@ class CameraStreamer:
         res, bufferInfo = IKapC.ItkBufferGetInfo(hBuffer)
         if bufferInfo.State != IKapCDef.ITKBUFFER_VAL_STATE_FULL and bufferInfo.State != IKapCDef.ITKBUFFER_VAL_STATE_UNCOMPLETED:
             return
+            
+        # Update timestamp to prevent watchdog from auto-disconnecting
+        self.last_frame_time = time.time()
 
         img_w = bufferInfo.ImageWidth
         img_h = bufferInfo.ImageHeight
@@ -1326,20 +1536,6 @@ class CameraStreamer:
                                 pass
                     self.latest_frame = rawNp.copy()
 
-    def check_and_recover(self):
-        """Watchdog: Checks if frame feed has stalled for > 3.5 seconds. Reconnects camera if needed."""
-        if not self.is_connected:
-            return False
-        if time.time() - self.last_frame_time > 3.5:
-            print(f"[Camera Watchdog] GigE camera frame feed stalled (> 3.5s since last callback frame). Auto-reconnecting camera ID {self.last_connected_cam_id}...")
-            try:
-                self.connect(self.last_connected_cam_id)
-                return True
-            except Exception as e:
-                print(f"[Camera Watchdog] Reconnection error: {e}")
-                return False
-        return False
-
     def get_frame(self):
         with self.lock:
             if self.latest_frame is not None:
@@ -1442,7 +1638,7 @@ def video_processing_loop():
                 if not cam.is_connected:
                     time.sleep(0.05)
                     continue
-                cam.check_and_recover()
+                # Watchdog removed as requested
                 frame = cam.get_frame()
                 if frame is None:
                     time.sleep(0.01)
@@ -1489,9 +1685,9 @@ def video_processing_loop():
                 latest_raw_frame = enhanced_frame
                 latest_unenhanced_frame = raw_unenhanced_frame
 
-            # Resize frame to standard 480px width first to speed up JPEG encoding and keep annotations crisp
+            # Resize frame to standard 800px width first to speed up JPEG encoding and keep annotations crisp
             h_ann, w_ann = frame.shape[:2]
-            UI_WIDTH = 480 # Reduced resolution for UI to prevent getting stuck
+            UI_WIDTH = 800 # Reduced resolution for UI to prevent getting stuck
             if w_ann > UI_WIDTH:
                 scale_ann = UI_WIDTH / w_ann
                 annotated_frame = cv2.resize(frame, (UI_WIDTH, int(h_ann * scale_ann)))
@@ -1627,7 +1823,7 @@ def yolo_worker_loop():
         if _debug_counter % 30 == 0:
             print(f"[YOLO] Running inference frame #{_debug_counter}, state={state}")
             
-        if _debug_counter % 300 == 0 and torch.cuda.is_available():
+        if _debug_counter % 300 == 0 and GPU_AVAILABLE:
             torch.cuda.empty_cache()
             
         h_orig, w_orig = frame_to_process.shape[:2]
@@ -1645,10 +1841,8 @@ def yolo_worker_loop():
             min_thresh = min(CLASS_CONF_THRESHOLDS.values()) if CLASS_CONF_THRESHOLDS else YOLO_CONF_THRESHOLD
             run_thresh = min(float(min_thresh), float(YOLO_CONF_THRESHOLD))
             
-            # Explicitly target GPU (device=0) for YOLO inference; fallback to cpu only if CUDA unavailable
-            yolo_dev = 0 if torch.cuda.is_available() else 'cpu'
             with torch.inference_mode():
-                results = YOLO_MODEL(frame_resized, verbose=False, conf=run_thresh, task='segment', imgsz=448, device=yolo_dev)
+                results = YOLO_MODEL(frame_resized, verbose=False, conf=run_thresh, task='segment', imgsz=448, device=YOLO_DEVICE)
             new_detections = []
             frame_holes = 0
             frame_ring_bush = 0
@@ -1791,15 +1985,18 @@ def yolo_worker_loop():
                         frame_defects.append(class_name)
                         
                     if class_name == "hole" or class_name == "holes":
-                        if has_back_detected or (not has_front_detected and not has_back_detected):
+                        if has_back_detected:
                             frame_holes += 1
                     elif class_name in ["ring_bush", "ringbush", "rod"]:
-                        frame_ring_bush += 1
-                        frame_rod += 1
+                        if has_front_detected:
+                            frame_ring_bush += 1
+                            frame_rod += 1
                     elif class_name == "striker":
-                        frame_striker += 1
+                        if has_front_detected:
+                            frame_striker += 1
                     elif class_name == "back_hook":
-                        frame_back_hook += 1
+                        if has_back_detected:
+                            frame_back_hook += 1
                     elif class_name == "lock_striker":
                         frame_lock_striker += 1
                     elif class_name in ["front", "circle_front"]:
@@ -1866,8 +2063,8 @@ def yolo_worker_loop():
                     is_ocr_target = False
 
                     if class_name in ["serial", "serial_area"]:
-                        # Ultra-fast trigger: start OCR immediately upon detection (50ms stability check)
-                        if time_elapsed >= 0.05:
+                        # User-requested 3.0s delay to ensure the part is perfectly stable and motion blur is gone
+                        if time_elapsed >= 3.0:
                             is_ocr_target = True
                     else:
                         is_ocr_target = False
@@ -1945,11 +2142,11 @@ def yolo_worker_loop():
                 # Strict State Machine Logic
                 if state == "WAITING_FRONT":
                     current_cycle["status"] = "Waiting for Front Panel"
+                    current_cycle["instruction"] = "PLACE FUEL DOOR (FRONT)"
                     if not active_cycle_data.get("defects_detected"):
-                        current_cycle["instruction"] = "PLACE FUEL DOOR (FRONT)"
                         current_cycle["instruction_color"] = "blue"
                     else:
-                        current_cycle["instruction"] = "NG"
+                        # current_cycle["instruction"] = "NG"  # Removed per user request to keep operator instructions
                         current_cycle["instruction_color"] = "red"
                         current_cycle["result"] = "NG"
                     
@@ -1982,7 +2179,8 @@ def yolo_worker_loop():
                         
                         active_cycle_data["front_missing_frames"] = 0
                         
-                        if time_stable >= 0.2:
+                        components_ok = (active_cycle_data.get("max_ring_bush_detected", 0) >= 1) and (active_cycle_data.get("max_striker_detected", 0) >= 2)
+                        if (components_ok and time_stable >= 0.2) or time_stable >= 4.0:
                             # Save full enhanced image without annotations and without cropping
                             full_image = frame_to_process.copy()
                             front_file = os.path.join(active_cycle_data["temp_folder"], "front.jpg")
@@ -2002,16 +2200,15 @@ def yolo_worker_loop():
                             active_cycle_data["front_type"] = "circle" if front_class == "circle_front" else "standard"
                             logger.info(f"[State] Front captured as type='{active_cycle_data['front_type']}' (class='{front_class}')")
                             current_cycle["step2_status"] = "OK"
+                            if components_ok:
+                                active_cycle_data["flash_end_time"] = time.time() + 1.0
+                                active_cycle_data["flash_message"] = "FRONT OK"
                             active_cycle_data["state"] = "WAITING_LOCK_STRIKER"
                             for d in frame_defects:
                                 active_cycle_data["defects_detected"].add(d)
-                            # Immediate missing component check on Front Panel capture
-                            if active_cycle_data.get("max_ring_bush_detected", 0) < 1 and frame_ring_bush < 1:
-                                active_cycle_data["defects_detected"].add("missing_ring_bush")
-                            if active_cycle_data.get("max_striker_detected", 0) < 2 and frame_striker < 2:
-                                active_cycle_data["defects_detected"].add("missing_striker")
+                            # Immediate missing checks removed to allow 1.5s detection time before flashing NG
                             if active_cycle_data.get("defects_detected"):
-                                current_cycle["instruction"] = "NG"
+                                # current_cycle["instruction"] = "NG"  # Removed per user request to keep operator instructions
                                 current_cycle["instruction_color"] = "red"
                                 current_cycle["result"] = "NG"
 
@@ -2023,11 +2220,11 @@ def yolo_worker_loop():
                             
                 elif state == "WAITING_LOCK_STRIKER":
                     current_cycle["status"] = "Waiting for Lock Striker"
+                    current_cycle["instruction"] = "SHOW LOCK STRIKER"
                     if not active_cycle_data.get("defects_detected"):
-                        current_cycle["instruction"] = "SHOW LOCK STRIKER"
                         current_cycle["instruction_color"] = "blue"
                     else:
-                        current_cycle["instruction"] = "NG"
+                        # current_cycle["instruction"] = "NG"  # Removed per user request to keep operator instructions
                         current_cycle["instruction_color"] = "red"
                         current_cycle["result"] = "NG"
                     
@@ -2039,24 +2236,31 @@ def yolo_worker_loop():
                     # Check if operator skipped Lock Striker and flipped directly to Back Side
                     is_back_panel_visible = (back_box is not None) and (not has_front_detected)
                     
+                    if "ls_state_start" not in active_cycle_data:
+                        active_cycle_data["ls_state_start"] = time.time()
+                    
+                    ls_time_elapsed = time.time() - active_cycle_data["ls_state_start"]
+                    
                     if ls_detected or ls_saved:
                         logger.info("[Lock Striker] Lock Striker detected! Step 3 -> OK")
                         current_cycle["step3_status"] = "OK"
+                        active_cycle_data["flash_end_time"] = time.time() + 1.0
+                        active_cycle_data["flash_message"] = "LOCK STRIKER OK"
                         active_cycle_data["defects_detected"].discard("missing_lock_striker")
                         active_cycle_data["state"] = "WAITING_BACK"
-                    elif is_back_panel_visible:
-                        logger.warning("[Lock Striker Skip] Back panel detected before Lock Striker. Step 3 -> NG")
+                    elif is_back_panel_visible or ls_time_elapsed >= 4.0:
+                        logger.warning(f"[Lock Striker Skip] Skipped Lock Striker (Back panel visible: {is_back_panel_visible}, Time elapsed: {ls_time_elapsed:.1f}s). Step 3 -> NG")
                         active_cycle_data["defects_detected"].add("missing_lock_striker")
                         current_cycle["step3_status"] = "NG"
                         active_cycle_data["state"] = "WAITING_BACK"
                         
                 elif state == "WAITING_BACK":
                     current_cycle["status"] = "Waiting for Back Panel"
+                    current_cycle["instruction"] = "FLIP TO BACK SIDE"
                     if not active_cycle_data.get("defects_detected"):
-                        current_cycle["instruction"] = "FLIP TO BACK SIDE"
                         current_cycle["instruction_color"] = "blue"
                     else:
-                        current_cycle["instruction"] = "NG"
+                        # current_cycle["instruction"] = "NG"  # Removed per user request to keep operator instructions
                         current_cycle["instruction_color"] = "red"
                         current_cycle["result"] = "NG"
                     
@@ -2112,36 +2316,38 @@ def yolo_worker_loop():
                             
                             ocr_done = active_cycle_data.get("serial_number") is not None
                             ocr_start = active_cycle_data.get("ocr_start_time")
-                            ocr_timeout = (ocr_start is not None) and (time.time() - ocr_start > 5.0)
+                            ocr_timeout = (ocr_start is not None) and (time.time() - ocr_start > 8.0)
                             
-                            if time_stable >= 0.0 or ocr_done:
-                                # Delay the transition to finalization until the OCR thread has actually successfully completed or timed out
-                                if ocr_done or ocr_timeout:
-                                    # Save full enhanced image without cropping
-                                    full_raw = frame_to_process.copy()
-                                    back_file = os.path.join(active_cycle_data["temp_folder"], "back.jpg")
+                            components_ok = (active_cycle_data.get("max_holes_detected", 0) >= 3) and (active_cycle_data.get("max_back_hook_detected", 0) >= 2)
+                            
+                            if (ocr_done or ocr_timeout) and ((components_ok and time_stable >= 0.2) or time_stable >= 4.0):
+                            # Save full enhanced image without cropping
+                                full_raw = frame_to_process.copy()
+                                back_file = os.path.join(active_cycle_data["temp_folder"], "back.jpg")
 
-                                    # Optionally retain original un-enhanced frame for debugging
-                                    if active_cycle_data.get("save_debug_raw", False) or APP_CONFIG.get("storage", {}).get("save_debug_raw", False):
-                                        debug_raw_file = os.path.join(active_cycle_data["temp_folder"], "back_raw_debug.jpg")
-                                        with lock:
-                                            if latest_unenhanced_frame is not None:
-                                                cv2.imwrite(debug_raw_file, latest_unenhanced_frame, [cv2.IMWRITE_JPEG_QUALITY, 95])
-                                                logger.info(f"[Debug] Saved original un-enhanced back image: {debug_raw_file}")
+                                # Optionally retain original un-enhanced frame for debugging
+                                if active_cycle_data.get("save_debug_raw", False) or APP_CONFIG.get("storage", {}).get("save_debug_raw", False):
+                                    debug_raw_file = os.path.join(active_cycle_data["temp_folder"], "back_raw_debug.jpg")
+                                    with lock:
+                                        if latest_unenhanced_frame is not None:
+                                            cv2.imwrite(debug_raw_file, latest_unenhanced_frame, [cv2.IMWRITE_JPEG_QUALITY, 95])
+                                            logger.info(f"[Debug] Saved original un-enhanced back image: {debug_raw_file}")
 
-                                    cv2.imwrite(back_file, full_raw, [cv2.IMWRITE_JPEG_QUALITY, 95])
-                                    active_cycle_data["back_path"] = back_file
+                                cv2.imwrite(back_file, full_raw, [cv2.IMWRITE_JPEG_QUALITY, 95])
+                                active_cycle_data["back_path"] = back_file
+                                
+                                current_cycle["step4_status"] = "OK"
+                                for d in frame_defects:
+                                    active_cycle_data["defects_detected"].add(d)
                                     
-                                    current_cycle["step4_status"] = "OK"
-                                    for d in frame_defects:
-                                        active_cycle_data["defects_detected"].add(d)
-                                    
-                                    # Go straight to finalization
-                                    active_cycle_data["state"] = "WAITING_REMOVE"
-                                    check_and_finalize_cycle(active_cycle_data)
-                                else:
-                                    current_cycle["instruction"] = "DETECTING SERIAL NUMBER..."
-                                    active_cycle_data["back_frames_count"] = 1 # Keep it below threshold until serial is seen
+                                # Immediate missing checks removed to allow 1.5s detection time before flashing NG
+                                
+                                # Go straight to finalization
+                                active_cycle_data["state"] = "WAITING_REMOVE"
+                                check_and_finalize_cycle(active_cycle_data)
+                            else:
+                                current_cycle["instruction"] = "DETECTING SERIAL NUMBER..."
+                                active_cycle_data["back_frames_count"] = 1 # Keep it below threshold until serial is seen
                     else:
                         active_cycle_data["back_frames_count"] = 0
                         active_cycle_data["back_first_seen_time"] = None
@@ -2191,24 +2397,87 @@ def yolo_worker_loop():
                         current_cycle["step3_status"] = "OK"
                         active_cycle_data["defects_detected"].discard("missing_lock_striker")
                     
-                    # Continuously accumulate defects from every frame (not just at capture time)
-                    for d in frame_defects:
-                        active_cycle_data["defects_detected"].add(d)
-                    current_cycle["defects"] = list(active_cycle_data["defects_detected"])
-                    
-                    # If any defect is identified during live frames, immediately trigger NG (flashy red side signals)
-                    if active_cycle_data["defects_detected"]:
-                        current_cycle["instruction"] = "NG"
-                        current_cycle["instruction_color"] = "red"
-                        current_cycle["result"] = "NG"
-
                     if active_cycle_data["temp_folder"] is not None:
+                        current_t = time.time()
+                        last_t = active_cycle_data.get("last_frame_time", current_t)
+                        dt = current_t - last_t
+                        active_cycle_data["last_frame_time"] = current_t
+                        
+                        if "defect_times" not in active_cycle_data:
+                            active_cycle_data["defect_times"] = {}
+                        
+                        # Only accumulate physical defect times if a panel is actually in view!
+                        if has_front_detected or has_back_detected:
+                            for d in frame_defects:
+                                active_cycle_data["defect_times"][d] = active_cycle_data["defect_times"].get(d, 0.0) + dt
+                                if active_cycle_data["defect_times"][d] >= 1.5:
+                                    active_cycle_data["defects_detected"].add(d)
+                        
                         active_cycle_data["max_holes_detected"] = min(3, max(active_cycle_data["max_holes_detected"], frame_holes))
                         active_cycle_data["max_ring_bush_detected"] = min(1, max(active_cycle_data.get("max_ring_bush_detected", 0), frame_ring_bush))
                         active_cycle_data["max_rod_detected"] = active_cycle_data["max_ring_bush_detected"]
                         active_cycle_data["max_striker_detected"] = min(2, max(active_cycle_data["max_striker_detected"], frame_striker))
                         active_cycle_data["max_back_hook_detected"] = min(2, max(active_cycle_data["max_back_hook_detected"], frame_back_hook))
                         active_cycle_data["max_lock_striker_detected"] = min(1, max(active_cycle_data["max_lock_striker_detected"], frame_lock_striker))
+                        
+                        if frame_holes >= 3:
+                            active_cycle_data["holes_time"] = active_cycle_data.get("holes_time", 0.0) + dt
+                        if frame_ring_bush >= 1 or active_cycle_data.get("max_rod_detected", 0) >= 1:
+                            active_cycle_data["ring_bush_time"] = active_cycle_data.get("ring_bush_time", 0.0) + dt
+                        if frame_striker >= 2:
+                            active_cycle_data["striker_time"] = active_cycle_data.get("striker_time", 0.0) + dt
+                        if frame_back_hook >= 2:
+                            active_cycle_data["back_hook_time"] = active_cycle_data.get("back_hook_time", 0.0) + dt
+                        if frame_lock_striker >= 1:
+                            active_cycle_data["lock_striker_time"] = active_cycle_data.get("lock_striker_time", 0.0) + dt
+                        
+                        # Dynamically add missing defects only after 1.5s of panel visibility
+                        if has_front_detected:
+                            active_cycle_data["front_visible_time"] = active_cycle_data.get("front_visible_time", 0.0) + dt
+                            if active_cycle_data["front_visible_time"] >= 1.5:
+                                if active_cycle_data.get("max_ring_bush_detected", 0) < 1:
+                                    active_cycle_data["defects_detected"].add("missing_ring_bush")
+                                if active_cycle_data.get("max_striker_detected", 0) < 2:
+                                    active_cycle_data["defects_detected"].add("missing_striker")
+                        
+                        if has_back_detected:
+                            active_cycle_data["back_visible_time"] = active_cycle_data.get("back_visible_time", 0.0) + dt
+                            if active_cycle_data["back_visible_time"] >= 1.5:
+                                if active_cycle_data.get("max_holes_detected", 0) < 3:
+                                    active_cycle_data["defects_detected"].add("missing_holes")
+                                if active_cycle_data.get("max_back_hook_detected", 0) < 2:
+                                    active_cycle_data["defects_detected"].add("missing_back_hook")
+                        
+                        # Dynamically clear missing defects if they are eventually found during the cycle
+                        if active_cycle_data.get("max_holes_detected", 0) >= 3:
+                            active_cycle_data["defects_detected"].discard("missing_holes")
+                        if active_cycle_data.get("max_ring_bush_detected", 0) >= 1:
+                            active_cycle_data["defects_detected"].discard("missing_ring_bush")
+                        if active_cycle_data.get("max_striker_detected", 0) >= 2:
+                            active_cycle_data["defects_detected"].discard("missing_striker")
+                        if active_cycle_data.get("max_back_hook_detected", 0) >= 2:
+                            active_cycle_data["defects_detected"].discard("missing_back_hook")
+                        if active_cycle_data["max_lock_striker_detected"] >= 1:
+                            active_cycle_data["defects_detected"].discard("missing_lock_striker")
+
+                    current_cycle["defects"] = list(active_cycle_data["defects_detected"])
+                    
+                    # If any defect is identified during live frames, immediately trigger NG (flashy red side signals)
+                    if active_cycle_data["defects_detected"]:
+                        current_cycle["instruction_color"] = "red"
+                        current_cycle["result"] = "NG"
+                    else:
+                        if state != "WAITING_REMOVE":
+                            current_cycle["instruction_color"] = "blue"
+                            current_cycle["result"] = "Awaiting analysis..."
+
+                    # Allow the 1-second sequence success flash to override the current state, EVEN IF NG!
+                    if state != "WAITING_REMOVE":
+                        flash_end = active_cycle_data.get("flash_end_time", 0)
+                        if time.time() < flash_end:
+                            current_cycle["instruction_color"] = "green"
+                            current_cycle["instruction"] = active_cycle_data.get("flash_message", "OK")
+                            current_cycle["result"] = "OK"
             if needs_reset:
                 reset_cycle_state()
                 
@@ -2337,6 +2606,81 @@ def scan_cameras():
     global cam
     return jsonify({'cameras': cam.scan_cameras()})
 
+@app.route('/connect_default_gige', methods=['POST'])
+def connect_default_gige():
+    """One-click connect: uses target_serial from config (73ABE004). No scan needed."""
+    global cam, stream_source, is_processing, video_cap
+    target_serial = APP_CONFIG.get("camera", {}).get("gige", {}).get("target_serial", "73ABE004").strip()
+    exposure = APP_CONFIG.get("camera", {}).get("gige", {}).get("exposure", None)
+    gain = APP_CONFIG.get("camera", {}).get("gige", {}).get("gain", None)
+    pixel_format = APP_CONFIG.get("camera", {}).get("gige", {}).get("pixel_format", "BayerRG8")
+
+    logger.info(f"[Default Connect] Connecting to camera SN: {target_serial}")
+
+    if cam.is_connected:
+        cam.disconnect()
+
+    # connect() will resolve SDK index by serial automatically via find_index_by_serial()
+    if cam.connect(0, exposure=exposure, gain=gain, pixel_format=pixel_format):
+        if video_cap:
+            video_cap.release()
+            video_cap = None
+        stream_source = "gige"
+        is_processing = True
+        reset_cycle_state()
+        return jsonify({"status": "success", "message": f"Camera SN:{target_serial} connected successfully!"})
+    else:
+        return jsonify({"status": "error", "message": cam.last_error_msg})
+
+@app.route('/force_connect_gige', methods=['POST'])
+def force_connect_gige():
+    """
+    Force-release camera from any holding processes, then connect.
+    Kills: IKap viewer/tools + competing app.py instances holding the camera.
+    """
+    global cam, stream_source, is_processing, video_cap
+    target_serial = APP_CONFIG.get("camera", {}).get("gige", {}).get("target_serial", "73ABE004").strip()
+    exposure = APP_CONFIG.get("camera", {}).get("gige", {}).get("exposure", None)
+    gain = APP_CONFIG.get("camera", {}).get("gige", {}).get("gain", None)
+    pixel_format = APP_CONFIG.get("camera", {}).get("gige", {}).get("pixel_format", "BayerRG8")
+
+    logger.warning(f"[Force Connect] Releasing camera SN: {target_serial} from holder processes...")
+
+    # 1. Disconnect our own handle first
+    if cam.is_connected:
+        cam.disconnect()
+
+    # 2. Kill all competing processes holding the camera
+    killed = kill_camera_holders()
+    logger.warning(f"[Force Connect] Killed processes: {killed if killed else 'none found'}")
+
+    # 3. Give the OS time to release the handle
+    import time as _t
+    _t.sleep(1.5)
+
+    # 4. Re-init SDK to flush stale handles
+    try:
+        import IKapC as _ikc
+        _ikc.ItkManFinalize()
+        _t.sleep(0.4)
+        _ikc.ItkManInitialize()
+        _t.sleep(0.3)
+    except Exception as sdk_err:
+        logger.warning(f"[Force Connect] SDK reinit warning: {sdk_err}")
+
+    # 5. Attempt connection
+    if cam.connect(0, exposure=exposure, gain=gain, pixel_format=pixel_format):
+        if video_cap:
+            video_cap.release()
+            video_cap = None
+        stream_source = "gige"
+        is_processing = True
+        reset_cycle_state()
+        killed_msg = f" (Released: {', '.join(killed)})" if killed else ""
+        return jsonify({"status": "success", "message": f"Camera SN:{target_serial} connected!{killed_msg}"})
+    else:
+        return jsonify({"status": "error", "message": cam.last_error_msg})
+
 @app.route('/connect_gige', methods=['POST'])
 def connect_gige():
     global cam
@@ -2448,9 +2792,9 @@ if __name__ == '__main__':
         # Try specific Python 3.12 launcher first (runs OCR server on Python 3.12)
         try:
             py312_path = subprocess.check_output(["py", "-3.12", "-c", "import sys; print(sys.executable)"]).decode().strip()
-            ocr_process = subprocess.Popen([py312_path, "paddleocr_server.py"], stdout=ocr_log, stderr=subprocess.STDOUT, env=dict(os.environ, PYTHONUNBUFFERED="1"))
+            ocr_process = subprocess.Popen([py312_path, "paddleocr_server.py", "--parent-pid", str(os.getpid())], stdout=ocr_log, stderr=subprocess.STDOUT, env=dict(os.environ, PYTHONUNBUFFERED="1"), creationflags=0x08000000)
         except Exception:
-            ocr_process = subprocess.Popen([sys.executable, "paddleocr_server.py"], stdout=ocr_log, stderr=subprocess.STDOUT, env=dict(os.environ, PYTHONUNBUFFERED="1"))
+            ocr_process = subprocess.Popen([sys.executable, "paddleocr_server.py", "--parent-pid", str(os.getpid())], stdout=ocr_log, stderr=subprocess.STDOUT, env=dict(os.environ, PYTHONUNBUFFERED="1"), creationflags=0x08000000)
             
         def cleanup_ocr():
             logger.info("[System] Shutting down PaddleOCR Server...")
@@ -2483,4 +2827,6 @@ if __name__ == '__main__':
     app.run(host=APP_CONFIG.get("web", {}).get("host", "0.0.0.0"), 
             port=APP_CONFIG.get("web", {}).get("port", 5000), 
             debug=False, threaded=True)
+
+
 
