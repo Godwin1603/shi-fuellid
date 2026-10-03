@@ -2698,7 +2698,7 @@ def yolo_worker_loop():
                             logger.info(f"[State] Front captured as type='{_front_capture_type}' (class='{front_class}')")
                             current_cycle["step2_status"] = "OK"
                             
-                            active_cycle_data["flash_end_time"] = time.time() + 1.0
+                            active_cycle_data["flash_end_time"] = time.time() + 2.0
                             active_cycle_data["flash_message"] = "FRONT OK"
                                 
                             active_cycle_data["state"] = "WAITING_LOCK_STRIKER"
@@ -2744,7 +2744,7 @@ def yolo_worker_loop():
                     if ls_detected or ls_saved:
                         logger.info("[Lock Striker] Lock Striker detected! Step 3 -> OK")
                         current_cycle["step3_status"] = "OK"
-                        active_cycle_data["flash_end_time"] = time.time() + 1.0
+                        active_cycle_data["flash_end_time"] = time.time() + 2.0
                         active_cycle_data["flash_message"] = "LOCK STRIKER OK"
                         active_cycle_data["defects_detected"].discard("missing_lock_striker")
                         active_cycle_data["state"] = "WAITING_BACK"
@@ -2960,17 +2960,22 @@ def yolo_worker_loop():
 
                     current_cycle["defects"] = list(active_cycle_data["defects_detected"])
                     
-                    # If any defect is identified during live frames, immediately trigger NG (flashy red side signals)
-                    if active_cycle_data["defects_detected"]:
-                        current_cycle["instruction_color"] = "red"
-                        current_cycle["result"] = "NG"
+                    if state == "WAITING_REMOVE":
+                        # User request: At the last sequence until they take the part out, flash OK only, don't flash NG
+                        if active_cycle_data.get("remove_frames_count", 0) == 0:
+                            current_cycle["instruction_color"] = "green"
+                            current_cycle["instruction"] = "REMOVE THE PLATE"
+                            current_cycle["result"] = "OK"
                     else:
-                        if state != "WAITING_REMOVE":
+                        # If any defect is identified during live frames, immediately trigger NG (flashy red side signals)
+                        if active_cycle_data["defects_detected"]:
+                            current_cycle["instruction_color"] = "red"
+                            current_cycle["result"] = "NG"
+                        else:
                             current_cycle["instruction_color"] = "blue"
                             current_cycle["result"] = "Awaiting analysis..."
 
-                    # Allow the 1-second sequence success flash to override the current state, EVEN IF NG!
-                    if state != "WAITING_REMOVE":
+                        # Allow the 2-second sequence success flash to override the current state, EVEN IF NG!
                         flash_end = active_cycle_data.get("flash_end_time", 0)
                         if time.time() < flash_end:
                             current_cycle["instruction_color"] = "green"
