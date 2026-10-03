@@ -76,7 +76,7 @@ camera:
   gige:
     target_serial: "73ABE004"  # Always connect this specific camera by serial number
     pixel_format: "BayerRG8" # UA5MEAGV-50C native color format (BGR8/RGB8 not supported by camera)
-    exposure: 65000.0
+    exposure: 80000.0
     gain: 1.0
   # For RTSP IP Cameras
   rtsp:

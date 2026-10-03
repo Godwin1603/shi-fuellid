@@ -785,8 +785,9 @@ def has_part(roi_bgr, blue_thresh, metal_min_ratio, laplacian_min):
     return True
 
 def _correct_ocr_chars(text):
-    """Fix common OCR char substitutions in numeric context: O->0, I->1, S->5, B->8, Z->2, G->6."""
-    digit_fix = str.maketrans("OISBGZ", "015862")
+    """Fix common OCR char substitutions in numeric context: O->0, I->1, S->5, Z->2, G->6, D->0."""
+    # Removed B->8 because B is a valid model letter in the serial
+    digit_fix = str.maketrans("OISGZD", "015620")
     return text.translate(digit_fix)
 
 
@@ -913,14 +914,27 @@ def _try_reconstruct_serial(raw_clean):
             elif len(candidate) == 14:
                 print(f"[OCR RECONSTRUCT P2] Rejected '{candidate}': failed date/time validation")
 
-    # Pass 3: all-digit string (13-15 chars), insert A/B/C at position 9
+    # Pass 3: extract exactly 9 digits from start and 4 digits from end, insert A/B/C
     digits_only = re.sub(r"\D", "", s)
-    if 13 <= len(digits_only) <= 15:
+    if len(digits_only) >= 13:
+        d_start = digits_only[:9]
+        d_end = digits_only[-4:]
         for letter in ("A", "B", "C"):
-            candidate = digits_only[:9] + letter + digits_only[9:]
-            if len(candidate) >= 14 and _validate_serial(candidate[:14]):
-                return candidate[:14]
+            candidate = d_start + letter + d_end
+            if _validate_serial(candidate):
+                return candidate
 
+    # Pass 4: Handle swapped lines from 90-degree rotations
+    # e.g., if lines were read as 10:33 then 220926 022A -> clean text is 1033220926022A
+    if len(digits_only) >= 13:
+        # Check if the time (4 digits) is at the start, and date (9 digits) is at the end
+        d_time = digits_only[:4]
+        d_date = digits_only[-9:]
+        for letter in ("A", "B", "C"):
+            candidate = d_date + letter + d_time
+            if _validate_serial(candidate):
+                return candidate
+                
     return None
 
 
