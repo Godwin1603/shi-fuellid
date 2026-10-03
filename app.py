@@ -2585,9 +2585,8 @@ def yolo_worker_loop():
                                         x2, y2 = min(w_orig, int(xyxy_r[2] / scale)), min(h_orig, int(xyxy_r[3] / scale))
                                         print(f"[OCR] Recovered 'serial' box from raw YOLO (conf {float(best_low.conf[0].cpu().item()):.2f}): {[x1, y1, x2, y2]}")
                                     else:
-                                        # Blind crop: Serial is always in the bottom 40% of the serial_area
-                                        y1 = y1 + int((y2 - y1) * 0.60)
-                                        print(f"[OCR] Blind crop: using bottom 40% of serial_area: {[x1, y1, x2, y2]}")
+                                        # Fallback: pass the entire serial_area to OCR
+                                        print(f"[OCR] Fallback: using entire serial_area: {[x1, y1, x2, y2]}")
                             
                             # Extract the expected serial-number region from this back-side crop
                             # If it's the whole back, we still use the bounding box as the source region
