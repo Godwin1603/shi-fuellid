@@ -65,7 +65,7 @@ web:
 ui:
   # Width of the side flash bars (OK / NG) as a percentage of the live camera view.
   # Reduce this value if the bars overlap the camera feed. Range: 1–50 (%)
-  side_flash_width_percent: 30
+  side_flash_width_percent: 50
   # Hard maximum width cap for the side flash bars in pixels.
   side_flash_max_width_px: 120
 

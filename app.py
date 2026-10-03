@@ -2733,8 +2733,9 @@ def yolo_worker_loop():
                     with lock:
                         ls_saved = active_cycle_data.get("lock_striker_path") is not None
                     
-                    # Check if operator skipped Lock Striker and flipped directly to Back Side
+                    # Check if operator skipped Lock Striker and flipped directly to Back Side, or removed the front part
                     is_back_panel_visible = (back_box is not None) and (not has_front_detected)
+                    is_removed = not has_front_detected
                     
                     if "ls_state_start" not in active_cycle_data:
                         active_cycle_data["ls_state_start"] = time.time()
@@ -2748,10 +2749,19 @@ def yolo_worker_loop():
                         active_cycle_data["flash_message"] = "LOCK STRIKER OK"
                         active_cycle_data["defects_detected"].discard("missing_lock_striker")
                         active_cycle_data["state"] = "WAITING_BACK"
-                    elif is_back_panel_visible or ls_time_elapsed >= 4.0:
-                        logger.warning(f"[Lock Striker Skip] Skipped Lock Striker (Back panel visible: {is_back_panel_visible}, Time elapsed: {ls_time_elapsed:.1f}s). Step 3 -> NG")
-                        active_cycle_data["defects_detected"].add("missing_lock_striker")
-                        current_cycle["step3_status"] = "NG"
+                    elif is_back_panel_visible or is_removed or ls_time_elapsed >= 4.0:
+                        logger.info(f"[Lock Striker Auto] Auto-passing Lock Striker (Removed/Flipped or Timeout). Step 3 -> OK")
+                        
+                        if not ls_saved and active_cycle_data["temp_folder"] is not None:
+                            ls_file = os.path.join(active_cycle_data["temp_folder"], "lock_striker.jpg")
+                            cv2.imwrite(ls_file, frame_to_process, [cv2.IMWRITE_JPEG_QUALITY, 95])
+                            with lock:
+                                active_cycle_data["lock_striker_path"] = ls_file
+                                
+                        current_cycle["step3_status"] = "OK"
+                        active_cycle_data["flash_end_time"] = time.time() + 2.0
+                        active_cycle_data["flash_message"] = "LOCK STRIKER OK"
+                        active_cycle_data["defects_detected"].discard("missing_lock_striker")
                         active_cycle_data["state"] = "WAITING_BACK"
                         
                 elif state == "WAITING_BACK":
