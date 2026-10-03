@@ -1249,13 +1249,23 @@ def finalize_report_and_rename(c_data):
         # Path of the report within the temp folder matching the folder_name
         temp_report_path = os.path.join(temp_dir, f"{folder_name}.pdf")
 
+        # Extract date and time from serial number if valid
+        report_date = datetime.now().strftime("%Y-%m-%d")
+        report_time = datetime.now().strftime("%H:%M:%S")
+        if serial and len(serial) == 14 and serial != "serial_missing":
+            # format: DDMMYY(6) + NNN(3) + [ABC](1) + HHMM(4)
+            dd, mm, yy = serial[0:2], serial[2:4], serial[4:6]
+            hh, mn = serial[10:12], serial[12:14]
+            report_date = f"20{yy}-{mm}-{dd}"
+            report_time = f"{hh}:{mn}:00"
+
         # Create report PDF
         create_inspection_report(
             serial_number=serial,
             model_name="IP Cam",
             status=status,
-            date_str=datetime.now().strftime("%Y-%m-%d"),
-            time_str=datetime.now().strftime("%H:%M:%S"),
+            date_str=report_date,
+            time_str=report_time,
             traceability_id=f"TRC{folder_name}",
             front_image_path=front,
             back_image_path=back,
