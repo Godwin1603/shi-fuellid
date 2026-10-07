@@ -1,5 +1,21 @@
-import cv2
 import sys
+import os
+import subprocess
+
+# PaddlePaddle requires Python <= 3.12. If running under Python 3.13+, re-exec with Python 3.12.
+if sys.version_info >= (3, 13):
+    print(f"Detected Python {sys.version_info.major}.{sys.version_info.minor}. PaddleOCR requires Python 3.12.")
+    print("Re-launching script under Python 3.12 ('py -3.12')...")
+    try:
+        py312 = subprocess.check_output(["py", "-3.12", "-c", "import sys; print(sys.executable)"]).decode().strip()
+        ret = subprocess.call([py312] + sys.argv)
+        sys.exit(ret)
+    except Exception as err:
+        print(f"Error re-launching under Python 3.12: {err}", file=sys.stderr)
+        print("Please run using: py -3.12 test_ocr.py", file=sys.stderr)
+        sys.exit(1)
+
+import cv2
 from paddleocr import PaddleOCR
 
 def test_ocr():

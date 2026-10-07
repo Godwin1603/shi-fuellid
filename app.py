@@ -17,6 +17,7 @@ os.environ.setdefault("NUMEXPR_NUM_THREADS",  str(_CPU_CORES))
 import re
 import cv2
 import time
+from datetime import datetime, date
 import uuid
 import shutil
 import threading
@@ -475,6 +476,7 @@ active_cycle_data = {
     "processing_thread_active": False,
     "ocr_thread_active": False,
     "defects_detected": set(),
+    "defect_tracker": {},  # Tracks dynamic hit/miss counters and bounding boxes for dynamic defect freezing
     "max_holes_detected": 0,
     "max_ring_bush_detected": 0,
     "max_rod_detected": 0,
@@ -1401,6 +1403,7 @@ def reset_cycle_state():
             "processing_thread_active": False,
             "ocr_thread_active": False,
             "defects_detected": set(),
+            "defect_tracker": {},
             "max_holes_detected": 0,
             "max_ring_bush_detected": 0,
             "max_rod_detected": 0,
@@ -2511,6 +2514,43 @@ def yolo_worker_loop():
                         active_cycle_data["defect_frame_path"] = defect_file
                     logger.info(f"[Defect Frame] Saved annotated defect frame: {defect_file} (defects: {frame_defects})")
 
+            # --- Dynamic Defect Tracker & Freezing Engine ---
+            with lock:
+                tracker = active_cycle_data.get("defect_tracker", {})
+                detected_classes = set(frame_defects)
+                
+                # 1. Update hit counts for currently detected defect classes
+                for d in detected_classes:
+                    if d not in tracker:
+                        tracker[d] = {"hit_count": 1, "miss_count": 0, "status": "PENDING"}
+                    else:
+                        tracker[d]["hit_count"] += 1
+                        tracker[d]["miss_count"] = 0
+                    
+                    # Confirm defect if seen for >= 2 frames
+                    if tracker[d]["hit_count"] >= 2:
+                        tracker[d]["status"] = "CONFIRMED"
+                        active_cycle_data["defects_detected"].add(d)
+
+                # 2. Update miss counts for defects in tracker not present in current frame
+                to_remove = []
+                for d, info in tracker.items():
+                    if d not in detected_classes:
+                        info["miss_count"] += 1
+                        # If pending and missed for 2 frames, remove candidate
+                        if info["status"] == "PENDING" and info["miss_count"] >= 2:
+                            to_remove.append(d)
+                        # If confirmed but absent for 5 consecutive frames, dynamically remove/un-freeze
+                        elif info["status"] == "CONFIRMED" and info["miss_count"] >= 5:
+                            to_remove.append(d)
+                            active_cycle_data["defects_detected"].discard(d)
+                            logger.info(f"[Dynamic Freezing] Dynamically removed transient defect '{d}' after 5 absent frames.")
+                
+                for d in to_remove:
+                    del tracker[d]
+                
+                active_cycle_data["defect_tracker"] = tracker
+
             # --- Lock Striker Frame Save ---
             if frame_lock_striker > 0 and active_cycle_data["temp_folder"] is not None:
                 with lock:
@@ -2747,14 +2787,8 @@ def yolo_worker_loop():
                     with lock:
                         ls_saved = active_cycle_data.get("lock_striker_path") is not None
                     
-                    # Check if operator skipped Lock Striker and flipped directly to Back Side, or removed the front part
+                    # Check if operator skipped Lock Striker and flipped directly to Back Side
                     is_back_panel_visible = (back_box is not None) and (not has_front_detected)
-                    is_removed = not has_front_detected
-                    
-                    if "ls_state_start" not in active_cycle_data:
-                        active_cycle_data["ls_state_start"] = time.time()
-                    
-                    ls_time_elapsed = time.time() - active_cycle_data["ls_state_start"]
                     
                     if ls_detected or ls_saved:
                         logger.info("[Lock Striker] Lock Striker detected! Step 3 -> OK")
@@ -2763,19 +2797,10 @@ def yolo_worker_loop():
                         active_cycle_data["flash_message"] = "LOCK STRIKER OK"
                         active_cycle_data["defects_detected"].discard("missing_lock_striker")
                         active_cycle_data["state"] = "WAITING_BACK"
-                    elif is_back_panel_visible or is_removed or ls_time_elapsed >= 4.0:
-                        logger.info(f"[Lock Striker Auto] Auto-passing Lock Striker (Removed/Flipped or Timeout). Step 3 -> OK")
-                        
-                        if not ls_saved and active_cycle_data["temp_folder"] is not None:
-                            ls_file = os.path.join(active_cycle_data["temp_folder"], "lock_striker.jpg")
-                            cv2.imwrite(ls_file, frame_to_process, [cv2.IMWRITE_JPEG_QUALITY, 95])
-                            with lock:
-                                active_cycle_data["lock_striker_path"] = ls_file
-                                
-                        current_cycle["step3_status"] = "OK"
-                        active_cycle_data["flash_end_time"] = time.time() + 2.0
-                        active_cycle_data["flash_message"] = "LOCK STRIKER OK"
-                        active_cycle_data["defects_detected"].discard("missing_lock_striker")
+                    elif is_back_panel_visible:
+                        logger.info("[Lock Striker] Flipped directly to Back Panel without Lock Striker detected.")
+                        if not ls_saved:
+                            active_cycle_data["defects_detected"].add("missing_lock_striker")
                         active_cycle_data["state"] = "WAITING_BACK"
                         
                 elif state == "WAITING_BACK":
@@ -3055,27 +3080,80 @@ def yolo_worker_loop():
 # -------------------------------
 # Disk Space Management (Auto Cleanup)
 # -------------------------------
+# -------------------------------
+# Disk Space Management (30-Day Auto Cleanup)
+# -------------------------------
+def cleanup_old_folders(retention_days=RETENTION_DAYS, data_dir="lid_data"):
+    """
+    Deletes subfolders inside data_dir older than retention_days (default 30 days).
+    Calculates folder age primarily by parsing date from folder name YYYY-MM-DD.
+    Falls back to folder mtime/ctime if folder name does not match YYYY-MM-DD.
+    """
+    deleted = []
+    retained = []
+    errors = []
+    
+    if not os.path.exists(data_dir):
+        return {"deleted": deleted, "retained": retained, "errors": [f"Directory '{data_dir}' does not exist"]}
+        
+    today = date.today()
+    now_ts = time.time()
+    
+    try:
+        for folder in os.listdir(data_dir):
+            folder_path = os.path.join(data_dir, folder)
+            if not os.path.isdir(folder_path):
+                continue
+            
+            age_days = None
+            # 1. Primary Method: Parse date directly from folder name (YYYY-MM-DD)
+            if re.match(r"^\d{4}-\d{2}-\d{2}$", folder):
+                try:
+                    folder_date = datetime.strptime(folder, "%Y-%m-%d").date()
+                    age_days = (today - folder_date).days
+                except ValueError:
+                    pass
+            
+            # 2. Fallback Method: Check directory modification / creation timestamp
+            if age_days is None:
+                try:
+                    mtime = os.path.getmtime(folder_path)
+                    ctime = os.path.getctime(folder_path)
+                    folder_ts = min(mtime, ctime)
+                    age_days = (now_ts - folder_ts) / (24 * 3600)
+                except Exception as ex:
+                    logger.warning(f"[Cleanup] Could not determine timestamp for {folder}: {ex}")
+                    continue
+            
+            if age_days > retention_days:
+                try:
+                    shutil.rmtree(folder_path, ignore_errors=True)
+                    deleted.append({"folder": folder, "age_days": round(age_days, 1)})
+                    logger.info(f"[Cleanup] Deleted old data folder: '{folder}' ({round(age_days, 1)} days old, retention limit: {retention_days} days)")
+                except Exception as ex:
+                    errors.append(f"Failed to delete {folder}: {ex}")
+                    logger.error(f"[Cleanup Error] Failed to delete '{folder}': {ex}")
+            else:
+                retained.append({"folder": folder, "age_days": round(age_days, 1)})
+    except Exception as e:
+        logger.error(f"[Cleanup Error] Exception while scanning directory '{data_dir}': {e}")
+        errors.append(str(e))
+        
+    return {"deleted": deleted, "retained": retained, "errors": errors}
+
 def auto_cleanup_loop():
-    """Runs continuously in the background, deleting old files once per day."""
+    """Runs continuously in the background, checking for old folders hourly."""
+    logger.info(f"[Cleanup Thread] Background auto-cleanup thread active (Retention limit: {RETENTION_DAYS} days)")
     while True:
         try:
-            now = time.time()
-            data_dir = "lid_data"
-            if os.path.exists(data_dir):
-                for folder in os.listdir(data_dir):
-                    folder_path = os.path.join(data_dir, folder)
-                    # We look for date-formatted folders like "2026-08-22"
-                    if os.path.isdir(folder_path) and re.match(r"\d{4}-\d{2}-\d{2}", folder):
-                        folder_mtime = os.path.getmtime(folder_path)
-                        age_days = (now - folder_mtime) / (24 * 3600)
-                        if age_days > RETENTION_DAYS:
-                            shutil.rmtree(folder_path, ignore_errors=True)
-                            print(f"[Cleanup] Deleted old data folder: {folder}")
+            res = cleanup_old_folders(retention_days=RETENTION_DAYS, data_dir="lid_data")
+            if res["deleted"]:
+                logger.info(f"[Cleanup Thread] Auto-cleanup purged {len(res['deleted'])} folders older than {RETENTION_DAYS} days.")
         except Exception as e:
-            print(f"[Cleanup Error] {e}")
+            logger.error(f"[Cleanup Thread Exception] {e}")
         
-        # Sleep for 24 hours
-        time.sleep(24 * 3600)
+        # Sleep for 1 hour
+        time.sleep(3600)
 
 # -------------------------------
 # Core Frame Generator Loop (Clients stream here)
@@ -3348,6 +3426,63 @@ def ui_config():
         "side_flash_width_percent": ui_cfg.get("side_flash_width_percent", 12),
         "side_flash_max_width_px":  ui_cfg.get("side_flash_max_width_px", 120),
     })
+
+@app.route('/trigger_cleanup', methods=['POST', 'GET'])
+def trigger_cleanup():
+    """Manual API endpoint to trigger 30-day folder cleanup on demand."""
+    try:
+        req_days = RETENTION_DAYS
+        if request.is_json:
+            data = request.get_json(silent=True) or {}
+            req_days = data.get("retention_days", RETENTION_DAYS)
+        res = cleanup_old_folders(retention_days=req_days, data_dir="lid_data")
+        return jsonify({
+            "status": "success",
+            "message": f"Folder cleanup completed (retention={req_days} days).",
+            "deleted_count": len(res["deleted"]),
+            "deleted_folders": res["deleted"],
+            "retained_count": len(res["retained"]),
+            "errors": res["errors"]
+        })
+    except Exception as e:
+        return jsonify({"status": "error", "message": str(e)}), 500
+
+@app.route('/cleanup_status', methods=['GET'])
+def cleanup_status():
+    """API endpoint to report current storage folders and retention age status."""
+    try:
+        data_dir = "lid_data"
+        folders_info = []
+        today = date.today()
+        now_ts = time.time()
+        if os.path.exists(data_dir):
+            for folder in os.listdir(data_dir):
+                folder_path = os.path.join(data_dir, folder)
+                if not os.path.isdir(folder_path):
+                    continue
+                age_days = None
+                if re.match(r"^\d{4}-\d{2}-\d{2}$", folder):
+                    try:
+                        folder_date = datetime.strptime(folder, "%Y-%m-%d").date()
+                        age_days = (today - folder_date).days
+                    except ValueError:
+                        pass
+                if age_days is None:
+                    mtime = os.path.getmtime(folder_path)
+                    age_days = (now_ts - mtime) / (24 * 3600)
+                folders_info.append({
+                    "folder": folder,
+                    "age_days": round(age_days, 1),
+                    "marked_for_deletion": age_days > RETENTION_DAYS
+                })
+        return jsonify({
+            "retention_days": RETENTION_DAYS,
+            "total_folders": len(folders_info),
+            "folders": folders_info
+        })
+    except Exception as e:
+        return jsonify({"status": "error", "message": str(e)}), 500
+
 
 
 if __name__ == '__main__':

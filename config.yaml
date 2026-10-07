@@ -3,7 +3,7 @@
 # --- AI & Vision Settings ---
 ai:
   # Path to the trained YOLO model
-  model_path: "SHI_FUEL_DOOR_V2.pt"
+  model_path: "SHI_FUEL_DOOR_V1.2.pt"
   # Confidence threshold for detecting the OCR target regions (serial, back, etc.)
   ocr_confidence_threshold: 0.10
   # Fallback timeout (in seconds) before attempting to read the back panel if serial is missing

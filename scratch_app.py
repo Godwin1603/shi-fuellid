@@ -8,6 +8,7 @@ os.environ["NUMEXPR_NUM_THREADS"] = "1"
 
 import re
 import cv2
+import numpy as np
 import time
 import uuid
 import shutil
@@ -15,7 +16,52 @@ import threading
 import torch
 from datetime import datetime
 from flask import Flask, render_template, Response, request, jsonify
-from paddleocr import PaddleOCR
+import json as _json
+import urllib.request as _urllib_req
+import base64 as _base64
+
+try:
+    from paddleocr import PaddleOCR
+except Exception:
+    PaddleOCR = None
+
+class _PaddleOCRClient:
+    """HTTP client that calls the paddleocr_server.py microservice (py -3.12)."""
+    PADDLE_URL = "http://127.0.0.1:5001/ocr"
+
+    def __init__(self, *args, **kwargs):
+        pass
+
+    def predict_crop(self, img_bgr):
+        try:
+            _, buf = cv2.imencode('.jpg', img_bgr, [cv2.IMWRITE_JPEG_QUALITY, 95])
+            b64 = _base64.b64encode(buf).decode()
+            payload = _json.dumps({"image": b64}).encode()
+            req = _urllib_req.Request(self.PADDLE_URL, data=payload, headers={'Content-Type': 'application/json'})
+            resp = _urllib_req.urlopen(req, timeout=8)
+            raw_data = resp.read()
+            data = _json.loads(raw_data)
+            return data.get("results", [])
+        except Exception as e:
+            try:
+                import subprocess
+                print("Attempting to auto-start paddleocr_server.py in background...")
+                subprocess.Popen(["py", "-3.12", "paddleocr_server.py", "--parent-pid", str(os.getpid())], cwd=os.getcwd(), creationflags=0x08000000)
+            except Exception as launch_err:
+                print(f"Failed to auto-launch paddleocr_server.py: {launch_err}")
+            return []
+
+    def ocr(self, img, cls=False, det=True, rec=True):
+        results = self.predict_crop(img)
+        if not results:
+            return None
+        lines = []
+        for r in results:
+            text = r.get("rec_text", "")
+            score = r.get("rec_score", 0.0)
+            lines.append([[[0, 0], [0, 0], [0, 0], [0, 0]], (text, score)])
+        return [lines] if lines else None
+
 from ultralytics import YOLO
 
 # Limit PyTorch CPU threads
@@ -79,6 +125,7 @@ active_cycle_data = {
     "processing_thread_active": False,
     "ocr_thread_active": False,
     "defects_detected": set(),
+    "defect_tracker": {},
     "max_holes_detected": 0,
     "serial_votes": [],  # List of dicts: {"text": "123456", "confidence": 92.5}
     "back_frames_count": 0,
@@ -149,14 +196,20 @@ def init_models():
             YOLO_MODEL = YOLO("yolov8n.pt")  # Fallback
     if OCR_ENGINE is None:
         print("Loading PaddleOCR Engine...")
-        # PaddleOCR is CPU-only (paddlepaddle CPU build avoids CUDA conflict with torch)
-        print("GPU Acceleration for OCR: Disabled (CPU build — YOLO still uses GPU)")
-        OCR_ENGINE = PaddleOCR(
-            use_angle_cls=False,  # Skip angle classifier for speed (we rotate manually)
-            lang="en",
-            use_gpu=False,        # paddlepaddle CPU build installed
-            show_log=False
-        )
+        if PaddleOCR is not None:
+            try:
+                OCR_ENGINE = PaddleOCR(
+                    use_angle_cls=False,  # Skip angle classifier for speed (we rotate manually)
+                    lang="en",
+                    use_gpu=False,        # paddlepaddle CPU build installed
+                    show_log=False
+                )
+            except Exception as e:
+                print(f"Direct PaddleOCR initialization failed ({e}), falling back to microservice client...")
+                OCR_ENGINE = _PaddleOCRClient()
+        else:
+            print("PaddleOCR module not installed directly. Using PaddleOCR microservice client...")
+            OCR_ENGINE = _PaddleOCRClient()
     print("Models Initialized.")
 
 # -------------------------------

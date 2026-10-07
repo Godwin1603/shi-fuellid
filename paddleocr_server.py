@@ -6,6 +6,23 @@ Usage: py -3.12 paddleocr_server.py
 Endpoint: POST http://127.0.0.1:5001/ocr  (body: multipart image OR raw bytes)
 """
 
+import sys
+import os
+import subprocess
+
+# PaddlePaddle requires Python <= 3.12. If running under Python 3.13+, re-exec with Python 3.12.
+if sys.version_info >= (3, 13):
+    print(f"[OCR Server] Detected Python {sys.version_info.major}.{sys.version_info.minor}. PaddleOCR requires Python 3.12.")
+    print("[OCR Server] Re-launching under Python 3.12 ('py -3.12')...")
+    try:
+        py312 = subprocess.check_output(["py", "-3.12", "-c", "import sys; print(sys.executable)"]).decode().strip()
+        ret = subprocess.call([py312] + sys.argv)
+        sys.exit(ret)
+    except Exception as err:
+        print(f"[OCR Server Error] Could not re-launch under Python 3.12: {err}", file=sys.stderr)
+        print("Please run using: py -3.12 paddleocr_server.py", file=sys.stderr)
+        sys.exit(1)
+
 import base64
 import json
 import logging
@@ -61,16 +78,20 @@ _ocr_lock = threading.Lock()
 
 ocr = None
 try:
-    # Explicitly disable GPU to prevent crashes/hangs on legacy drivers
-    ocr = PaddleOCR(lang='en', use_gpu=False, show_log=False)
-    logging.info("PaddleOCR successfully initialized (CPU mode).")
+    # PaddleOCR 3.x initialization
+    ocr = PaddleOCR(lang='en')
+    logging.info("PaddleOCR successfully initialized.")
 except Exception as e:
-    logging.error(f"PaddleOCR initialization failed: {e}")
+    logging.warning(f"Standard PaddleOCR init failed ({e}), trying fallback...")
     try:
-        ocr = PaddleOCR(use_gpu=False, show_log=False)
-        logging.info("PaddleOCR initialized with default config (CPU mode).")
+        ocr = PaddleOCR(lang='en', use_gpu=False)
+        logging.info("PaddleOCR initialized with use_gpu=False (legacy mode).")
     except Exception as ex:
-        logging.error(f"Fallback PaddleOCR initialization failed: {ex}")
+        try:
+            ocr = PaddleOCR()
+            logging.info("PaddleOCR initialized with default config.")
+        except Exception as ex2:
+            logging.error(f"All PaddleOCR initialization attempts failed: {ex2}")
 
 
 def run_ocr(image):
