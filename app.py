@@ -1045,7 +1045,8 @@ def process_ocr_async(crop_img, temp_folder, crop_num, c_data):
             with lock:
                 c_data["serial_votes"].append({
                     "text": detected_serial,
-                    "confidence": confidence
+                    "confidence": confidence,
+                    "crop_path": crop_path if temp_folder is not None else None
                 })
                 
                 logger.info(f"\n[OCR VOTE]")
@@ -1055,11 +1056,8 @@ def process_ocr_async(crop_img, temp_folder, crop_num, c_data):
 
                 is_active = (c_data is active_cycle_data)
 
-                # Show result in UI immediately if active
-                if is_active:
-                    ds_fmt = f"{detected_serial[:6]} {detected_serial[6:10]} {detected_serial[10:]}"
-                    current_cycle["serial"] = ds_fmt
-                    current_cycle["confidence"] = f"{confidence:.1f}%"
+                # We no longer update current_cycle["serial"] here so false OCR votes 
+                # do not flash in the main UI before finalization.
 
                 votes = c_data["serial_votes"]
                 if len(votes) >= 1 and is_active:
@@ -1071,17 +1069,13 @@ def process_ocr_async(crop_img, temp_folder, crop_num, c_data):
 
                 logger.info(f"[OCR Thread] Crop {crop_num}: {detected_serial} ({confidence:.1f}%)")
 
-                from collections import Counter
-                texts = [v["text"] for v in votes]
-                counter = Counter(texts)
-                most_common_text, count = counter.most_common(1)[0]
-                winning_votes = [v for v in votes if v["text"] == most_common_text]
-                max_winning_conf = max(v["confidence"] for v in winning_votes)
+                # Finalize if we have collected at least 2 votes (pick the best one)
+                if len(votes) >= 2:
+                    best_vote_entry = max(votes, key=lambda v: v["confidence"])
+                    final_serial = best_vote_entry["text"]
+                    final_conf = best_vote_entry["confidence"]
 
-                # Finalize if 2 matching votes OR any single read with >= 70% confidence
-                if count >= 2 or max_winning_conf >= 20.0:
-                    final_serial = most_common_text
-                    final_conf = max_winning_conf  # use best confidence
+                    c_data["final_crop_path"] = best_vote_entry.get("crop_path")
 
                     c_data["serial_number"] = final_serial
                     c_data["ocr_confidence"] = final_conf
@@ -1099,11 +1093,10 @@ def process_ocr_async(crop_img, temp_folder, crop_num, c_data):
                         if current_cycle["status"].startswith("Finished Cycle"):
                             current_cycle["status"] = "Finished Cycle for " + fs_fmt
 
-                        current_cycle["vote_1"] = f"{final_serial} ({winning_votes[0]['confidence']:.1f}%)"
-                        if len(winning_votes) >= 2:
-                            current_cycle["vote_2"] = f"{winning_votes[1]['text']} ({winning_votes[1]['confidence']:.1f}%)"
-                        if len(winning_votes) >= 3:
-                            current_cycle["vote_3"] = f"{winning_votes[2]['text']} ({winning_votes[2]['confidence']:.1f}%)"
+                        # Show the two votes that were collected
+                        current_cycle["vote_1"] = f"{votes[0]['text']} ({votes[0]['confidence']:.1f}%)"
+                        current_cycle["vote_2"] = f"{votes[1]['text']} ({votes[1]['confidence']:.1f}%)"
+                        current_cycle["vote_3"] = "- - - - - -"
 
                     logger.info(f"[OCR Thread] Finalized: {final_serial} ({final_conf:.1f}%)")
                     check_and_finalize_cycle(c_data)
@@ -1138,6 +1131,7 @@ def finalize_report_and_rename(c_data):
                     best_vote = max(c_data["serial_votes"], key=lambda v: v["confidence"])
                     c_data["serial_number"] = best_vote["text"]
                     c_data["ocr_confidence"] = best_vote["confidence"]
+                    c_data["final_crop_path"] = best_vote.get("crop_path")
                     if c_data is active_cycle_data:
                         current_cycle["serial"] = best_vote["text"]
                         current_cycle["confidence"] = f"{best_vote['confidence']:.1f}%"
@@ -1152,6 +1146,7 @@ def finalize_report_and_rename(c_data):
                     best_vote = max(c_data["serial_votes"], key=lambda v: v["confidence"])
                     c_data["serial_number"] = best_vote["text"]
                     c_data["ocr_confidence"] = best_vote["confidence"]
+                    c_data["final_crop_path"] = best_vote.get("crop_path")
                     if c_data is active_cycle_data:
                         current_cycle["serial"] = best_vote["text"]
                         current_cycle["confidence"] = f"{best_vote['confidence']:.1f}%"
@@ -1186,6 +1181,7 @@ def finalize_report_and_rename(c_data):
                         best_vote = max(active_cycle_data["serial_votes"], key=lambda v: v["confidence"])
                         active_cycle_data["serial_number"] = best_vote["text"]
                         active_cycle_data["ocr_confidence"] = best_vote["confidence"]
+                        active_cycle_data["final_crop_path"] = best_vote.get("crop_path")
                         current_cycle["serial"] = best_vote["text"]
                         current_cycle["confidence"] = f"{best_vote['confidence']:.1f}%"
                         break
@@ -1232,14 +1228,13 @@ def finalize_report_and_rename(c_data):
                 defects.append("serial_missing")
             current_cycle["defects"] = defects
 
-            # Update operator instruction to show NG (red big) if defective, or OK (green big) if no defects
             if defects:
-                # current_cycle["instruction"] = "NG"  # Removed per user request to keep operator instructions
+                current_cycle["instruction"] = "NG"  
                 current_cycle["instruction_color"] = "red"
                 current_cycle["result"] = "NG"
                 current_cycle["status"] = "NG - DEFECT DETECTED"
             else:
-                # current_cycle["instruction"] = "OK"  # Removed per user request
+                current_cycle["instruction"] = "OK"  
                 current_cycle["instruction_color"] = "green"
                 current_cycle["result"] = "OK"
         status = "FAIL" if defects else "PASS"
@@ -1344,7 +1339,23 @@ def finalize_report_and_rename(c_data):
             if os.path.exists(old_defect_path):
                 os.rename(old_defect_path, new_defect_path)
                 print(f"[Finalize Thread] Renamed defect frame to: {folder_name}_defect.jpg")
-            
+                
+            # Extract and keep only the single winning crop
+            final_crop = active_cycle_data.get("final_crop_path")
+            if final_crop:
+                filename = os.path.basename(final_crop)
+                old_crop_path = os.path.join(final_dir, "crops", filename)
+                new_crop_path = os.path.join(final_dir, f"{folder_name}_serial_crop.jpg")
+                if os.path.exists(old_crop_path):
+                    shutil.copy2(old_crop_path, new_crop_path)
+                    print(f"[Finalize Thread] Saved winning crop to: {folder_name}_serial_crop.jpg")
+                    
+            # Delete the crops subfolder containing all the unused crops
+            crops_dir_final = os.path.join(final_dir, "crops")
+            if os.path.exists(crops_dir_final):
+                shutil.rmtree(crops_dir_final)
+                
+
             print(f"[Finalize Thread] Renamed images to match folder name: {folder_name}")
         except Exception as rename_err:
             print(f"[Finalize Thread] Error renaming images: {rename_err}")
@@ -1359,12 +1370,12 @@ def finalize_report_and_rename(c_data):
                 cycle_count += 1
 
             if defects:
-                # current_cycle["instruction"] = "NG"  # Removed per user request to keep operator instructions
+                current_cycle["instruction"] = "NG"  
                 current_cycle["instruction_color"] = "red"
                 current_cycle["result"] = "NG"
                 current_cycle["status"] = f"Finished Cycle: NG ({serial})"
             else:
-                # current_cycle["instruction"] = "OK"  # Removed per user request
+                current_cycle["instruction"] = "OK"  
                 current_cycle["instruction_color"] = "green"
                 current_cycle["result"] = "OK"
                 current_cycle["status"] = f"Finished Cycle: OK ({serial})"
@@ -2157,10 +2168,10 @@ def video_processing_loop():
             overlay = None
             for det in dets:
                 class_name = det["class_name"]
-                if class_name in SURFACE_DEFECT_CLASSES:
+                if class_name in SURFACE_DEFECT_CLASSES or class_name in ["line_mark", "dent", "buldge", "bulge", "damage", "defect"]:
                     mask_pts = det.get("mask")
                     if mask_pts is not None:
-                        color = (0, 0, 255)  # ALL damage and defect classes are pure RED
+                        color = (0, 255, 255) if class_name == "line_mark" else (0, 0, 255)
                         pts = np.array(mask_pts, np.int32)
                         pts[:, 0] = (pts[:, 0] * scale_ann).astype(int)
                         pts[:, 1] = (pts[:, 1] * scale_ann).astype(int)
@@ -2191,10 +2202,12 @@ def video_processing_loop():
                     color = (255, 0, 255)
                 elif class_name in ["serial", "serial_area"]:
                     color = (255, 255, 0)
-                elif class_name in SURFACE_DEFECT_CLASSES:
-                    color = (0, 0, 255)  # ALL damage and defect classes are pure RED
+                elif class_name in SURFACE_DEFECT_CLASSES or class_name in ["dent", "buldge", "bulge", "damage", "defect"]:
+                    color = (0, 0, 255)
+                elif class_name == "line_mark":
+                    color = (0, 255, 255)
 
-                if class_name in SURFACE_DEFECT_CLASSES and det.get("mask") is not None:
+                if (class_name in SURFACE_DEFECT_CLASSES or class_name in ["line_mark", "dent", "buldge", "bulge", "damage", "defect"]) and det.get("mask") is not None:
                     pts = np.array(det["mask"], np.int32)
                     pts[:, 0] = (pts[:, 0] * scale_ann).astype(int)
                     pts[:, 1] = (pts[:, 1] * scale_ann).astype(int)
@@ -2422,7 +2435,7 @@ def yolo_worker_loop():
                     metal_t = presence_cfg.get("metal_min_ratio", 0.15)
                     lap_t = presence_cfg.get("laplacian_variance_min", 150.0)
                     
-                    if class_name not in SURFACE_DEFECT_CLASSES:
+                    if class_name not in SURFACE_DEFECT_CLASSES and class_name not in ["dent", "buldge", "bulge", "line_mark", "linemark", "line-mark", "damage", "hole_spec_error", "defect"]:
                         roi = frame_to_process[y1:y2, x1:x2]
                         if not has_part(roi, blue_t, metal_t, lap_t):
                             logger.info(f"Filtered out empty tray misclassified as '{class_name}' (conf: {conf:.2f})")
@@ -2451,9 +2464,11 @@ def yolo_worker_loop():
                     if class_name in ["front", "circle_front"]: color = (0, 165, 255)
                     elif class_name in ["back", "circle_back", "cricle_back"]: color = (255, 0, 255)
                     elif class_name in ["serial", "serial_area"]: color = (255, 255, 0)
-                    elif class_name in SURFACE_DEFECT_CLASSES: color = (0, 0, 255)  # ALL damage and defect classes are pure RED
+                    elif class_name in SURFACE_DEFECT_CLASSES or class_name in ["dent", "buldge", "bulge", "damage", "defect"]: color = (0, 0, 255)
+                    elif class_name == "hole_spec_error": color = (0, 128, 255)  # Orange for hole spec errors
+                    elif class_name == "line_mark": color = (0, 255, 255)
                     
-                    if class_name in SURFACE_DEFECT_CLASSES:
+                    if class_name in SURFACE_DEFECT_CLASSES or class_name in ["line_mark", "dent", "buldge", "bulge", "damage", "defect"]:
                         if mask_polygon is not None:
                             pts = np.array(mask_polygon, np.int32).reshape((-1, 1, 2))
                             overlay = annotated_frame.copy()
@@ -2480,7 +2495,7 @@ def yolo_worker_loop():
                         elif class_name == "holes":
                             has_holes_detected = True
                     
-                    if class_name in SURFACE_DEFECT_CLASSES:
+                    if class_name in SURFACE_DEFECT_CLASSES or class_name in ["dent", "buldge", "bulge", "line_mark", "linemark", "line-mark", "damage", "hole_spec_error", "defect"]:
                         frame_defects.append(class_name)
                         active_cycle_data["defects_detected"].add(class_name)
                         

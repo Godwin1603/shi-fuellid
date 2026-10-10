@@ -24,14 +24,14 @@ ai:
     ring_bush: 0.40
     striker: 0.60
     striker_bend: 0.40       # NEW in V1.2: Striker bend defect
-    buldge: 0.40              # Surface bulge defect
-    dent: 0.40                # Surface dent defect
+    buldge: 0.30              # Surface bulge defect
+    dent: 0.30                # Surface dent defect
     defect: 0.40              # NEW in V1.2: General defect
     frame_damage: 0.40        # NEW in V1.2: Frame damage defect
   # Minimum bounding box area (in pixels) for a defect to be considered valid to prevent false positives quickly
   min_defect_area: 200
   # Default YOLO confidence threshold if a class is not specified above
-  default_yolo_confidence: 0.25
+  default_yolo_confidence: 0.10
   
 
   # Post-processing thresholds to filter out empty blue foam trays

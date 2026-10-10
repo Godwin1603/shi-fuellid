@@ -78,9 +78,9 @@ _ocr_lock = threading.Lock()
 
 ocr = None
 try:
-    # PaddleOCR 3.x initialization
-    ocr = PaddleOCR(lang='en')
-    logging.info("PaddleOCR successfully initialized.")
+    # PaddleOCR initialization - Force CPU because inference crashes with missing cudnn DLLs
+    ocr = PaddleOCR(lang='en', use_gpu=False, enable_mkldnn=False)
+    logging.info("PaddleOCR successfully initialized on CPU.")
 except Exception as e:
     logging.warning(f"Standard PaddleOCR init failed ({e}), trying fallback...")
     try:
@@ -98,7 +98,22 @@ def run_ocr(image):
     """Run PaddleOCR with fast recognition fallback for cropped serial regions."""
     def parse_res(res_list):
         parsed = []
-        if not res_list or not isinstance(res_list, list):
+        if not res_list:
+            return parsed
+            
+        # Handle case where res_list is just a single tuple: ('123456', 0.99)
+        if isinstance(res_list, tuple) and len(res_list) == 2 and isinstance(res_list[0], str):
+            parsed.append({
+                "rec_text": res_list[0],
+                "rec_score": float(res_list[1])
+            })
+            return parsed
+            
+        # If it's a tuple of lists, convert to list
+        if isinstance(res_list, tuple):
+            res_list = list(res_list)
+
+        if not isinstance(res_list, list):
             return parsed
         for res in res_list:
             if not res:
@@ -108,6 +123,11 @@ def run_ocr(image):
                 scores = res.get('rec_scores', [])
                 for t, s in zip(texts, scores):
                     parsed.append({"rec_text": t, "rec_score": float(s)})
+            elif isinstance(res, tuple) and len(res) == 2:
+                parsed.append({
+                    "rec_text": res[0],
+                    "rec_score": float(res[1])
+                })
             elif isinstance(res, list):
                 for line in res:
                     if isinstance(line, list) and len(line) == 2 and isinstance(line[1], tuple):
@@ -128,15 +148,19 @@ def run_ocr(image):
         try:
             raw_result = ocr.ocr(image, det=True, rec=True)
             results = parse_res(raw_result)
-        except Exception:
+        except Exception as e:
+            import traceback
+            traceback.print_exc()
             results = []
 
-        # 2. If detection returned no text (common on tight bounding-box crops), run direct recognition (det=False)
+        # 2. If detection returned no text, run direct recognition (det=False)
         if not results:
             try:
                 rec_result = ocr.ocr(image, det=False, rec=True)
                 results = parse_res(rec_result)
-            except Exception:
+            except Exception as e:
+                import traceback
+                traceback.print_exc()
                 results = []
 
     return results

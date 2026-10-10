@@ -20,7 +20,7 @@ from paddleocr import PaddleOCR
 
 def test_ocr():
     print("Loading OCR...")
-    ocr = PaddleOCR(use_textline_orientation=False, lang='en', device='cpu', enable_mkldnn=False)
+    ocr = PaddleOCR(use_textline_orientation=False, lang='en', use_gpu=False, enable_mkldnn=False)
     
     # We will just pass a dummy image
     import numpy as np
@@ -29,7 +29,7 @@ def test_ocr():
     cv2.putText(img, "10:35", (10, 90), cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 0, 0), 2)
     
     print("Running inference...")
-    result = ocr.ocr(img)
+    result = ocr.ocr(img, det=False, rec=True)
     print("Type of result:", type(result))
     
     # Convert to list if it's a generator
