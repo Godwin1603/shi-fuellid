@@ -423,6 +423,13 @@ YOLO_CONF_THRESHOLD = APP_CONFIG.get("ai", {}).get("default_yolo_confidence", 0.
 CLASS_CONF_THRESHOLDS = APP_CONFIG.get("ai", {}).get("class_confidences", {})
   # Minimum YOLO confidence (0.0 - 1.0). Lower = more detections, Higher = stricter.
 
+# Defect class names used for surface defect tracking, overlays, and reports
+SURFACE_DEFECT_CLASSES = [
+    "dent", "buldge", "bulge", "line_mark", "linemark", "line-mark",
+    "damage", "frame_damage", "hole_spec_error", "back_hook_bend",
+    "lock_striker_bend", "striker_bend", "defect"
+]
+
 # Global lock for thread safety (using RLock to prevent self-deadlocks on nested acquisitions)
 lock = threading.RLock()
 
@@ -1235,9 +1242,25 @@ def finalize_report_and_rename(c_data):
                 # current_cycle["instruction"] = "OK"  # Removed per user request
                 current_cycle["instruction_color"] = "green"
                 current_cycle["result"] = "OK"
-                current_cycle["status"] = "OK - INSPECTION PASSED"
-
         status = "FAIL" if defects else "PASS"
+        
+        # Guarantee annotated defect image is saved for the PDF report when inspection fails
+        if status == "FAIL" and (not defect_frame or not os.path.exists(defect_frame)) and temp_dir:
+            fallback_defect_path = os.path.join(temp_dir, "defect_frame.jpg")
+            if latest_annotated_frame is not None:
+                try:
+                    if isinstance(latest_annotated_frame, bytes):
+                        with open(fallback_defect_path, "wb") as f_out:
+                            f_out.write(latest_annotated_frame)
+                    else:
+                        cv2.imwrite(fallback_defect_path, latest_annotated_frame, [cv2.IMWRITE_JPEG_QUALITY, 95])
+                    defect_frame = fallback_defect_path
+                    active_cycle_data["defect_frame_path"] = defect_frame
+                    logger.info(f"[Finalize Thread] Saved fallback annotated defect frame for report: {defect_frame}")
+                except Exception as _e:
+                    logger.warning(f"[Finalize Thread] Failed to save fallback defect frame: {_e}")
+            if not defect_frame or not os.path.exists(defect_frame):
+                defect_frame = front or back
         
         # Check folder structure and resolve if serial folder already exists
         today_str = datetime.now().strftime("%Y-%m-%d")
@@ -2134,10 +2157,10 @@ def video_processing_loop():
             overlay = None
             for det in dets:
                 class_name = det["class_name"]
-                if class_name in ["line_mark", "dent", "buldge", "bulge", "damage"]:
+                if class_name in SURFACE_DEFECT_CLASSES:
                     mask_pts = det.get("mask")
                     if mask_pts is not None:
-                        color = (0, 0, 255) if class_name in ["dent", "buldge", "bulge", "damage"] else (0, 255, 255)
+                        color = (0, 0, 255)  # ALL damage and defect classes are pure RED
                         pts = np.array(mask_pts, np.int32)
                         pts[:, 0] = (pts[:, 0] * scale_ann).astype(int)
                         pts[:, 1] = (pts[:, 1] * scale_ann).astype(int)
@@ -2168,12 +2191,10 @@ def video_processing_loop():
                     color = (255, 0, 255)
                 elif class_name in ["serial", "serial_area"]:
                     color = (255, 255, 0)
-                elif class_name in ["dent", "buldge", "bulge", "damage"]:
-                    color = (0, 0, 255)
-                elif class_name == "line_mark":
-                    color = (0, 255, 255)
+                elif class_name in SURFACE_DEFECT_CLASSES:
+                    color = (0, 0, 255)  # ALL damage and defect classes are pure RED
 
-                if class_name in ["line_mark", "dent", "buldge", "bulge", "damage"] and det.get("mask") is not None:
+                if class_name in SURFACE_DEFECT_CLASSES and det.get("mask") is not None:
                     pts = np.array(det["mask"], np.int32)
                     pts[:, 0] = (pts[:, 0] * scale_ann).astype(int)
                     pts[:, 1] = (pts[:, 1] * scale_ann).astype(int)
@@ -2401,7 +2422,7 @@ def yolo_worker_loop():
                     metal_t = presence_cfg.get("metal_min_ratio", 0.15)
                     lap_t = presence_cfg.get("laplacian_variance_min", 150.0)
                     
-                    if class_name not in ["dent", "buldge", "bulge", "line_mark", "linemark", "line-mark", "damage", "hole_spec_error"]:
+                    if class_name not in SURFACE_DEFECT_CLASSES:
                         roi = frame_to_process[y1:y2, x1:x2]
                         if not has_part(roi, blue_t, metal_t, lap_t):
                             logger.info(f"Filtered out empty tray misclassified as '{class_name}' (conf: {conf:.2f})")
@@ -2430,11 +2451,9 @@ def yolo_worker_loop():
                     if class_name in ["front", "circle_front"]: color = (0, 165, 255)
                     elif class_name in ["back", "circle_back", "cricle_back"]: color = (255, 0, 255)
                     elif class_name in ["serial", "serial_area"]: color = (255, 255, 0)
-                    elif class_name in ["dent", "buldge", "bulge", "damage"]: color = (0, 0, 255)
-                    elif class_name == "hole_spec_error": color = (0, 128, 255)  # Orange for hole spec errors
-                    elif class_name == "line_mark": color = (0, 255, 255)
+                    elif class_name in SURFACE_DEFECT_CLASSES: color = (0, 0, 255)  # ALL damage and defect classes are pure RED
                     
-                    if class_name in ["line_mark", "dent", "buldge", "bulge", "damage"]:
+                    if class_name in SURFACE_DEFECT_CLASSES:
                         if mask_polygon is not None:
                             pts = np.array(mask_polygon, np.int32).reshape((-1, 1, 2))
                             overlay = annotated_frame.copy()
@@ -2461,8 +2480,9 @@ def yolo_worker_loop():
                         elif class_name == "holes":
                             has_holes_detected = True
                     
-                    if class_name in ["dent", "buldge", "bulge", "line_mark", "linemark", "line-mark", "damage", "hole_spec_error"]:
+                    if class_name in SURFACE_DEFECT_CLASSES:
                         frame_defects.append(class_name)
+                        active_cycle_data["defects_detected"].add(class_name)
                         
                     if class_name == "hole" or class_name == "holes":
                         if has_back_detected:
@@ -3020,13 +3040,14 @@ def yolo_worker_loop():
                         if active_cycle_data["defects_detected"]:
                             current_cycle["instruction_color"] = "red"
                             current_cycle["result"] = "NG"
+                            current_cycle["status"] = "NG - DEFECT DETECTED"
                         else:
                             current_cycle["instruction_color"] = "blue"
                             current_cycle["result"] = "Awaiting analysis..."
 
-                        # Allow the 2-second sequence success flash to override the current state, EVEN IF NG!
+                        # Allow the 2-second sequence success flash to override the current state ONLY IF NO DEFECT IS DETECTED
                         flash_end = active_cycle_data.get("flash_end_time", 0)
-                        if time.time() < flash_end:
+                        if time.time() < flash_end and not active_cycle_data["defects_detected"]:
                             current_cycle["instruction_color"] = "green"
                             current_cycle["instruction"] = active_cycle_data.get("flash_message", "OK")
                             current_cycle["result"] = "OK"

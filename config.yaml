@@ -16,13 +16,18 @@ ai:
     serial_area: 0.10
     line_mark: 0.30
     hole: 0.50
-    hole_spec_error: 0.70  # NEW in V2: hole specification error
+    hole_spec_error: 0.70    # Hole specification error defect
     back_hook: 0.50
+    back_hook_bend: 0.40     # NEW in V1.2: Back hook bend defect
     lock_striker: 0.20
+    lock_striker_bend: 0.40  # NEW in V1.2: Lock striker bend defect
     ring_bush: 0.40
     striker: 0.60
-    buldge: 0.40            # NEW in V2: surface bulge defect
-    dent: 0.40              # NEW in V2: surface dent defect
+    striker_bend: 0.40       # NEW in V1.2: Striker bend defect
+    buldge: 0.40              # Surface bulge defect
+    dent: 0.40                # Surface dent defect
+    defect: 0.40              # NEW in V1.2: General defect
+    frame_damage: 0.40        # NEW in V1.2: Frame damage defect
   # Minimum bounding box area (in pixels) for a defect to be considered valid to prevent false positives quickly
   min_defect_area: 200
   # Default YOLO confidence threshold if a class is not specified above
