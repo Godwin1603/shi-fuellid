@@ -3,7 +3,7 @@
 # --- AI & Vision Settings ---
 ai:
   # Path to the trained YOLO model
-  model_path: "best.pt"
+  model_path: "best_SHI_FUELDOOR.pt"
   # Confidence threshold for detecting the OCR target regions (serial, back, etc.)
   ocr_confidence_threshold: 0.10
   # Fallback timeout (in seconds) before attempting to read the back panel if serial is missing
@@ -14,22 +14,23 @@ ai:
     back: 0.40
     serial: 0.10
     serial_area: 0.10
-    line_mark: 0.30
-    hole: 0.50
-    hole_spec_error: 0.70    # Hole specification error defect
-    back_hook: 0.50
-    back_hook_bend: 0.40     # NEW in V1.2: Back hook bend defect
+    line_mark: 0.25
+    hole: 0.40
+    hole_spec_error: 0.35    # Hole specification error defect
+    back_hook: 0.40
+    back_hook_bend: 0.35     # NEW in V1.2: Back hook bend defect
     lock_striker: 0.20
-    lock_striker_bend: 0.40  # NEW in V1.2: Lock striker bend defect
-    ring_bush: 0.40
-    striker: 0.60
-    striker_bend: 0.40       # NEW in V1.2: Striker bend defect
-    buldge: 0.30              # Surface bulge defect
-    dent: 0.30                # Surface dent defect
-    defect: 0.40              # NEW in V1.2: General defect
-    frame_damage: 0.40        # NEW in V1.2: Frame damage defect
+    lock_striker_bend: 0.35  # NEW in V1.2: Lock striker bend defect
+    ring_bush: 0.30
+    striker: 0.35
+    striker_bend: 0.35       # NEW in V1.2: Striker bend defect
+    buldge: 0.25              # Surface bulge defect
+    dent: 0.25                # Surface dent defect
+    defect: 0.25              # NEW in V1.2: General defect
+    frame_damage: 0.30        # NEW in V1.2: Frame damage defect
+    hand: 0.40                # Hand detection
   # Minimum bounding box area (in pixels) for a defect to be considered valid to prevent false positives quickly
-  min_defect_area: 200
+  min_defect_area: 50
   # Default YOLO confidence threshold if a class is not specified above
   default_yolo_confidence: 0.10
   

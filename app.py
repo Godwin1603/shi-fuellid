@@ -77,7 +77,7 @@ else:
 # Def config defaults
 OCR_CONF_THRESHOLD = APP_CONFIG.get("ai", {}).get("ocr_confidence_threshold", 0.20)
 OCR_FALLBACK_TIMEOUT = APP_CONFIG.get("ai", {}).get("ocr_fallback_timeout", 3.5)
-MODEL_PATH = APP_CONFIG.get("ai", {}).get("model_path", "SHI_FUEL_DOOR_V1.1.pt")
+MODEL_PATH = APP_CONFIG.get("ai", {}).get("model_path", "best_SHI_FUELDOOR.pt")
 RETENTION_DAYS = APP_CONFIG.get("storage", {}).get("retention_days", 30)
 
 
@@ -259,7 +259,7 @@ print(_gpu_msg)
 # ──────────────────────────────────────────────────────────────────────────────
 
 from datetime import datetime
-from flask import Flask, render_template, Response, request, jsonify
+from flask import Flask, render_template, Response, request, jsonify, send_file, send_from_directory, redirect
 import logging
 werkzeug_log = logging.getLogger('werkzeug')
 werkzeug_log.setLevel(logging.ERROR)
@@ -267,6 +267,9 @@ import urllib.request as _urllib_req
 import urllib.error
 import base64 as _base64
 import json as _json
+import csv as _csv
+import io as _io
+import db_logger
 
 
 def kill_process_on_port(port=5001):
@@ -471,7 +474,9 @@ current_cycle = {
     "vote_2": "- - - - - -",
     "vote_3": "- - - - - -",
     "instruction": "WAITING FOR PART",
-    "instruction_color": "blue"
+    "instruction_color": "blue",
+    "hand_detected": False,
+    "hand_warning": False
 }
 
 active_cycle_data = {
@@ -579,8 +584,9 @@ def enhance_image(image, save_original_debug=False, debug_path=None):
 def init_models():
     global YOLO_MODEL, OCR_ENGINE
     if YOLO_MODEL is None:
-        print("Loading YOLO Model...")
         model_file = MODEL_PATH if os.path.exists(MODEL_PATH) else "yolov8n.pt"
+        print(f"Loading YOLO Model from {model_file}...")
+        logger.info(f"[YOLO] Loading model from: {model_file}")
         YOLO_MODEL = YOLO(model_file)
         # Move YOLO to the detected target device
         if GPU_AVAILABLE:
@@ -1159,84 +1165,105 @@ def finalize_report_and_rename(c_data):
         # Feature: Recheck if serial is missing
         is_missing = False
         with lock:
-            if active_cycle_data["serial_number"] == "serial_missing":
+            if c_data.get("serial_number") == "serial_missing":
                 is_missing = True
 
         if is_missing:
             with lock:
-                current_cycle["instruction"] = "RECHECKING SERIAL..."
-                current_cycle["instruction_color"] = "red"
-                current_cycle["status"] = "Confirming Missing Serial..."
+                if c_data is active_cycle_data:
+                    current_cycle["instruction"] = "RECHECKING SERIAL..."
+                    current_cycle["instruction_color"] = "red"
+                    current_cycle["status"] = "Confirming Missing Serial..."
                 # Reset start time so fallback logic triggers again if needed
-                active_cycle_data["ocr_start_time"] = time.time()
-                active_cycle_data["serial_number"] = None
+                c_data["ocr_start_time"] = time.time()
+                c_data["serial_number"] = None
 
             # Wait for recheck
             recheck_wait_start = time.time()
             while time.time() - recheck_wait_start < 2.5:
                 with lock:
-                    if active_cycle_data["serial_number"] is not None and active_cycle_data["serial_number"] != "serial_missing":
+                    if c_data.get("serial_number") is not None and c_data.get("serial_number") != "serial_missing":
                         break
-                    if active_cycle_data["serial_votes"] and not active_cycle_data["ocr_thread_active"]:
-                        best_vote = max(active_cycle_data["serial_votes"], key=lambda v: v["confidence"])
-                        active_cycle_data["serial_number"] = best_vote["text"]
-                        active_cycle_data["ocr_confidence"] = best_vote["confidence"]
-                        active_cycle_data["final_crop_path"] = best_vote.get("crop_path")
-                        current_cycle["serial"] = best_vote["text"]
-                        current_cycle["confidence"] = f"{best_vote['confidence']:.1f}%"
+                    if c_data.get("serial_votes") and not c_data.get("ocr_thread_active"):
+                        best_vote = max(c_data["serial_votes"], key=lambda v: v["confidence"])
+                        c_data["serial_number"] = best_vote["text"]
+                        c_data["ocr_confidence"] = best_vote["confidence"]
+                        c_data["final_crop_path"] = best_vote.get("crop_path")
+                        if c_data is active_cycle_data:
+                            current_cycle["serial"] = best_vote["text"]
+                            current_cycle["confidence"] = f"{best_vote['confidence']:.1f}%"
                         break
                 time.sleep(0.02)
 
             with lock:
-                if active_cycle_data["serial_number"] is None:
-                    active_cycle_data["serial_number"] = "serial_missing"
-                    active_cycle_data["ocr_confidence"] = 0.0
-                    current_cycle["serial"] = "serial_missing"
-                    current_cycle["confidence"] = "0.0%"
+                if c_data.get("serial_number") is None:
+                    c_data["serial_number"] = "serial_missing"
+                    c_data["ocr_confidence"] = 0.0
+                    if c_data is active_cycle_data:
+                        current_cycle["serial"] = "serial_missing"
+                        current_cycle["confidence"] = "0.0%"
                     print("[Finalize] Recheck completed: Still serial_missing")
                 else:
-                    print(f"[Finalize] Recheck succeeded: {active_cycle_data['serial_number']}")
+                    print(f"[Finalize] Recheck succeeded: {c_data['serial_number']}")
 
         # Now that we have the final serial number, instruct operator to remove the plate
         with lock:
-            current_cycle["instruction"] = "REMOVE THE PLATE"
-            current_cycle["instruction_color"] = "red"
-            current_cycle["status"] = "Saving report..."
+            if c_data is active_cycle_data:
+                current_cycle["instruction"] = "REMOVE THE PLATE"
+                current_cycle["instruction_color"] = "red"
+                current_cycle["status"] = "Saving report..."
         
-        temp_dir = active_cycle_data["temp_folder"]
-        serial = active_cycle_data["serial_number"]
-        front = active_cycle_data["front_path"]
-        back = active_cycle_data["back_path"]
-        conf = active_cycle_data["ocr_confidence"]
-        defect_frame = active_cycle_data.get("defect_frame_path")  # Annotated frame with defect markings
+        temp_dir = c_data.get("temp_folder")
+        serial = c_data.get("serial_number")
+        if not serial:
+            serial = "serial_missing"
+        front = c_data.get("front_path")
+        back = c_data.get("back_path")
+        conf = c_data.get("ocr_confidence", 0.0)
+        defect_frame = c_data.get("defect_frame_path")
+        if not defect_frame and temp_dir and os.path.exists(os.path.join(temp_dir, "defect_frame.jpg")):
+            defect_frame = os.path.join(temp_dir, "defect_frame.jpg")
+            c_data["defect_frame_path"] = defect_frame
+
+        if not temp_dir or not os.path.exists(temp_dir):
+            logger.error(f"[Finalize Thread] temp_folder '{temp_dir}' does not exist, aborting finalization.")
+            return
         
         # Read defects and verify holes
         with lock:
-            defects = list(active_cycle_data["defects_detected"])
-            if active_cycle_data.get("max_holes_detected", 0) < 3:
+            defects = list(c_data.get("defects_detected", []))
+            if c_data.get("max_holes_detected", 0) < 3:
                 defects.append("missing_holes")
-            if active_cycle_data.get("max_ring_bush_detected", 0) < 1 and active_cycle_data.get("max_rod_detected", 0) < 1:
+            if c_data.get("max_ring_bush_detected", 0) < 1 and c_data.get("max_rod_detected", 0) < 1:
                 defects.append("missing_ring_bush")
-            if active_cycle_data.get("max_striker_detected", 0) < 2:
+            if c_data.get("max_striker_detected", 0) < 2:
                 defects.append("missing_striker")
-            if active_cycle_data.get("max_back_hook_detected", 0) < 2:
+            if c_data.get("max_back_hook_detected", 0) < 2:
                 defects.append("missing_back_hook")
-            if active_cycle_data["max_lock_striker_detected"] < 1:
+            if c_data.get("max_lock_striker_detected", 0) < 1:
                 defects.append("missing_lock_striker")
                 
             if serial == "serial_missing":
                 defects.append("serial_missing")
-            current_cycle["defects"] = defects
 
-            if defects:
-                current_cycle["instruction"] = "NG"  
-                current_cycle["instruction_color"] = "red"
-                current_cycle["result"] = "NG"
-                current_cycle["status"] = "NG - DEFECT DETECTED"
-            else:
-                current_cycle["instruction"] = "OK"  
-                current_cycle["instruction_color"] = "green"
-                current_cycle["result"] = "OK"
+            # If defect_frame exists, guarantee defect is recorded
+            if defect_frame and os.path.exists(defect_frame) and not defects:
+                defects.append("defect_detected")
+
+            defects = list(set(defects))
+
+            if c_data is active_cycle_data:
+                current_cycle["defects"] = defects
+                if defects:
+                    current_cycle["instruction"] = "NG"  
+                    current_cycle["instruction_color"] = "red"
+                    current_cycle["result"] = "NG"
+                    current_cycle["status"] = "NG - DEFECT DETECTED"
+                else:
+                    current_cycle["instruction"] = "OK"  
+                    current_cycle["instruction_color"] = "green"
+                    current_cycle["result"] = "OK"
+
         status = "FAIL" if defects else "PASS"
         
         # Guarantee annotated defect image is saved for the PDF report when inspection fails
@@ -1250,7 +1277,7 @@ def finalize_report_and_rename(c_data):
                     else:
                         cv2.imwrite(fallback_defect_path, latest_annotated_frame, [cv2.IMWRITE_JPEG_QUALITY, 95])
                     defect_frame = fallback_defect_path
-                    active_cycle_data["defect_frame_path"] = defect_frame
+                    c_data["defect_frame_path"] = defect_frame
                     logger.info(f"[Finalize Thread] Saved fallback annotated defect frame for report: {defect_frame}")
                 except Exception as _e:
                     logger.warning(f"[Finalize Thread] Failed to save fallback defect frame: {_e}")
@@ -1264,10 +1291,10 @@ def finalize_report_and_rename(c_data):
         
         timestamp_str = datetime.now().strftime("%H%M%S")
         
-        if serial == "serial_missing":
+        if not serial or serial == "serial_missing":
             folder_name = f"serial_missing - {timestamp_str}"
         else:
-            base_serial = serial
+            base_serial = str(serial).strip()
             base_path = os.path.join(day_dir, base_serial)
             if os.path.exists(base_path):
                 # Same serial exists! Use timestamp for folder, images, and report
@@ -1360,6 +1387,26 @@ def finalize_report_and_rename(c_data):
         except Exception as rename_err:
             print(f"[Finalize Thread] Error renaming images: {rename_err}")
 
+        # Safely log to SQLite for Shift Analytics Dashboard
+        try:
+            import db_logger
+            db_report_path = os.path.join(final_dir, f"{folder_name}.pdf")
+            db_defect_img = os.path.join(final_dir, f"{folder_name}_defect.jpg") if os.path.exists(os.path.join(final_dir, f"{folder_name}_defect.jpg")) else ""
+            db_front_img = os.path.join(final_dir, f"{folder_name}_front.jpg") if os.path.exists(os.path.join(final_dir, f"{folder_name}_front.jpg")) else ""
+            db_back_img = os.path.join(final_dir, f"{folder_name}_back.jpg") if os.path.exists(os.path.join(final_dir, f"{folder_name}_back.jpg")) else ""
+            db_logger.log_inspection(
+                serial=serial,
+                status=status,
+                confidence=conf,
+                defects=defects,
+                folder_path=final_dir,
+                report_path=db_report_path,
+                defect_image=db_defect_img,
+                front_image=db_front_img,
+                back_image=db_back_img
+            )
+        except Exception as _log_e:
+            logger.warning(f"[DB Logger] Failed to record inspection: {_log_e}")
 
         with lock:
             # Check and increment cycle count daily
@@ -1427,6 +1474,8 @@ def reset_cycle_state():
         current_cycle["vote_3"] = "- - - - - -"
         current_cycle["instruction"] = "WAITING FOR PART"
         current_cycle["instruction_color"] = "blue"
+        current_cycle["hand_detected"] = False
+        current_cycle["hand_warning"] = False
         
         active_cycle_data = {
             "temp_folder": None,
@@ -2206,6 +2255,8 @@ def video_processing_loop():
                     color = (0, 0, 255)
                 elif class_name == "line_mark":
                     color = (0, 255, 255)
+                elif class_name == "hand":
+                    color = (0, 140, 255)
 
                 if (class_name in SURFACE_DEFECT_CLASSES or class_name in ["line_mark", "dent", "buldge", "bulge", "damage", "defect"]) and det.get("mask") is not None:
                     pts = np.array(det["mask"], np.int32)
@@ -2213,8 +2264,7 @@ def video_processing_loop():
                     pts[:, 1] = (pts[:, 1] * scale_ann).astype(int)
                     pts = pts.reshape((-1, 1, 2))
                     cv2.polylines(annotated_frame, [pts], True, color, 2)
-                else:
-                    cv2.rectangle(annotated_frame, (x1, y1), (x2, y2), color, 2)
+                cv2.rectangle(annotated_frame, (x1, y1), (x2, y2), color, 2)
 
                 # Draw label without confidence percentage
                 label = f"{class_name}"
@@ -2333,6 +2383,7 @@ def yolo_worker_loop():
             has_serial_detected = False
             has_holes_detected = False
             has_defect_detected = False
+            has_hand_detected = False
             
             if results:
                 boxes = results[0].boxes
@@ -2360,6 +2411,8 @@ def yolo_worker_loop():
                             active_cycle_data["front_first_seen_time"] = time.time()
                     elif class_name in ["back", "circle_back", "cricle_back", "serial", "serial_area"]:
                         has_back_detected = True
+                    elif class_name == "hand":
+                        has_hand_detected = True
                 
                 processed_boxes = {}
                 for box_idx, box in enumerate(boxes):
@@ -2416,8 +2469,8 @@ def yolo_worker_loop():
                             if dbg_canvas is not None:
                                 cv2.imwrite("logs/ring_bush_debug.jpg", dbg_canvas)
                             
-                            if decision == "ABSENT":
-                                logger.info(f"OpenCV rejected ring_bush (Score: {score:.2f})")
+                            if decision == "ABSENT" and conf < 0.50:
+                                logger.info(f"OpenCV rejected ring_bush (Score: {score:.2f}, conf: {conf:.2f})")
                                 continue
                             elif decision == "UNCERTAIN":
                                 logger.info(f"OpenCV uncertain about ring_bush (Score: {score:.2f}) - retaining YOLO decision")
@@ -2435,19 +2488,15 @@ def yolo_worker_loop():
                     metal_t = presence_cfg.get("metal_min_ratio", 0.15)
                     lap_t = presence_cfg.get("laplacian_variance_min", 150.0)
                     
-                    if class_name not in SURFACE_DEFECT_CLASSES and class_name not in ["dent", "buldge", "bulge", "line_mark", "linemark", "line-mark", "damage", "hole_spec_error", "defect"]:
+                    if class_name not in SURFACE_DEFECT_CLASSES and class_name not in ["dent", "buldge", "bulge", "line_mark", "linemark", "line-mark", "damage", "hole_spec_error", "defect", "hand"]:
                         roi = frame_to_process[y1:y2, x1:x2]
                         if not has_part(roi, blue_t, metal_t, lap_t):
                             logger.info(f"Filtered out empty tray misclassified as '{class_name}' (conf: {conf:.2f})")
                             continue # Skip this bounding box
                     else:
-                        # Defect classes are only valid on the FRONT side
-                        if not has_front_detected:
-                            continue # Skip this defect bounding box
-                        
                         # Fast and accurate filter: remove tiny false positive defects based on area
                         box_area = (x2 - x1) * (y2 - y1)
-                        min_defect_area = APP_CONFIG.get("ai", {}).get("min_defect_area", 200)
+                        min_defect_area = APP_CONFIG.get("ai", {}).get("min_defect_area", 50)
                         if box_area < min_defect_area:
                             logger.info(f"Filtered out {class_name} due to small area ({box_area} < {min_defect_area})")
                             continue
@@ -2467,6 +2516,7 @@ def yolo_worker_loop():
                     elif class_name in SURFACE_DEFECT_CLASSES or class_name in ["dent", "buldge", "bulge", "damage", "defect"]: color = (0, 0, 255)
                     elif class_name == "hole_spec_error": color = (0, 128, 255)  # Orange for hole spec errors
                     elif class_name == "line_mark": color = (0, 255, 255)
+                    elif class_name == "hand": color = (0, 140, 255)  # Amber / Orange for operator hand
                     
                     if class_name in SURFACE_DEFECT_CLASSES or class_name in ["line_mark", "dent", "buldge", "bulge", "damage", "defect"]:
                         if mask_polygon is not None:
@@ -2503,28 +2553,18 @@ def yolo_worker_loop():
                         if has_back_detected:
                             frame_holes += 1
                     elif class_name in ["ring_bush", "ringbush"]:
-                        if has_front_detected:
-                            # Record the first moment the front class was seen this cycle
-                            if active_cycle_data.get("front_first_seen_time") is None:
-                                active_cycle_data["front_first_seen_time"] = time.time()
-                            # Only count ring_bush AFTER a 1-second settle delay
-                            front_settle_elapsed = time.time() - active_cycle_data["front_first_seen_time"]
-                            if front_settle_elapsed >= 1.0:
-                                frame_ring_bush += 1
+                        if has_front_detected or state in ["WAITING_FRONT", "WAITING_LOCK_STRIKER"]:
+                            frame_ring_bush += 1
                     elif class_name == "striker":
-                        if has_front_detected:
-                            # Record the first moment the front class was seen this cycle
-                            if active_cycle_data.get("front_first_seen_time") is None:
-                                active_cycle_data["front_first_seen_time"] = time.time()
-                            # Only count striker AFTER a 1-second settle delay
-                            front_settle_elapsed = time.time() - active_cycle_data["front_first_seen_time"]
-                            if front_settle_elapsed >= 1.0:
-                                frame_striker += 1
+                        if has_front_detected or state in ["WAITING_FRONT", "WAITING_LOCK_STRIKER"]:
+                            frame_striker += 1
                     elif class_name == "back_hook":
                         if has_back_detected:
                             frame_back_hook += 1
                     elif class_name == "lock_striker":
                         frame_lock_striker += 1
+                    elif class_name == "hand":
+                        has_hand_detected = True
                     elif class_name in ["front", "circle_front"]:
                         front_box = (x1, y1, x2, y2)
                         front_class = class_name  # Track whether it's 'front' or 'circle_front'
@@ -2542,7 +2582,7 @@ def yolo_worker_loop():
             if frame_defects and has_front_detected and active_cycle_data["temp_folder"] is not None:
                 with lock:
                     defect_frame_already_saved = active_cycle_data.get("defect_frame_path") is not None
-                if not defect_frame_already_saved:
+                if not defect_frame_already_saved and not has_hand_detected:
                     defect_file = os.path.join(active_cycle_data["temp_folder"], "defect_frame.jpg")
                     cv2.imwrite(defect_file, annotated_frame, [cv2.IMWRITE_JPEG_QUALITY, 95])
                     with lock:
@@ -2575,11 +2615,9 @@ def yolo_worker_loop():
                         # If pending and missed for 2 frames, remove candidate
                         if info["status"] == "PENDING" and info["miss_count"] >= 2:
                             to_remove.append(d)
-                        # If confirmed but absent for 5 consecutive frames, dynamically remove/un-freeze
-                        elif info["status"] == "CONFIRMED" and info["miss_count"] >= 5:
-                            to_remove.append(d)
-                            active_cycle_data["defects_detected"].discard(d)
-                            logger.info(f"[Dynamic Freezing] Dynamically removed transient defect '{d}' after 5 absent frames.")
+                        # Once CONFIRMED, physical defects remain latched for the entire inspection cycle.
+                        # Do NOT discard them when the operator flips the part to lock striker or back side!
+                        pass
                 
                 for d in to_remove:
                     del tracker[d]
@@ -2733,6 +2771,11 @@ def yolo_worker_loop():
 
             with lock:
                 current_detections = new_detections
+                current_cycle["hand_detected"] = has_hand_detected
+
+                # Hand warning is active whenever hand is detected anywhere in frame during frame capture states
+                hand_warning = has_hand_detected and (state in ["WAITING_FRONT", "WAITING_BACK"])
+                current_cycle["hand_warning"] = hand_warning
                 needs_reset = False
                 
                 # Strict State Machine Logic
@@ -2761,7 +2804,7 @@ def yolo_worker_loop():
                         prev_cx, prev_cy = active_cycle_data.get("front_box_center") or (cx, cy)
                         dist = ((cx - prev_cx)**2 + (cy - prev_cy)**2)**0.5
                         
-                        if dist > 10:
+                        if dist > 10 or has_hand_detected:
                             active_cycle_data["front_frames_count"] = 0
                             active_cycle_data["front_first_seen_time"] = None
                             
@@ -2775,7 +2818,7 @@ def yolo_worker_loop():
                         
                         active_cycle_data["front_missing_frames"] = 0
                         
-                        if time_stable >= 0.5:
+                        if not has_hand_detected and time_stable >= 0.5:
                             # --- Capture front image (file I/O done OUTSIDE lock below) ---
                             _front_capture_frame   = frame_to_process.copy()
                             _front_capture_folder  = active_cycle_data["temp_folder"]
@@ -2886,7 +2929,7 @@ def yolo_worker_loop():
                             prev_cx, prev_cy = active_cycle_data.get("back_box_center") or (cx, cy)
                             dist = ((cx - prev_cx)**2 + (cy - prev_cy)**2)**0.5
                             
-                            if dist > 50:
+                            if dist > 50 or has_hand_detected:
                                 active_cycle_data["back_frames_count"] = 0
                                 active_cycle_data["back_first_seen_time"] = None
                                 
@@ -2902,7 +2945,7 @@ def yolo_worker_loop():
                             ocr_start = active_cycle_data.get("ocr_start_time")
                             ocr_timeout = (ocr_start is not None) and (time.time() - ocr_start > 8.0)
                             
-                            if (ocr_done or ocr_timeout) and time_stable >= 0.5:
+                            if not has_hand_detected and (ocr_done or ocr_timeout) and time_stable >= 0.5:
                                 # --- Capture back image (file I/O done OUTSIDE lock below) ---
                                 _do_back_write = True
                                 _back_capture_frame = frame_to_process.copy()
@@ -3051,8 +3094,11 @@ def yolo_worker_loop():
                             current_cycle["instruction"] = "REMOVE THE PLATE"
                             current_cycle["result"] = "OK"
                     else:
-                        # If any defect is identified during live frames, immediately trigger NG (flashy red side signals)
-                        if active_cycle_data["defects_detected"]:
+                        if hand_warning:
+                            current_cycle["instruction_color"] = "yellow"
+                            current_cycle["instruction"] = "TAKE HAND AWAY FROM THE PART"
+                            current_cycle["status"] = "Hand Detected - Please Remove Hand"
+                        elif active_cycle_data["defects_detected"]:
                             current_cycle["instruction_color"] = "red"
                             current_cycle["result"] = "NG"
                             current_cycle["status"] = "NG - DEFECT DETECTED"
@@ -3060,9 +3106,9 @@ def yolo_worker_loop():
                             current_cycle["instruction_color"] = "blue"
                             current_cycle["result"] = "Awaiting analysis..."
 
-                        # Allow the 2-second sequence success flash to override the current state ONLY IF NO DEFECT IS DETECTED
+                        # Allow the 2-second sequence success flash to override the current state ONLY IF NO DEFECT IS DETECTED AND NO HAND WARNING
                         flash_end = active_cycle_data.get("flash_end_time", 0)
-                        if time.time() < flash_end and not active_cycle_data["defects_detected"]:
+                        if time.time() < flash_end and not active_cycle_data["defects_detected"] and not hand_warning:
                             current_cycle["instruction_color"] = "green"
                             current_cycle["instruction"] = active_cycle_data.get("flash_message", "OK")
                             current_cycle["result"] = "OK"
@@ -3520,10 +3566,381 @@ def cleanup_status():
         return jsonify({"status": "error", "message": str(e)}), 500
 
 
+# -------------------------------
+# Shift Analytics Dashboard Endpoints (Integrated on Port 5000)
+# -------------------------------
+@app.route('/dashboard')
+def dashboard():
+    """Redirects to the standalone Shift Analytics Dashboard process running on Port 5050."""
+    return redirect("http://localhost:5050")
+
+@app.route('/api/dates')
+def get_dates():
+    """Returns all available production dates and total counts."""
+    with db_logger.get_db_connection() as conn:
+        rows = conn.execute("""
+            SELECT production_date, COUNT(*) as count 
+            FROM inspections 
+            GROUP BY production_date 
+            ORDER BY production_date DESC
+        """).fetchall()
+    
+    dates = [{"date": r["production_date"], "count": r["count"]} for r in rows]
+    current_shift, current_prod_date = db_logger.get_shift_and_production_date()
+    
+    return jsonify({
+        "dates": dates,
+        "current_production_date": current_prod_date,
+        "current_shift": current_shift
+    })
+
+@app.route('/api/summary')
+def get_summary():
+    """
+    Returns shift-wise analytics, defect breakdowns, and hourly trends for a selected date.
+    Query params:
+      date: 'YYYY-MM-DD' (default: today's production date)
+      shift: 'A', 'B', 'C', or 'all' (default: 'all')
+    """
+    selected_date = request.args.get("date")
+    selected_shift = request.args.get("shift", "all").upper()
+    
+    current_shift, current_prod_date = db_logger.get_shift_and_production_date()
+    if not selected_date:
+        selected_date = current_prod_date
+        
+    with db_logger.get_db_connection() as conn:
+        # 1. Total & Shift-wise summary for the day
+        shift_query = """
+            SELECT 
+                shift,
+                COUNT(*) as total,
+                SUM(CASE WHEN status = 'OK' THEN 1 ELSE 0 END) as ok_count,
+                SUM(CASE WHEN status = 'NG' THEN 1 ELSE 0 END) as ng_count
+            FROM inspections
+            WHERE production_date = ?
+            GROUP BY shift
+        """
+        rows = conn.execute(shift_query, (selected_date,)).fetchall()
+        
+        shifts_data = {
+            "A": {"total": 0, "ok": 0, "ng": 0, "yield_rate": 0.0, "ng_rate": 0.0, "time_range": "08:00 - 16:30"},
+            "B": {"total": 0, "ok": 0, "ng": 0, "yield_rate": 0.0, "ng_rate": 0.0, "time_range": "16:30 - 01:00"},
+            "C": {"total": 0, "ok": 0, "ng": 0, "yield_rate": 0.0, "ng_rate": 0.0, "time_range": "01:00 - 08:00"}
+        }
+        
+        total_scanned = 0
+        total_ok = 0
+        total_ng = 0
+        
+        for r in rows:
+            s = r["shift"]
+            if s in shifts_data:
+                tot = r["total"] or 0
+                ok = r["ok_count"] or 0
+                ng = r["ng_count"] or 0
+                shifts_data[s]["total"] = tot
+                shifts_data[s]["ok"] = ok
+                shifts_data[s]["ng"] = ng
+                shifts_data[s]["yield_rate"] = round((ok / tot * 100), 1) if tot > 0 else 0.0
+                shifts_data[s]["ng_rate"] = round((ng / tot * 100), 1) if tot > 0 else 0.0
+                
+                total_scanned += tot
+                total_ok += ok
+                total_ng += ng
+                
+        overall_yield = round((total_ok / total_scanned * 100), 1) if total_scanned > 0 else 0.0
+        overall_ng_rate = round((total_ng / total_scanned * 100), 1) if total_scanned > 0 else 0.0
+        
+        # 2. Defect Breakdown
+        defect_where = "WHERE production_date = ? AND status = 'NG'"
+        defect_params = [selected_date]
+        if selected_shift in ["A", "B", "C"]:
+            defect_where += " AND shift = ?"
+            defect_params.append(selected_shift)
+            
+        defect_rows = conn.execute(f"SELECT defects FROM inspections {defect_where}", defect_params).fetchall()
+        defect_counts = {}
+        for r in defect_rows:
+            try:
+                d_list = _json.loads(r["defects"]) if r["defects"] else []
+            except Exception:
+                d_list = []
+            if not d_list:
+                d_list = ["Unspecified Defect"]
+            for d in d_list:
+                clean_d = d.replace("_", " ").title()
+                defect_counts[clean_d] = defect_counts.get(clean_d, 0) + 1
+                
+        sorted_defects = sorted([{"name": k, "count": v} for k, v in defect_counts.items()], key=lambda x: x["count"], reverse=True)
+        
+        # 3. Hourly Production Trend (24-hour cycle)
+        hourly_where = "WHERE production_date = ?"
+        hourly_params = [selected_date]
+        if selected_shift in ["A", "B", "C"]:
+            hourly_where += " AND shift = ?"
+            hourly_params.append(selected_shift)
+            
+        hourly_rows = conn.execute(f"""
+            SELECT 
+                strftime('%H', timestamp) as hour,
+                COUNT(*) as total,
+                SUM(CASE WHEN status = 'OK' THEN 1 ELSE 0 END) as ok_count,
+                SUM(CASE WHEN status = 'NG' THEN 1 ELSE 0 END) as ng_count
+            FROM inspections
+            {hourly_where}
+            GROUP BY hour
+            ORDER BY hour ASC
+        """, hourly_params).fetchall()
+        
+        hourly_map = {f"{h:02d}": {"total": 0, "ok": 0, "ng": 0} for h in range(24)}
+        for r in hourly_rows:
+            h = r["hour"]
+            if h in hourly_map:
+                hourly_map[h] = {
+                    "total": r["total"] or 0,
+                    "ok": r["ok_count"] or 0,
+                    "ng": r["ng_count"] or 0
+                }
+                
+        hourly_list = [{"hour": f"{h}:00", **hourly_map[h]} for h in sorted(hourly_map.keys())]
+
+    return jsonify({
+        "production_date": selected_date,
+        "selected_shift": selected_shift,
+        "current_active_shift": current_shift,
+        "overall": {
+            "total_scanned": total_scanned,
+            "total_ok": total_ok,
+            "total_ng": total_ng,
+            "yield_rate": overall_yield,
+            "ng_rate": overall_ng_rate
+        },
+        "shifts": shifts_data,
+        "defects": sorted_defects,
+        "hourly_trend": hourly_list
+    })
+
+@app.route('/api/records')
+def get_records():
+    """
+    Returns individual inspection scan records.
+    Filters: date, shift ('A', 'B', 'C', 'all'), status ('OK', 'NG', 'all'), search, all_dates
+    """
+    selected_date = request.args.get("date")
+    selected_shift = request.args.get("shift", "all").upper()
+    selected_status = request.args.get("status", "all").upper()
+    search = request.args.get("search", "").strip()
+    all_dates = request.args.get("all_dates", "0") == "1"
+    limit = int(request.args.get("limit", 100))
+    offset = int(request.args.get("offset", 0))
+    
+    _, current_prod_date = db_logger.get_shift_and_production_date()
+    if not selected_date:
+        selected_date = current_prod_date
+        
+    where_clauses = []
+    params = []
+
+    # If searching across all dates or selected_date is 'all', omit the date filter
+    if not (search and all_dates) and selected_date != "all":
+        where_clauses.append("production_date = ?")
+        params.append(selected_date)
+    
+    if selected_shift in ["A", "B", "C"]:
+        where_clauses.append("shift = ?")
+        params.append(selected_shift)
+        
+    if selected_status in ["OK", "NG"]:
+        where_clauses.append("status = ?")
+        params.append(selected_status)
+        
+    if search:
+        where_clauses.append("(serial LIKE ? OR defects LIKE ? OR folder_path LIKE ?)")
+        params.extend([f"%{search}%", f"%{search}%", f"%{search}%"])
+        
+    where_sql = ("WHERE " + " AND ".join(where_clauses)) if where_clauses else ""
+    
+    with db_logger.get_db_connection() as conn:
+        total_count = conn.execute(f"SELECT COUNT(*) FROM inspections {where_sql}", params).fetchone()[0]
+        
+        query = f"""
+            SELECT id, timestamp, time_str, shift, serial, status, defects, confidence,
+                   folder_path, report_path, defect_image, front_image, back_image
+            FROM inspections
+            {where_sql}
+            ORDER BY timestamp DESC
+            LIMIT ? OFFSET ?
+        """
+        query_params = list(params) + [limit, offset]
+        rows = conn.execute(query, query_params).fetchall()
+    
+    records = []
+    for r in rows:
+        try:
+            d_list = _json.loads(r["defects"]) if r["defects"] else []
+        except Exception:
+            d_list = []
+            
+        records.append({
+            "id": r["id"],
+            "timestamp": r["timestamp"],
+            "time_str": r["time_str"],
+            "shift": r["shift"],
+            "serial": r["serial"],
+            "status": r["status"],
+            "defects": d_list,
+            "confidence": r["confidence"],
+            "has_report": bool(r["report_path"] and os.path.exists(r["report_path"])),
+            "has_defect_image": bool(r["defect_image"] and os.path.exists(r["defect_image"])),
+            "folder_path": r["folder_path"]
+        })
+        
+    return jsonify({
+        "total": total_count,
+        "limit": limit,
+        "offset": offset,
+        "records": records
+    })
+
+@app.route('/api/view_file')
+def view_file():
+    """Safely serves PDF reports or inspection images from lid_data."""
+    file_path = request.args.get("path")
+    if not file_path or not os.path.exists(file_path):
+        return "File not found", 404
+        
+    abs_path = os.path.abspath(file_path)
+    base_dir = os.path.abspath("lid_data")
+    if not abs_path.startswith(base_dir):
+        return "Access denied", 403
+        
+    return send_file(abs_path)
+
+@app.route('/api/open_folder', methods=['POST', 'GET'])
+def open_folder():
+    """Opens the inspection folder directly in Windows File Explorer."""
+    folder_path = request.args.get("path")
+    if not folder_path or not os.path.exists(folder_path):
+        return jsonify({"status": "error", "message": "Folder not found"}), 404
+        
+    abs_path = os.path.abspath(folder_path)
+    base_dir = os.path.abspath("lid_data")
+    if not abs_path.startswith(base_dir):
+        return jsonify({"status": "error", "message": "Access denied"}), 403
+        
+    try:
+        if sys.platform == "win32" and hasattr(os, "startfile"):
+            os.startfile(abs_path)
+        else:
+            import subprocess
+            subprocess.Popen(["explorer", abs_path])
+        return jsonify({"status": "success", "message": "Folder opened in File Explorer"})
+    except Exception as e:
+        return jsonify({"status": "error", "message": str(e)}), 500
+
+@app.route('/api/open_file', methods=['POST', 'GET'])
+def open_file():
+    """Opens a PDF report or image directly in the default Windows desktop viewer."""
+    file_path = request.args.get("path")
+    if not file_path or not os.path.exists(file_path):
+        return jsonify({"status": "error", "message": "File not found"}), 404
+        
+    abs_path = os.path.abspath(file_path)
+    base_dir = os.path.abspath("lid_data")
+    if not abs_path.startswith(base_dir):
+        return jsonify({"status": "error", "message": "Access denied"}), 403
+        
+    try:
+        if sys.platform == "win32" and hasattr(os, "startfile"):
+            os.startfile(abs_path)
+        else:
+            import subprocess
+            subprocess.Popen(["start", abs_path], shell=True)
+        return jsonify({"status": "success", "message": "File opened in system viewer"})
+    except Exception as e:
+        return jsonify({"status": "error", "message": str(e)}), 500
+
+@app.route('/api/export_csv')
+def export_csv():
+    """Generates a downloadable CSV of inspection records for quality auditing."""
+    selected_date = request.args.get("date")
+    selected_shift = request.args.get("shift", "all").upper()
+    
+    _, current_prod_date = db_logger.get_shift_and_production_date()
+    if not selected_date:
+        selected_date = current_prod_date
+        
+    where_clauses = ["production_date = ?"]
+    params = [selected_date]
+    if selected_shift in ["A", "B", "C"]:
+        where_clauses.append("shift = ?")
+        params.append(selected_shift)
+        
+    where_sql = "WHERE " + " AND ".join(where_clauses)
+    
+    with db_logger.get_db_connection() as conn:
+        rows = conn.execute(f"""
+            SELECT timestamp, time_str, production_date, shift, serial, status, defects, confidence, folder_path
+            FROM inspections
+            {where_sql}
+            ORDER BY timestamp ASC
+        """, params).fetchall()
+    
+    si = _io.StringIO()
+    writer = _csv.writer(si)
+    writer.writerow(["Timestamp", "Time", "Production Date", "Shift", "Serial Number", "Result Status", "Defects Detected", "Confidence %", "Folder Path"])
+    
+    for r in rows:
+        try:
+            d_list = _json.loads(r["defects"]) if r["defects"] else []
+            d_str = "; ".join(d_list)
+        except Exception:
+            d_str = r["defects"] or ""
+            
+        writer.writerow([
+            r["timestamp"],
+            r["time_str"],
+            r["production_date"],
+            f"Shift {r['shift']}",
+            r["serial"],
+            r["status"],
+            d_str,
+            f"{r['confidence']:.1f}%",
+            r["folder_path"]
+        ])
+        
+    filename = f"fuel_door_inspections_{selected_date}_Shift_{selected_shift}.csv"
+    return Response(
+        si.getvalue(),
+        mimetype="text/csv",
+        headers={"Content-disposition": f"attachment; filename={filename}"}
+    )
+
+@app.route('/api/sync', methods=['POST', 'GET'])
+def sync_data():
+    """Triggers an on-demand scan of lid_data to index any uncatalogued scans."""
+    count = db_logger.sync_existing_lid_data()
+    return jsonify({"status": "success", "synced_new_records": count})
+
+
 
 if __name__ == '__main__':
     # Initialize workspace folders
     os.makedirs("lid_data", exist_ok=True)
+    
+    # Initialize SQLite database and sync past inspection scans in lid_data
+    try:
+        db_logger.init_db()
+        threading.Thread(target=db_logger.sync_existing_lid_data, daemon=True).start()
+        logger.info("[DB Logger] Shift analytics database initialized and background sync started.")
+    except Exception as _dbe:
+        logger.warning(f"[DB Logger] Init warning: {_dbe}")
+
+    web_port = APP_CONFIG.get("web", {}).get("port", 5000)
+    kill_process_on_port(web_port)
+    kill_process_on_port(5001)
+    kill_process_on_port(5050)
     init_models()
     
     import subprocess
@@ -3554,6 +3971,32 @@ if __name__ == '__main__':
         atexit.register(cleanup_ocr)
     except Exception as e:
         logger.error(f"[System] Failed to start PaddleOCR server: {e}")
+    
+    logger.info("[System] Automatically starting Shift Analytics Dashboard (Port 5050)...")
+    try:
+        dash_log = open("logs/dashboard_server.log", "w", buffering=1)
+        try:
+            py312_path = subprocess.check_output(["py", "-3.12", "-c", "import sys; print(sys.executable)"]).decode().strip()
+            dash_cmd = [py312_path, "dashboard_app.py", "--no-browser"]
+        except Exception:
+            dash_cmd = [sys.executable, "dashboard_app.py", "--no-browser"]
+        dash_process = subprocess.Popen(dash_cmd, stdout=dash_log, stderr=subprocess.STDOUT, env=dict(os.environ, PYTHONUNBUFFERED="1"), creationflags=0x08000000)
+        
+        def cleanup_dash():
+            logger.info("[System] Shutting down Dashboard Server...")
+            try:
+                dash_process.terminate()
+                dash_process.wait(timeout=2)
+                dash_log.close()
+            except Exception:
+                try:
+                    dash_process.kill()
+                except:
+                    pass
+                
+        atexit.register(cleanup_dash)
+    except Exception as e:
+        logger.error(f"[System] Failed to start Dashboard server: {e}")
     
     # Start the video processing background thread
     processing_thread = threading.Thread(target=video_processing_loop, daemon=True)
