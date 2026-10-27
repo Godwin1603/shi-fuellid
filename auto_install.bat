@@ -1,6 +1,9 @@
 @echo off
 setlocal enabledelayedexpansion
 
+:: Ensure working directory is set to this script's directory
+cd /d "%~dp0"
+
 echo ==============================================
 echo SHI Vision System - 1-Click Installer
 echo ==============================================

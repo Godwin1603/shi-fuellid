@@ -1,4 +1,6 @@
 @echo off
+:: Ensure working directory is set to this script's directory
+cd /d "%~dp0"
 echo ==============================================
 echo SHI Production - Windows Service Installer
 echo ==============================================

@@ -49,23 +49,37 @@
         /* Warning Banner — hidden by default, shown only when capturing front panel */
         .warning-banner {
             flex-shrink: 0;
-            display: none;              /* hidden until WAITING_FRONT is active */
+            display: none;              /* hidden until hand is detected */
             align-items: center;
             justify-content: center;
             gap: 12px;
-            background: transparent;
+            background: rgba(245, 158, 11, 0.2);
             border: 2px solid #f59e0b;
             border-radius: 8px;
             padding: 9px 20px;
-            color: #b45309;
+            color: #f59e0b;
             font-family: var(--font-display);
             font-size: 18px;
-            font-weight: 700;
-            letter-spacing: 0.02em;
+            font-weight: 800;
+            letter-spacing: 0.03em;
+            animation: warn-banner-flash 0.5s infinite alternate;
         }
 
         .warning-banner.visible {
             display: flex;
+        }
+
+        @keyframes warn-banner-flash {
+            0% {
+                background-color: rgba(245, 158, 11, 0.35);
+                border-color: #f59e0b;
+                box-shadow: 0 0 25px rgba(245, 158, 11, 0.6);
+            }
+            100% {
+                background-color: rgba(245, 158, 11, 0.08);
+                border-color: #d97706;
+                box-shadow: 0 0 6px rgba(245, 158, 11, 0.2);
+            }
         }
 
         .warning-banner .warn-icon {
@@ -814,17 +828,17 @@
 </head>
 <body>
 
-    <!-- Warning Banner — shown only during WAITING_FRONT state -->
+    <!-- Warning Banner — shown whenever hand is detected -->
     <div class="warning-banner" id="warning-banner">
         <span class="warn-dot"></span>
         <span class="warn-icon">
-            <svg fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24">
+            <svg fill="none" stroke="currentColor" stroke-width="2.5" viewBox="0 0 24 24">
                 <path stroke-linecap="round" stroke-linejoin="round" d="M12 9v3.75m-9.303 3.376c-.866 1.5.217 3.374 1.948 3.374h14.71c1.73 0 2.813-1.874 1.948-3.374L13.949 3.378c-.866-1.5-3.032-1.5-3.898 0L2.697 16.126ZM12 15.75h.007v.008H12v-.008Z"/>
             </svg>
         </span>
-        <span>WARNING — The system is capturing images. Place the part correctly and keep hands and objects away from the camera.</span>
+        <span>WARNING — OPERATOR HAND DETECTED! PLEASE TAKE HAND AWAY FROM THE PART AND CAMERA.</span>
         <span class="warn-icon">
-            <svg fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24">
+            <svg fill="none" stroke="currentColor" stroke-width="2.5" viewBox="0 0 24 24">
                 <path stroke-linecap="round" stroke-linejoin="round" d="M12 9v3.75m-9.303 3.376c-.866 1.5.217 3.374 1.948 3.374h14.71c1.73 0 2.813-1.874 1.948-3.374L13.949 3.378c-.866-1.5-3.032-1.5-3.898 0L2.697 16.126ZM12 15.75h.007v.008H12v-.008Z"/>
             </svg>
         </span>
@@ -850,7 +864,7 @@
             </style>
             <div style="position: relative; display: flex; align-items: center;">
                 <div id="top-tour-arrow" style="position: absolute; left: -32px; font-size: 24px; animation: bounce-right 1.5s infinite; filter: drop-shadow(0 2px 4px rgba(0,0,0,0.3)); pointer-events: none; z-index: 100;">👉</div>
-                <button class="config-toggle-btn tour-btn" id="header-connect-btn" onclick="connectGige()" style="background-color: var(--accent-blue); color: white; border: none; margin-right: 8px;">
+                <button class="config-toggle-btn tour-btn" id="header-connect-btn" onclick="connectDefaultGige()" style="background-color: var(--accent-blue); color: white; border: none; margin-right: 8px;" title="One-click connect to camera SN: 73ABE004">
                     <svg width="14" height="14" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24">
                         <path stroke-linecap="round" stroke-linejoin="round" d="M6.827 6.175A2.31 2.31 0 0 1 5.186 7.23c-.38.054-.757.112-1.134.175C2.999 7.58 2.25 8.507 2.25 9.574V18a2.25 2.25 0 0 0 2.25 2.25h15A2.25 2.25 0 0 0 21.75 18V9.574c0-1.067-.75-1.994-1.802-2.169a47.865 47.865 0 0 0-1.134-.175 2.31 2.31 0 0 1-1.64-1.055l-.822-1.316a2.192 2.192 0 0 0-1.736-1.039 48.774 48.774 0 0 0-5.232 0 2.192 2.192 0 0 0-1.736 1.039l-.821 1.316Z" />
                         <path stroke-linecap="round" stroke-linejoin="round" d="M16.5 12.75a4.5 4.5 0 1 1-9 0 4.5 4.5 0 0 1 9 0ZM18.75 10.5h.008v.008h-.008V10.5Z" />
@@ -858,13 +872,18 @@
                     Connect Camera
                 </button>
             </div>
+            <!-- Manual Reset Cycle button: operator safety valve to break a stuck inspection cycle -->
+            <button class="config-toggle-btn" id="header-reset-btn" onclick="manualResetCycle()" title="Force reset the current inspection cycle if stuck" style="margin-right: 4px; background: rgba(245,158,11,0.12); border-color: rgba(245,158,11,0.3); color: #f59e0b; display:none;">
+                <svg width="14" height="14" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" d="M16.023 9.348h4.992v-.001M2.985 19.644v-4.992m0 0h4.992m-4.993 0 3.181 3.183a8.25 8.25 0 0 0 13.803-3.7M4.031 9.865a8.25 8.25 0 0 1 13.803-3.7l3.181 3.182m0-4.991v4.99" /></svg>
+                Reset Cycle
+            </button>
             <button class="config-toggle-btn" onclick="toggleConfigSidebar()" title="Toggle Camera & Vision Settings">
                 <svg width="14" height="14" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24">
                     <path stroke-linecap="round" stroke-linejoin="round" d="M9.594 3.94c.09-.542.56-.94 1.11-.94h2.593c.55 0 1.02.398 1.11.94l.213 1.281c.063.374.313.686.645.87.074.04.147.083.22.127.324.196.72.257 1.075.124l1.217-.456a1.125 1.125 0 0 1 1.37.49l1.296 2.247a1.125 1.125 0 0 1-.26 1.43l-1.003.828c-.293.241-.438.613-.43.992a7.723 7.723 0 0 1 0 .255c-.008.378.137.75.43.991l1.004.827c.424.35.534.954.26 1.43l-1.298 2.247a1.125 1.125 0 0 1-1.369.491l-1.217-.456c-.355-.133-.75-.072-1.076.124a6.57 6.57 0 0 1-.22.128c-.331.183-.581.495-.644.869l-.213 1.28c-.09.543-.56.94-1.11.94h-2.594c-.55 0-1.02-.398-1.11-.94l-.213-1.281c-.062-.374-.312-.686-.644-.87a6.52 6.52 0 0 1-.22-.127c-.325-.196-.72-.257-1.076-.124l-1.217.456a1.125 1.125 0 0 1-1.369-.49l-1.297-2.247a1.125 1.125 0 0 1 .26-1.43l1.004-.827c.292-.24.437-.613.43-.992a6.932 6.932 0 0 1 0-.255c.007-.378-.138-.75-.43-.991l-1.004-.827a1.125 1.125 0 0 1-.26-1.43l1.297-2.247a1.125 1.125 0 0 1 1.37-.491l1.216.456c.356.133.751.072 1.076-.124.072-.044.146-.087.22-.128.332-.183.582-.495.644-.869l.214-1.281Z"/>
                     <path stroke-linecap="round" stroke-linejoin="round" d="M15 12a3 3 0 1 1-6 0 3 3 0 0 1 6 0Z"/>
                 </svg>
             </button>
-            <a href="http://localhost:5050" target="_blank" class="config-toggle-btn" style="text-decoration: none; background: rgba(59, 130, 246, 0.1); border-color: rgba(59, 130, 246, 0.3); color: var(--accent-blue);" title="Open Shift Analytics Dashboard (Port 5050)">
+            <a href="/dashboard" target="_blank" class="config-toggle-btn" style="text-decoration: none; background: rgba(59, 130, 246, 0.1); border-color: rgba(59, 130, 246, 0.3); color: var(--accent-blue);" title="Open Shift Analytics Dashboard">
                 <svg width="14" height="14" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24">
                     <path stroke-linecap="round" stroke-linejoin="round" d="M3 13.125C3 12.504 3.504 12 4.125 12h2.25c.621 0 1.125.504 1.125 1.125v6.75C7.5 20.496 6.996 21 6.375 21h-2.25A1.125 1.125 0 0 1 3 19.875v-6.75ZM9.75 8.625c0-.621.504-1.125 1.125-1.125h2.25c.621 0 1.125.504 1.125 1.125v11.25c0 .621-.504 1.125-1.125 1.125h-2.25a1.125 1.125 0 0 1-1.125-1.125V8.625ZM16.5 4.125c0-.621.504-1.125 1.125-1.125h2.25C20.496 3 21 3.504 21 4.125v15.75c0 .621-.504 1.125-1.125 1.125h-2.25a1.125 1.125 0 0 1-1.125-1.125V4.125Z" />
                 </svg>
@@ -1027,7 +1046,7 @@
                     </div>
 
                     <div style="font-weight: 600; font-size: 11px; margin-top: 4px; color: var(--text-muted); border-bottom: 1px solid #e2e8f0; padding-bottom: 4px;">BACK PANEL</div>
-                    <div style="display: flex; justify-content: space-between; align-items: center;">
+                    <div id="ui-holes-row" style="display: none; justify-content: space-between; align-items: center;">
                         <span style="color: var(--text-muted); font-size: 11px;">Holes (Target: 3):</span>
                         <span id="ui-holes-count" style="font-weight: 700; font-size: 12px; color: var(--text-main);">0 / 3</span>
                     </div>
@@ -1227,17 +1246,28 @@
         }
 
         // ─── One-click Connect from main screen (SN: 73ABE004, no scan needed) ───
+        let isConnecting = false;
         function connectDefaultGige() {
+            if (isConnecting) return;
+            isConnecting = true;
             const btn    = document.getElementById('main-connect-btn');
+            const hBtn   = document.getElementById('header-connect-btn');
             const msgEl  = document.getElementById('main-connect-msg');
-            // Hide any previous force button
             const oldForce = document.getElementById('main-force-btn');
             if (oldForce) oldForce.remove();
 
-            btn.disabled = true;
-            btn.style.background = '#64748b';
-            msgEl.textContent = 'Connecting to camera SN: 73ABE004…';
-            msgEl.style.color = '#94a3b8';
+            if (btn) {
+                btn.disabled = true;
+                btn.style.background = '#64748b';
+            }
+            if (hBtn) {
+                hBtn.disabled = true;
+                hBtn.innerHTML = '⏳ Connecting…';
+            }
+            if (msgEl) {
+                msgEl.textContent = 'Connecting to camera SN: 73ABE004…';
+                msgEl.style.color = '#94a3b8';
+            }
 
             fetch('/connect_default_gige', {
                 method : 'POST',
@@ -1246,36 +1276,58 @@
             })
             .then(r => r.json())
             .then(data => {
+                isConnecting = false;
+                if (hBtn) {
+                    hBtn.disabled = false;
+                    hBtn.innerHTML = '<svg width="14" height="14" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" d="M6.827 6.175A2.31 2.31 0 0 1 5.186 7.23c-.38.054-.757.112-1.134.175C2.999 7.58 2.25 8.507 2.25 9.574V18a2.25 2.25 0 0 0 2.25 2.25h15A2.25 2.25 0 0 0 21.75 18V9.574c0-1.067-.75-1.994-1.802-2.169a47.865 47.865 0 0 0-1.134-.175 2.31 2.31 0 0 1-1.64-1.055l-.822-1.316a2.192 2.192 0 0 0-1.736-1.039 48.774 48.774 0 0 0-5.232 0 2.192 2.192 0 0 0-1.736 1.039l-.821 1.316Z" /></svg> Connect Camera';
+                }
                 if (data.status === 'success') {
-                    msgEl.textContent = '✓ ' + data.message;
-                    msgEl.style.color = '#22c55e';
-                    btn.style.display = 'none';
+                    if (msgEl) {
+                        msgEl.textContent = '✓ ' + data.message;
+                        msgEl.style.color = '#22c55e';
+                    }
+                    if (btn) btn.style.display = 'none';
                     activateStream();
                     // Also sync the sidebar status
                     document.getElementById('gige-connect-btn').disabled    = true;
                     document.getElementById('gige-disconnect-btn').disabled  = false;
                     document.getElementById('gige-save-btn').disabled        = false;
                 } else {
-                    msgEl.textContent = '✗ ' + data.message;
-                    msgEl.style.color = '#ef4444';
-                    btn.disabled = false;
-                    btn.style.background = '#2563eb';
+                    if (msgEl) {
+                        msgEl.textContent = '✗ ' + data.message;
+                        msgEl.style.color = '#ef4444';
+                    }
+                    if (btn) {
+                        btn.disabled = false;
+                        btn.style.background = '#2563eb';
+                    }
                     // If timeout / exclusive lock: show Force Release button
-                    if (data.message && (data.message.includes('1114128') || data.message.includes('Timeout') || data.message.includes('EXCLUSIVE'))) {
+                    if (data.message && (data.message.includes('1114128') || data.message.includes('Timeout') || data.message.includes('EXCLUSIVE') || data.message.includes('held by another'))) {
                         const forceBtn = document.createElement('button');
                         forceBtn.id = 'main-force-btn';
                         forceBtn.textContent = '⚡ Force Release & Connect';
                         forceBtn.style.cssText = 'margin-top:8px;padding:9px 20px;background:#dc2626;color:#fff;border:none;border-radius:8px;font-size:13px;font-weight:700;cursor:pointer;display:flex;align-items:center;gap:6px;box-shadow:0 2px 8px rgba(220,38,38,0.3);';
                         forceBtn.onclick = forceConnectGige;
-                        btn.parentNode.insertBefore(forceBtn, msgEl);
+                        if (btn && btn.parentNode) {
+                            btn.parentNode.insertBefore(forceBtn, msgEl);
+                        }
                     }
                 }
             })
             .catch(err => {
-                msgEl.textContent = 'Connection error: ' + err;
-                msgEl.style.color = '#ef4444';
-                btn.disabled = false;
-                btn.style.background = '#2563eb';
+                isConnecting = false;
+                if (hBtn) {
+                    hBtn.disabled = false;
+                    hBtn.innerHTML = '<svg width="14" height="14" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" d="M6.827 6.175A2.31 2.31 0 0 1 5.186 7.23c-.38.054-.757.112-1.134.175C2.999 7.58 2.25 8.507 2.25 9.574V18a2.25 2.25 0 0 0 2.25 2.25h15A2.25 2.25 0 0 0 21.75 18V9.574c0-1.067-.75-1.994-1.802-2.169a47.865 47.865 0 0 0-1.134-.175 2.31 2.31 0 0 1-1.64-1.055l-.822-1.316a2.192 2.192 0 0 0-1.736-1.039 48.774 48.774 0 0 0-5.232 0 2.192 2.192 0 0 0-1.736 1.039l-.821 1.316Z" /></svg> Connect Camera';
+                }
+                if (msgEl) {
+                    msgEl.textContent = 'Connection error: ' + err;
+                    msgEl.style.color = '#ef4444';
+                }
+                if (btn) {
+                    btn.disabled = false;
+                    btn.style.background = '#2563eb';
+                }
             });
         }
 
@@ -1475,6 +1527,7 @@
 
         // Poll /camera_status every second and update status card
         function pollCameraStatus() {
+            if (isConnecting) return;
             const videoFeed = document.getElementById('video-stream');
             const msgEl = document.getElementById('gige-message');
             
@@ -1580,10 +1633,10 @@
                 document.getElementById('trace-value').textContent = data.serial;
                 document.getElementById('trace-sub').textContent = 'OCR confidence: ' + data.confidence;
 
-                // Warning banner: visible while waiting to capture the front panel or whenever hand is detected
+                // Warning banner: visible WHENEVER hand is detected
                 const warningBanner = document.getElementById('warning-banner');
                 if (warningBanner) {
-                    if (data.capture_state === 'WAITING_FRONT' || data.hand_detected) {
+                    if (data.hand_warning || data.hand_detected) {
                         warningBanner.classList.add('visible');
                     } else {
                         warningBanner.classList.remove('visible');
@@ -1591,16 +1644,18 @@
                 }
 
                 // Update Holes Count
-            const holes = data.holes_count !== undefined ? data.holes_count : 0;
+                const holes = data.holes_count !== undefined ? data.holes_count : 0;
                 const holesEl = document.getElementById('ui-holes-count');
-                holesEl.textContent = holes + ' / 3';
-                
-                const isAnalyzing = data.status.toLowerCase().includes("analyzing") || data.status.toLowerCase().includes("capturing");
-                const holesMissing = isAnalyzing && (holes < 3);
-                if (holesMissing) {
-                    holesEl.style.color = 'var(--accent-red)';
-                } else {
-                    holesEl.style.color = 'var(--text-main)';
+                if (holesEl) {
+                    holesEl.textContent = holes + ' / 3';
+                    const checkHoles = window.appUiConfig && window.appUiConfig.check_missing_holes;
+                    if (checkHoles) {
+                        const isAnalyzing = data.status.toLowerCase().includes("analyzing") || data.status.toLowerCase().includes("capturing");
+                        const holesMissing = isAnalyzing && (holes < 3);
+                        holesEl.style.color = holesMissing ? 'var(--accent-red)' : 'var(--text-main)';
+                    } else {
+                        holesEl.style.color = 'var(--text-main)';
+                    }
                 }
 
                 const opSec = document.getElementById('operator-instruction-section');
@@ -1664,7 +1719,8 @@
                 
                 if (data.defects) {
                     const knownDefects = ['missing_holes', 'missing_ring_bush', 'missing_rod', 'missing_striker', 'missing_back_hook', 'missing_lock_striker', 'dent', 'bulge', 'buldge', 'line_mark', 'linemark', 'line-mark', 'damage', 'frame_damage', 'defect', 'hole_spec_error', 'back_hook_bend', 'lock_striker_bend', 'striker_bend', 'serial_missing'];
-                    if (data.defects.includes('missing_holes')) warningMessages.push("MISSING HOLES");
+                    const checkHoles = window.appUiConfig && window.appUiConfig.check_missing_holes;
+                    if (checkHoles && data.defects.includes('missing_holes')) warningMessages.push("MISSING HOLES");
                     if (data.defects.includes('missing_ring_bush') || data.defects.includes('missing_rod')) warningMessages.push("MISSING RING BUSH");
                     if (data.defects.includes('missing_striker')) warningMessages.push("MISSING STRIKER");
                     if (data.defects.includes('missing_back_hook')) warningMessages.push("MISSING BACK HOOK");
@@ -1705,7 +1761,7 @@
                 const leftDefects = document.getElementById('side-signal-defects-left');
                 const rightDefects = document.getElementById('side-signal-defects-right');
 
-                let isHandWarning = Boolean(data.hand_warning);
+                let isHandWarning = Boolean(data.hand_warning || data.hand_detected);
                 let isNG = false;
                 let isOK = false;
 
@@ -1715,8 +1771,9 @@
                         rightSignal.className = 'side-signal side-signal-right state-warning';
                         leftText.textContent = 'HAND';
                         rightText.textContent = 'HAND';
-                        if (leftDefects) leftDefects.innerHTML = '';
-                        if (rightDefects) rightDefects.innerHTML = '';
+                        const handBadge = '<div class="side-signal-defect-badge" style="background:#b45309; color:#fff; font-weight:800; border-color:#f59e0b;">WARNING: HAND DETECTED</div>';
+                        if (leftDefects) leftDefects.innerHTML = handBadge;
+                        if (rightDefects) rightDefects.innerHTML = handBadge;
                     }
                 } else {
                     if (warningMessages.length > 0 || (data.defects && data.defects.length > 0)) {
@@ -1789,20 +1846,79 @@
         // Start polling status
         setInterval(pollStatus, 500);
 
-        // Apply UI config from config.yaml (side flash bar widths)
-        fetch('/ui_config')
-            .then(r => r.json())
-            .then(cfg => {
-                const pct     = cfg.side_flash_width_percent ?? 12;
-                const maxPx   = cfg.side_flash_max_width_px  ?? 120;
-                const minPx   = Math.round(maxPx * 0.5);          // min = half of max
-                document.querySelectorAll('.side-signal').forEach(el => {
-                    el.style.width    = pct + '%';
-                    el.style.maxWidth = maxPx + 'px';
-                    el.style.minWidth = minPx + 'px';
-                });
-            })
-            .catch(() => { /* server not up yet — CSS defaults remain */ });
+        // UI config defaults
+        window.appUiConfig = {
+            side_flash_width_percent: 12,
+            side_flash_max_width_px: 120,
+            check_missing_holes: false,
+            hide_holes_in_count_ui: true
+        };
+
+        function fetchUiConfig() {
+            fetch('/ui_config')
+                .then(r => r.json())
+                .then(cfg => {
+                    window.appUiConfig = Object.assign(window.appUiConfig, cfg);
+                    const pct     = cfg.side_flash_width_percent ?? 12;
+                    const maxPx   = cfg.side_flash_max_width_px  ?? 120;
+                    const minPx   = Math.round(maxPx * 0.5);
+                    document.querySelectorAll('.side-signal').forEach(el => {
+                        el.style.width    = pct + '%';
+                        el.style.maxWidth = maxPx + 'px';
+                        el.style.minWidth = minPx + 'px';
+                    });
+                    const holesRow = document.getElementById('ui-holes-row');
+                    if (holesRow) {
+                        holesRow.style.display = cfg.hide_holes_in_count_ui ? 'none' : 'flex';
+                    }
+                })
+                .catch(() => {});
+        }
+        fetchUiConfig();
+        setInterval(fetchUiConfig, 5000);
+
+        // ── Manual Cycle Reset (operator emergency button) ─────────────────
+        function manualResetCycle() {
+            const btn = document.getElementById('header-reset-btn');
+            if (btn) { btn.disabled = true; btn.textContent = '⏳ Resetting…'; }
+            fetch('/reset_cycle', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: '{}' })
+                .then(r => r.json())
+                .then(data => {
+                    if (btn) { btn.disabled = false; btn.innerHTML = '<svg width="14" height="14" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" d="M16.023 9.348h4.992v-.001M2.985 19.644v-4.992m0 0h4.992m-4.993 0 3.181 3.183a8.25 8.25 0 0 0 13.803-3.7M4.031 9.865a8.25 8.25 0 0 1 13.803-3.7l3.181 3.182m0-4.991v4.99" /></svg> Reset Cycle'; }
+                    if (data.status === 'success') {
+                        console.log('[UI] Cycle reset: ' + data.message);
+                        // hide reset button again after successful reset
+                        setTimeout(() => { if (btn) btn.style.display = 'none'; }, 2000);
+                    }
+                })
+                .catch(() => { if (btn) { btn.disabled = false; } });
+        }
+
+        // ── Stuck-state watchdog: show Reset Cycle button if WAITING_BACK > 45s ─
+        let _stuckStateTimer = null;
+        let _lastCaptureState = null;
+        let _stateEnteredAt = null;
+        setInterval(() => {
+            fetch('/status')
+                .then(r => r.json())
+                .then(data => {
+                    const st = data.capture_state;
+                    const resetBtn = document.getElementById('header-reset-btn');
+                    if (!resetBtn) return;
+                    if (st !== _lastCaptureState) {
+                        _lastCaptureState = st;
+                        _stateEnteredAt = Date.now();
+                    }
+                    const age = (Date.now() - (_stateEnteredAt || Date.now())) / 1000;
+                    // Show Reset button if stuck in WAITING_BACK or WAITING_LOCK_STRIKER for > 45s
+                    if ((st === 'WAITING_BACK' || st === 'WAITING_LOCK_STRIKER') && age > 45) {
+                        resetBtn.style.display = '';
+                        resetBtn.title = `Stuck in ${st} for ${Math.round(age)}s — click to reset`;
+                    } else {
+                        resetBtn.style.display = 'none';
+                    }
+                }).catch(() => {});
+        }, 5000);
 
     </script>
 </body>

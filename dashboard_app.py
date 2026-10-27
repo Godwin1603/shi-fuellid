@@ -256,7 +256,15 @@ def get_records():
         except Exception:
             d_list = []
             
-        records.append({
+        file_paths = resolve_record_paths(
+            folder_path=r["folder_path"],
+            report_path=r["report_path"] or "",
+            defect_image=r["defect_image"] or "",
+            front_image=r["front_image"] or "",
+            back_image=r["back_image"] or ""
+        )
+            
+        record_data = {
             "id": r["id"],
             "timestamp": r["timestamp"],
             "time_str": r["time_str"],
@@ -265,10 +273,10 @@ def get_records():
             "status": r["status"],
             "defects": d_list,
             "confidence": r["confidence"],
-            "has_report": bool(r["report_path"] and os.path.exists(r["report_path"])),
-            "has_defect_image": bool(r["defect_image"] and os.path.exists(r["defect_image"])),
             "folder_path": r["folder_path"]
-        })
+        }
+        record_data.update(file_paths)
+        records.append(record_data)
         
     return jsonify({
         "total": total_count,
@@ -278,33 +286,158 @@ def get_records():
     })
 
 
+def resolve_record_paths(folder_path, report_path="", defect_image="", front_image="", back_image=""):
+    """
+    Robustly resolves and verifies physical paths for reports and images.
+    If a stored path is missing or does not exist on disk, scans the folder
+    to locate the actual report PDF and captured inspection images.
+    Returns normalized forward-slash relative web paths.
+    """
+    res = {
+        "report_path": "",
+        "has_report": False,
+        "defect_image": "",
+        "has_defect_image": False,
+        "front_image": "",
+        "has_front_image": False,
+        "back_image": "",
+        "has_back_image": False,
+        "photo_path": "",
+        "has_photo": False,
+        "photos": []
+    }
+    
+    # 1. Verify or find report_path
+    if report_path and os.path.exists(report_path):
+        res["report_path"] = report_path.replace("\\", "/")
+        res["has_report"] = True
+    elif folder_path and os.path.isdir(folder_path):
+        try:
+            files = os.listdir(folder_path)
+            pdfs = [f for f in files if f.lower().endswith(".pdf")]
+            if pdfs:
+                res["report_path"] = os.path.join(folder_path, pdfs[0]).replace("\\", "/")
+                res["has_report"] = True
+        except Exception:
+            pass
+
+    # 2. Verify or find defect_image
+    if defect_image and os.path.exists(defect_image):
+        res["defect_image"] = defect_image.replace("\\", "/")
+        res["has_defect_image"] = True
+    elif folder_path and os.path.isdir(folder_path):
+        try:
+            files = os.listdir(folder_path)
+            dis = [f for f in files if "defect" in f.lower() and f.lower().endswith((".jpg", ".jpeg", ".png"))]
+            if dis:
+                res["defect_image"] = os.path.join(folder_path, dis[0]).replace("\\", "/")
+                res["has_defect_image"] = True
+        except Exception:
+            pass
+
+    # 3. Verify or find front_image
+    if front_image and os.path.exists(front_image):
+        res["front_image"] = front_image.replace("\\", "/")
+        res["has_front_image"] = True
+    elif folder_path and os.path.isdir(folder_path):
+        try:
+            files = os.listdir(folder_path)
+            fis = [f for f in files if "front" in f.lower() and f.lower().endswith((".jpg", ".jpeg", ".png"))]
+            if fis:
+                res["front_image"] = os.path.join(folder_path, fis[0]).replace("\\", "/")
+                res["has_front_image"] = True
+        except Exception:
+            pass
+
+    # 4. Verify or find back_image
+    if back_image and os.path.exists(back_image):
+        res["back_image"] = back_image.replace("\\", "/")
+        res["has_back_image"] = True
+    elif folder_path and os.path.isdir(folder_path):
+        try:
+            files = os.listdir(folder_path)
+            bis = [f for f in files if "back" in f.lower() and f.lower().endswith((".jpg", ".jpeg", ".png"))]
+            if bis:
+                res["back_image"] = os.path.join(folder_path, bis[0]).replace("\\", "/")
+                res["has_back_image"] = True
+        except Exception:
+            pass
+
+    # 5. Build photo list and determine primary photo
+    photos = []
+    if res["has_defect_image"]:
+        photos.append({"type": "defect", "label": "Defect View", "path": res["defect_image"]})
+    if res["has_front_image"]:
+        photos.append({"type": "front", "label": "Front View", "path": res["front_image"]})
+    if res["has_back_image"]:
+        photos.append({"type": "back", "label": "Back View", "path": res["back_image"]})
+        
+    # If no defect/front/back tagged image was found but other images exist in folder:
+    if not photos and folder_path and os.path.isdir(folder_path):
+        try:
+            files = os.listdir(folder_path)
+            other_imgs = [f for f in files if f.lower().endswith((".jpg", ".jpeg", ".png"))]
+            for img in other_imgs:
+                p = os.path.join(folder_path, img).replace("\\", "/")
+                photos.append({"type": "other", "label": img, "path": p})
+        except Exception:
+            pass
+
+    res["photos"] = photos
+    if photos:
+        res["has_photo"] = True
+        res["photo_path"] = photos[0]["path"]
+        
+    return res
+
+
 @app.route("/api/view_file")
 def view_file():
     """Safely serves PDF reports or inspection images from lid_data."""
     file_path = request.args.get("path")
-    if not file_path or not os.path.exists(file_path):
-        return "File not found", 404
+    if not file_path:
+        return "File path missing", 400
         
-    # Prevent directory traversal outside workspace
-    abs_path = os.path.abspath(file_path)
+    clean_path = os.path.normpath(file_path.strip().replace("/", os.sep))
+    abs_path = os.path.abspath(clean_path)
     base_dir = os.path.abspath("lid_data")
-    if not abs_path.startswith(base_dir):
+    
+    # Secure normalized case-insensitive directory check for Windows
+    if not os.path.normcase(abs_path).startswith(os.path.normcase(base_dir)):
         return "Access denied", 403
         
-    return send_file(abs_path)
+    if not os.path.exists(abs_path) or not os.path.isfile(abs_path):
+        return "File not found", 404
+        
+    ext = os.path.splitext(abs_path)[1].lower()
+    mimetype = "application/pdf" if ext == ".pdf" else (
+        "image/jpeg" if ext in [".jpg", ".jpeg"] else (
+            "image/png" if ext == ".png" else None
+        )
+    )
+    
+    from flask import make_response
+    response = make_response(send_file(abs_path, mimetype=mimetype))
+    response.headers["Content-Disposition"] = f"inline; filename=\"{os.path.basename(abs_path)}\""
+    response.headers["X-Content-Type-Options"] = "nosniff"
+    return response
 
 
 @app.route("/api/open_folder", methods=["POST", "GET"])
 def open_folder():
     """Opens the inspection folder directly in Windows File Explorer."""
     folder_path = request.args.get("path")
-    if not folder_path or not os.path.exists(folder_path):
-        return jsonify({"status": "error", "message": "Folder not found"}), 404
+    if not folder_path:
+        return jsonify({"status": "error", "message": "Folder path missing"}), 400
         
-    abs_path = os.path.abspath(folder_path)
+    clean_path = os.path.normpath(folder_path.strip().replace("/", os.sep))
+    abs_path = os.path.abspath(clean_path)
     base_dir = os.path.abspath("lid_data")
-    if not abs_path.startswith(base_dir):
+    if not os.path.normcase(abs_path).startswith(os.path.normcase(base_dir)):
         return jsonify({"status": "error", "message": "Access denied"}), 403
+        
+    if not os.path.exists(abs_path):
+        return jsonify({"status": "error", "message": "Folder not found"}), 404
         
     try:
         if sys.platform == "win32" and hasattr(os, "startfile"):
@@ -321,20 +454,24 @@ def open_folder():
 def open_file():
     """Opens a PDF report or image directly in the default Windows desktop viewer."""
     file_path = request.args.get("path")
-    if not file_path or not os.path.exists(file_path):
-        return jsonify({"status": "error", "message": "File not found"}), 404
+    if not file_path:
+        return jsonify({"status": "error", "message": "File path missing"}), 400
         
-    abs_path = os.path.abspath(file_path)
+    clean_path = os.path.normpath(file_path.strip().replace("/", os.sep))
+    abs_path = os.path.abspath(clean_path)
     base_dir = os.path.abspath("lid_data")
-    if not abs_path.startswith(base_dir):
+    if not os.path.normcase(abs_path).startswith(os.path.normcase(base_dir)):
         return jsonify({"status": "error", "message": "Access denied"}), 403
+        
+    if not os.path.exists(abs_path):
+        return jsonify({"status": "error", "message": "File not found"}), 404
         
     try:
         if sys.platform == "win32" and hasattr(os, "startfile"):
             os.startfile(abs_path)
         else:
             import subprocess
-            subprocess.Popen(["start", abs_path], shell=True)
+            subprocess.Popen(["start", "", abs_path], shell=True)
         return jsonify({"status": "success", "message": "File opened in system viewer"})
     except Exception as e:
         return jsonify({"status": "error", "message": str(e)}), 500

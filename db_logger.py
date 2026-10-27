@@ -132,6 +132,12 @@ def log_inspection(
         defects_json = json.dumps(defects if defects else [])
         
         with get_db_connection(db_path) as conn:
+            # Deduplicate by serial: remove any previous record with the same serial number
+            # so the dashboard, counters, and report tables show ONLY the latest result.
+            clean_serial = str(serial).strip() if serial else ""
+            if clean_serial and clean_serial not in ["serial_missing", "------"]:
+                conn.execute("DELETE FROM inspections WHERE serial = ?;", (clean_serial,))
+
             conn.execute("""
                 INSERT OR REPLACE INTO inspections (
                     timestamp, date_str, time_str, production_date, shift,
@@ -188,6 +194,35 @@ def sync_existing_lid_data(lid_data_dir="lid_data", db_path=DB_PATH):
             if not os.path.isdir(folder_path):
                 continue
             if folder_path in existing_folders:
+                # Check and populate any missing file paths for existing record
+                try:
+                    files = os.listdir(folder_path)
+                    up_report = ""
+                    up_defect = ""
+                    up_front = ""
+                    up_back = ""
+                    for f in files:
+                        f_low = f.lower()
+                        if f_low.endswith(".pdf") and not up_report:
+                            up_report = os.path.join(folder_path, f)
+                        elif "defect" in f_low and f_low.endswith((".jpg", ".png", ".jpeg")) and not up_defect:
+                            up_defect = os.path.join(folder_path, f)
+                        elif "front" in f_low and f_low.endswith((".jpg", ".png", ".jpeg")) and not up_front:
+                            up_front = os.path.join(folder_path, f)
+                        elif "back" in f_low and f_low.endswith((".jpg", ".png", ".jpeg")) and not up_back:
+                            up_back = os.path.join(folder_path, f)
+                    with get_db_connection(db_path) as conn:
+                        conn.execute("""
+                            UPDATE inspections SET
+                                report_path = CASE WHEN length(coalesce(report_path, '')) = 0 THEN ? ELSE report_path END,
+                                defect_image = CASE WHEN length(coalesce(defect_image, '')) = 0 THEN ? ELSE defect_image END,
+                                front_image = CASE WHEN length(coalesce(front_image, '')) = 0 THEN ? ELSE front_image END,
+                                back_image = CASE WHEN length(coalesce(back_image, '')) = 0 THEN ? ELSE back_image END
+                            WHERE folder_path = ?
+                        """, (up_report, up_defect, up_front, up_back, folder_path))
+                        conn.commit()
+                except Exception:
+                    pass
                 continue
                 
             # Inspect folder contents

@@ -838,6 +838,27 @@
       color: #fff;
     }
 
+    .tbl-btn-photo-ok {
+      border-color: #a7f3d0;
+      color: #059669;
+      background: #ecfdf5;
+    }
+    .tbl-btn-photo-ok:hover {
+      background: #d1fae5;
+      border-color: #10b981;
+      color: #047857;
+    }
+    [data-theme="dark"] .tbl-btn-photo-ok {
+      border-color: rgba(16, 185, 129, 0.35);
+      color: #6ee7b7;
+      background: rgba(16, 185, 129, 0.08);
+    }
+    [data-theme="dark"] .tbl-btn-photo-ok:hover {
+      background: rgba(16, 185, 129, 0.2);
+      border-color: #10b981;
+      color: #fff;
+    }
+
     /* ── Document / Image Viewer Modal ──────────────────── */
     .modal-backdrop {
       display: none;
@@ -846,15 +867,16 @@
       left: 0;
       right: 0;
       bottom: 0;
-      background: rgba(15, 23, 42, 0.45);
+      background: rgba(15, 23, 42, 0.55);
       z-index: 999;
       align-items: center;
       justify-content: center;
-      backdrop-filter: blur(5px);
+      backdrop-filter: blur(6px);
+      padding: 16px;
     }
     [data-theme="dark"] .modal-backdrop {
-      background: rgba(0, 0, 0, 0.8);
-      backdrop-filter: blur(4px);
+      background: rgba(0, 0, 0, 0.85);
+      backdrop-filter: blur(6px);
     }
     .modal-backdrop.active {
       display: flex;
@@ -864,59 +886,297 @@
       background: var(--bg-surface);
       border: 1px solid var(--border-subtle);
       border-radius: var(--radius-lg);
-      width: 90%;
-      max-width: 920px;
-      height: 85vh;
+      width: 95%;
+      max-width: 1040px;
+      height: 88vh;
       display: flex;
       flex-direction: column;
-      box-shadow: 0 20px 45px -10px rgba(15, 23, 42, 0.25);
+      box-shadow: 0 25px 50px -12px rgba(15, 23, 42, 0.3);
       overflow: hidden;
+      position: relative;
     }
     [data-theme="dark"] .modal-content {
-      box-shadow: 0 20px 40px rgba(0,0,0,0.7);
+      box-shadow: 0 25px 50px rgba(0,0,0,0.8);
     }
 
     .modal-header {
       display: flex;
       align-items: center;
       justify-content: space-between;
-      padding: 12px 18px;
+      gap: 12px;
+      padding: 10px 18px;
       border-bottom: 1px solid var(--border-subtle);
       background: var(--bg-surface);
       color: var(--text-main);
+      flex-shrink: 0;
+    }
+    .modal-title-group {
+      display: flex;
+      flex-direction: column;
+      gap: 3px;
+      min-width: 0;
+    }
+    .modal-title-row {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      flex-wrap: wrap;
     }
     .modal-title {
       font-family: var(--font-display);
       font-size: 14px;
       font-weight: 700;
+      color: var(--text-main);
     }
+    .modal-serial-badge {
+      font-family: monospace;
+      font-weight: 700;
+      font-size: 12px;
+      background: var(--bg-card);
+      border: 1px solid var(--border-subtle);
+      padding: 2px 7px;
+      border-radius: var(--radius-sm);
+      color: var(--text-main);
+    }
+    .modal-meta {
+      font-size: 11.5px;
+      color: var(--text-dim);
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      flex-wrap: wrap;
+    }
+
+    .modal-actions {
+      display: flex;
+      align-items: center;
+      gap: 6px;
+      flex-shrink: 0;
+    }
+    .modal-act-btn {
+      display: inline-flex;
+      align-items: center;
+      gap: 5px;
+      padding: 5px 10px;
+      border-radius: var(--radius-sm);
+      font-size: 11.5px;
+      font-weight: 600;
+      cursor: pointer;
+      border: 1px solid var(--border-subtle);
+      background: var(--bg-card);
+      color: var(--text-main);
+      transition: all 0.15s ease;
+      white-space: nowrap;
+    }
+    .modal-act-btn:hover {
+      background: var(--accent-blue);
+      color: #fff;
+      border-color: var(--accent-blue);
+    }
+    [data-theme="dark"] .modal-act-btn:hover {
+      background: var(--accent-blue);
+      color: #fff;
+    }
+
     .modal-close {
       background: transparent;
-      border: none;
+      border: 1px solid transparent;
       color: var(--text-dim);
       font-size: 22px;
       cursor: pointer;
       line-height: 1;
+      border-radius: var(--radius-sm);
+      padding: 2px 8px;
+      margin-left: 4px;
+      transition: all 0.15s ease;
     }
     .modal-close:hover {
-      color: var(--text-main);
+      color: var(--accent-red);
+      background: rgba(239, 68, 68, 0.1);
+      border-color: rgba(239, 68, 68, 0.3);
     }
+
+    /* Tab switcher inside modal */
+    .modal-tabs {
+      display: flex;
+      gap: 6px;
+      padding: 8px 18px;
+      background: var(--bg-card);
+      border-bottom: 1px solid var(--border-subtle);
+      overflow-x: auto;
+      flex-shrink: 0;
+      align-items: center;
+    }
+    .modal-tab-btn {
+      display: inline-flex;
+      align-items: center;
+      gap: 6px;
+      padding: 5px 12px;
+      border-radius: var(--radius-sm);
+      font-size: 12px;
+      font-weight: 600;
+      cursor: pointer;
+      border: 1px solid var(--border-subtle);
+      background: var(--bg-surface);
+      color: var(--text-dim);
+      transition: all 0.15s ease;
+      white-space: nowrap;
+    }
+    .modal-tab-btn:hover {
+      color: var(--text-main);
+      border-color: var(--text-dim);
+    }
+    .modal-tab-btn.active {
+      background: var(--accent-blue);
+      color: #fff;
+      border-color: var(--accent-blue);
+      box-shadow: 0 2px 6px rgba(59, 130, 246, 0.3);
+    }
+
     .modal-body {
       flex: 1;
-      background: #f8fafc;
+      background: #f1f5f9;
       display: flex;
       align-items: center;
       justify-content: center;
       overflow: hidden;
+      position: relative;
     }
     [data-theme="dark"] .modal-body {
-      background: var(--bg-base);
+      background: #090d16;
     }
-    .modal-body iframe, .modal-body img {
+
+    .modal-viewer-container {
+      width: 100%;
+      height: 100%;
+      display: flex;
+      flex-direction: column;
+      position: relative;
+      overflow: hidden;
+    }
+
+    .modal-viewer-container iframe {
       width: 100%;
       height: 100%;
       border: none;
+      background: #fff;
+    }
+
+    .modal-img-viewport {
+      flex: 1;
+      width: 100%;
+      height: 100%;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      overflow: auto;
+      position: relative;
+      background: repeating-conic-gradient(rgba(128,128,128,0.06) 0% 25%, transparent 0% 50%) 50% / 20px 20px;
+    }
+    .modal-img-viewport img {
+      max-width: 96%;
+      max-height: 96%;
       object-fit: contain;
+      transition: transform 0.15s ease-out;
+      border-radius: var(--radius-sm);
+      box-shadow: 0 8px 24px rgba(0,0,0,0.15);
+      user-select: none;
+    }
+
+    .img-toolbar {
+      position: absolute;
+      bottom: 16px;
+      left: 50%;
+      transform: translateX(-50%);
+      background: rgba(15, 23, 42, 0.82);
+      backdrop-filter: blur(8px);
+      border: 1px solid rgba(255, 255, 255, 0.15);
+      border-radius: 30px;
+      padding: 4px 10px;
+      display: flex;
+      align-items: center;
+      gap: 6px;
+      z-index: 10;
+      box-shadow: 0 10px 25px rgba(0,0,0,0.3);
+    }
+    .img-tool-btn {
+      background: transparent;
+      border: none;
+      color: #fff;
+      font-size: 13px;
+      font-weight: 600;
+      padding: 4px 8px;
+      border-radius: 16px;
+      cursor: pointer;
+      display: flex;
+      align-items: center;
+      gap: 4px;
+      transition: background 0.15s ease;
+    }
+    .img-tool-btn:hover {
+      background: rgba(255, 255, 255, 0.2);
+    }
+    .img-zoom-label {
+      color: rgba(255, 255, 255, 0.7);
+      font-size: 11.5px;
+      min-width: 44px;
+      text-align: center;
+      font-family: monospace;
+    }
+
+    .modal-spinner {
+      position: absolute;
+      top: 0;
+      left: 0;
+      right: 0;
+      bottom: 0;
+      background: var(--bg-surface);
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      justify-content: center;
+      gap: 12px;
+      z-index: 5;
+      color: var(--text-dim);
+      font-size: 13px;
+      font-weight: 600;
+    }
+    .spinner-circle {
+      width: 32px;
+      height: 32px;
+      border: 3px solid var(--border-subtle);
+      border-top-color: var(--accent-blue);
+      border-radius: 50%;
+      animation: modalSpin 0.7s linear infinite;
+    }
+    @keyframes modalSpin {
+      to { transform: rotate(360deg); }
+    }
+
+    .modal-error-card {
+      background: var(--bg-card);
+      border: 1px solid var(--border-subtle);
+      border-radius: var(--radius-md);
+      padding: 24px;
+      text-align: center;
+      max-width: 440px;
+      box-shadow: 0 10px 25px rgba(0,0,0,0.1);
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      gap: 12px;
+    }
+    .modal-error-card h4 {
+      margin: 0;
+      color: var(--accent-red);
+      font-size: 15px;
+    }
+    .modal-error-card p {
+      margin: 0;
+      font-size: 12.5px;
+      color: var(--text-dim);
+      line-height: 1.4;
+      word-break: break-all;
     }
 
     /* Toast Notification */
@@ -973,8 +1233,8 @@
       <button class="btn btn-success" id="btnExport">
         📥 Export CSV
       </button>
-      <a href="http://localhost:5000" target="_blank" class="btn btn-outline" title="Switch to live camera inspection view (Port 5000)">
-        📷 Vision Camera (Port 5000)
+      <a href="/" target="_blank" class="btn btn-outline" title="Switch to live camera inspection view">
+        📷 Vision Inspection
       </a>
     </div>
   </header>
@@ -1157,12 +1417,25 @@
   </section>
 
   <!-- ── Document / Image Viewer Modal ──────────────────── -->
-  <div class="modal-backdrop" id="previewModal">
+  <div class="modal-backdrop" id="previewModal" role="dialog" aria-modal="true">
     <div class="modal-content">
       <div class="modal-header">
-        <span class="modal-title" id="modalTitle">File Viewer</span>
-        <button class="modal-close" id="modalClose">&times;</button>
+        <div class="modal-title-group">
+          <div class="modal-title-row">
+            <span class="modal-title" id="modalTitle">Inspection Visual Viewer</span>
+            <span class="modal-serial-badge" id="modalSerialBadge" style="display:none;"></span>
+            <span id="modalStatusBadge"></span>
+          </div>
+          <div class="modal-meta" id="modalMeta"></div>
+        </div>
+        <div class="modal-actions" id="modalActions">
+          <button class="modal-act-btn" id="modalBtnWindows" title="Open current file in Windows Desktop Viewer">🖥️ Windows Viewer</button>
+          <button class="modal-act-btn" id="modalBtnTab" title="Open current file in a new browser tab">↗️ New Tab</button>
+          <button class="modal-act-btn" id="modalBtnFolder" title="Open inspection folder in Windows Explorer">📁 Open Folder</button>
+          <button class="modal-close" id="modalClose" title="Close">&times;</button>
+        </div>
       </div>
+      <div class="modal-tabs" id="modalTabs" style="display:none;"></div>
       <div class="modal-body" id="modalBody"></div>
     </div>
   </div>
@@ -1304,6 +1577,12 @@
       }
     }
 
+    let currentActiveRecord = null;
+    let currentActiveFilePath = "";
+    let currentModalTabs = [];
+    let currentActiveTabId = "";
+    let currentZoom = 1.0;
+
     // Load Scan Records with File & Folder Actions
     async function loadRecords() {
       try {
@@ -1314,6 +1593,7 @@
 
         const tbody = document.getElementById("scansTableBody");
         document.getElementById("tableRecordCount").textContent = `Showing ${data.records.length} of ${data.total} records`;
+        window._currentRecords = data.records || [];
 
         if (!data.records || data.records.length === 0) {
           tbody.innerHTML = `<tr><td colspan="8" style="text-align: center; color: var(--text-dim); padding: 30px;">No scan records found matching this search.</td></tr>`;
@@ -1342,20 +1622,21 @@
           
           // 1. Open Folder in Windows Explorer
           if (r.folder_path) {
-            const safeFolder = r.folder_path.replace(/\\/g, '\\\\');
-            actions.push(`<button class="tbl-btn tbl-btn-folder" onclick="openFolderInExplorer('${safeFolder}')" title="Open this folder in Windows File Explorer">📁 Open Folder</button>`);
+            actions.push(`<button class="tbl-btn tbl-btn-folder" onclick="openFolderByRecordIndex(${idx})" title="Open this inspection folder in Windows File Explorer">📁 Open Folder</button>`);
           }
 
-          // 2. Open PDF Report
-          if (r.has_report) {
-            const safeFolder = r.folder_path.replace(/\\/g, '/');
-            actions.push(`<button class="tbl-btn tbl-btn-pdf" onclick="openFileInViewer('${safeFolder}/${r.serial}.pdf', 'PDF Report: ${r.serial}')" title="View Inspection PDF Report">📄 PDF Report</button>`);
+          // 2. Open PDF Report (Uses direct verified path from backend)
+          if (r.has_report && r.report_path) {
+            actions.push(`<button class="tbl-btn tbl-btn-pdf" onclick="openInspectionArtifact(${idx}, 'report')" title="View Inspection PDF Report">📄 PDF Report</button>`);
           }
 
-          // 3. View Photo
-          if (r.has_defect_image) {
-            const safeFolder = r.folder_path.replace(/\\/g, '/');
-            actions.push(`<button class="tbl-btn tbl-btn-photo" onclick="openFileInViewer('${safeFolder}/${r.serial}_defect.jpg', 'Defect Photo: ${r.serial}')" title="View Annotated Defect Image">🔍 Photo</button>`);
+          // 3. View Photo (Annotated Defect for NG, Part Inspection Photo for OK)
+          if (r.has_photo && r.photo_path) {
+            const isNg = r.status === "NG" || r.has_defect_image;
+            const photoLabel = isNg ? "🔍 Defect Photo" : "📷 Part Photo";
+            const btnCls = isNg ? "tbl-btn tbl-btn-photo" : "tbl-btn tbl-btn-photo tbl-btn-photo-ok";
+            const btnTitle = isNg ? "View Annotated Defect Photo" : "View Captured Part Inspection Photo";
+            actions.push(`<button class="${btnCls}" onclick="openInspectionArtifact(${idx}, 'photo')" title="${btnTitle}">${photoLabel}</button>`);
           }
 
           const actionCol = actions.length > 0 
@@ -1381,6 +1662,14 @@
       }
     }
 
+    // Helper: open folder for record at index
+    window.openFolderByRecordIndex = function(idx) {
+      const r = window._currentRecords && window._currentRecords[idx];
+      if (r && r.folder_path) {
+        openFolderInExplorer(r.folder_path);
+      }
+    };
+
     // Open Folder in Windows File Explorer
     window.openFolderInExplorer = async function(folderPath) {
       try {
@@ -1396,35 +1685,319 @@
       }
     };
 
-    // Open File in Modal Viewer
-    window.openFileInViewer = function(filePath, title) {
-      modalTitle.textContent = title || "Inspection Artifact Viewer";
-      modalBody.innerHTML = "";
+    // Main Interactive Artifact Viewer (Handles PDF Reports and Multi-View Photos)
+    window.openInspectionArtifact = function(idx, initialCategory) {
+      const r = window._currentRecords && window._currentRecords[idx];
+      if (!r) return;
+      currentActiveRecord = r;
 
-      const cleanPath = filePath.replace(/\\/g, '/');
-      const ext = cleanPath.split('.').pop().toLowerCase();
+      // Update Header Info
+      const modalTitle = document.getElementById("modalTitle");
+      const modalSerialBadge = document.getElementById("modalSerialBadge");
+      const modalStatusBadge = document.getElementById("modalStatusBadge");
+      const modalMeta = document.getElementById("modalMeta");
+      const modalTabs = document.getElementById("modalTabs");
 
-      if (ext === 'pdf') {
-        const iframe = document.createElement("iframe");
-        iframe.src = `/api/view_file?path=${encodeURIComponent(cleanPath)}`;
-        modalBody.appendChild(iframe);
+      modalTitle.textContent = "Inspection Artifact Viewer";
+      modalSerialBadge.textContent = r.serial;
+      modalSerialBadge.style.display = "inline-block";
+
+      const isOk = r.status === "OK";
+      modalStatusBadge.innerHTML = isOk 
+        ? `<span class="badge-status badge-ok" style="font-size:11px;">✓ OK</span>`
+        : `<span class="badge-status badge-ng" style="font-size:11px;">✕ NG</span>`;
+
+      let metaHtml = `<span>${r.timestamp}</span> &bull; <span>Shift ${r.shift}</span>`;
+      if (r.defects && r.defects.length > 0) {
+        metaHtml += ` &bull; <span style="color:var(--accent-red); font-weight:600;">Defects: ${r.defects.map(d => d.replace('_', ' ')).join(', ')}</span>`;
+      }
+      if (r.confidence) {
+        metaHtml += ` &bull; <span>Conf: ${r.confidence.toFixed(1)}%</span>`;
+      }
+      modalMeta.innerHTML = metaHtml;
+
+      // Build Available Visual Tabs
+      const tabs = [];
+      if (r.has_report && r.report_path) {
+        tabs.push({ id: 'report', label: '📄 PDF Report', path: r.report_path, type: 'pdf' });
+      }
+      if (r.has_defect_image && r.defect_image) {
+        tabs.push({ id: 'defect', label: '🔍 Defect View', path: r.defect_image, type: 'img' });
+      }
+      if (r.has_front_image && r.front_image) {
+        tabs.push({ id: 'front', label: '📷 Front View', path: r.front_image, type: 'img' });
+      }
+      if (r.has_back_image && r.back_image) {
+        tabs.push({ id: 'back', label: '🔄 Back View', path: r.back_image, type: 'img' });
+      }
+      if (r.photos && Array.isArray(r.photos)) {
+        r.photos.forEach(p => {
+          if (!tabs.some(t => t.path === p.path)) {
+            tabs.push({ id: p.type || 'photo', label: `🖼️ ${p.label || 'Photo'}`, path: p.path, type: 'img' });
+          }
+        });
+      }
+
+      currentModalTabs = tabs;
+
+      // Render Tabs Bar
+      modalTabs.innerHTML = "";
+      if (tabs.length > 1) {
+        modalTabs.style.display = "flex";
+        tabs.forEach(t => {
+          const btn = document.createElement("button");
+          btn.className = "modal-tab-btn";
+          btn.id = `tabBtn_${t.id}`;
+          btn.innerHTML = t.label;
+          btn.onclick = () => switchModalTab(t.id);
+          modalTabs.appendChild(btn);
+        });
       } else {
-        const img = document.createElement("img");
-        img.src = `/api/view_file?path=${encodeURIComponent(cleanPath)}`;
-        modalBody.appendChild(img);
+        modalTabs.style.display = "none";
+      }
+
+      // Determine Initial Tab
+      let chosenTabId = "";
+      if (initialCategory === 'report' && tabs.some(t => t.id === 'report')) {
+        chosenTabId = 'report';
+      } else if (initialCategory === 'photo') {
+        const photoTab = tabs.find(t => t.id === 'defect') || tabs.find(t => t.id === 'front') || tabs.find(t => t.type === 'img');
+        chosenTabId = photoTab ? photoTab.id : (tabs[0] ? tabs[0].id : "");
+      } else {
+        chosenTabId = tabs[0] ? tabs[0].id : "";
       }
 
       previewModal.classList.add("active");
+      if (chosenTabId) {
+        switchModalTab(chosenTabId);
+      } else {
+        document.getElementById("modalBody").innerHTML = `<div class="modal-error-card"><h4>No Visuals Found</h4><p>No report or image files are available for this record.</p></div>`;
+      }
     };
 
+    // Switch Tab in Modal
+    function switchModalTab(tabId) {
+      const tab = currentModalTabs.find(t => t.id === tabId);
+      if (!tab) return;
+      currentActiveTabId = tabId;
+      currentActiveFilePath = tab.path;
+
+      // Update active tab buttons
+      currentModalTabs.forEach(t => {
+        const el = document.getElementById(`tabBtn_${t.id}`);
+        if (el) el.classList.toggle("active", t.id === tabId);
+      });
+
+      renderActiveArtifact(tab);
+    }
+
+    // Render active artifact (PDF or Image with Zoom/Pan)
+    function renderActiveArtifact(tab) {
+      const modalBody = document.getElementById("modalBody");
+      modalBody.innerHTML = "";
+
+      const container = document.createElement("div");
+      container.className = "modal-viewer-container";
+
+      const spinner = document.createElement("div");
+      spinner.className = "modal-spinner";
+      spinner.innerHTML = `<div class="spinner-circle"></div><span>Loading ${tab.type === 'pdf' ? 'PDF report' : 'high-res visual'}...</span>`;
+      container.appendChild(spinner);
+
+      const cleanPath = tab.path.replace(/\\/g, '/');
+
+      if (tab.type === 'pdf') {
+        const iframe = document.createElement("iframe");
+        iframe.src = `/api/view_file?path=${encodeURIComponent(cleanPath)}`;
+        iframe.onload = () => {
+          spinner.style.display = "none";
+        };
+        iframe.onerror = () => {
+          spinner.style.display = "none";
+          renderModalErrorCard(container, cleanPath, "Browser was unable to preview the PDF document inline.");
+        };
+        container.appendChild(iframe);
+      } else {
+        currentZoom = 1.0;
+        const viewport = document.createElement("div");
+        viewport.className = "modal-img-viewport";
+
+        const img = document.createElement("img");
+        img.src = `/api/view_file?path=${encodeURIComponent(cleanPath)}`;
+        img.alt = tab.label;
+        img.onload = () => {
+          spinner.style.display = "none";
+        };
+        img.onerror = () => {
+          spinner.style.display = "none";
+          renderModalErrorCard(container, cleanPath, "Could not load the requested image file.");
+        };
+
+        // Interactive Zoom Toolbar
+        const toolbar = document.createElement("div");
+        toolbar.className = "img-toolbar";
+        toolbar.innerHTML = `
+          <button class="img-tool-btn" id="zoomOutBtn" title="Zoom Out (−)">−</button>
+          <span class="img-zoom-label" id="zoomLevelLabel">100%</span>
+          <button class="img-tool-btn" id="zoomInBtn" title="Zoom In (+)">+</button>
+          <button class="img-tool-btn" id="zoomFitBtn" title="Fit to Screen" style="margin-left:4px;">Fit</button>
+          <button class="img-tool-btn" id="zoom100Btn" title="Actual Size 100%">1:1</button>
+        `;
+
+        viewport.appendChild(img);
+        container.appendChild(viewport);
+        container.appendChild(toolbar);
+
+        const updateZoom = (z) => {
+          currentZoom = Math.max(0.25, Math.min(4.0, z));
+          img.style.transform = `scale(${currentZoom})`;
+          const label = toolbar.querySelector("#zoomLevelLabel");
+          if (label) label.textContent = `${Math.round(currentZoom * 100)}%`;
+        };
+
+        toolbar.querySelector("#zoomInBtn").onclick = (e) => { e.stopPropagation(); updateZoom(currentZoom + 0.25); };
+        toolbar.querySelector("#zoomOutBtn").onclick = (e) => { e.stopPropagation(); updateZoom(currentZoom - 0.25); };
+        toolbar.querySelector("#zoom100Btn").onclick = (e) => { e.stopPropagation(); updateZoom(1.0); };
+        toolbar.querySelector("#zoomFitBtn").onclick = (e) => { 
+          e.stopPropagation();
+          currentZoom = 1.0;
+          img.style.transform = "none";
+          const label = toolbar.querySelector("#zoomLevelLabel");
+          if (label) label.textContent = "Fit";
+        };
+
+        viewport.addEventListener("wheel", (e) => {
+          e.preventDefault();
+          const step = e.deltaY < 0 ? 0.15 : -0.15;
+          updateZoom(currentZoom + step);
+        }, { passive: false });
+      }
+
+      modalBody.appendChild(container);
+    }
+
+    // Helper: Render error card inside modal if visual fails
+    function renderModalErrorCard(container, path, detail) {
+      const card = document.createElement("div");
+      card.className = "modal-error-card";
+      card.innerHTML = `
+        <h4>⚠️ Visual Preview Unavailable</h4>
+        <p>${detail}</p>
+        <p style="font-family:monospace; font-size:11px;">${path}</p>
+        <div style="display:flex; gap:8px; margin-top:8px;">
+          <button class="modal-act-btn" onclick="openFileInDesktopViewer('${path.replace(/\\/g, '\\\\')}')">🖥️ Open in Windows Viewer</button>
+          <button class="modal-act-btn" onclick="openActiveFolder()">📁 Open Folder</button>
+        </div>
+      `;
+      container.appendChild(card);
+    }
+
+    // Open file in Windows Desktop Viewer
+    window.openFileInDesktopViewer = async function(filePath) {
+      if (!filePath) return;
+      try {
+        const res = await fetch(`/api/open_file?path=${encodeURIComponent(filePath)}`);
+        const d = await res.json();
+        if (d.status === "success") {
+          showToast("🖥️ Opened in default Windows Viewer");
+        } else {
+          showToast("❌ Could not open in viewer: " + (d.message || "Error"));
+        }
+      } catch (err) {
+        showToast("❌ Error communicating with system viewer");
+      }
+    };
+
+    // Helper: open active record's folder
+    function openActiveFolder() {
+      if (currentActiveRecord && currentActiveRecord.folder_path) {
+        openFolderInExplorer(currentActiveRecord.folder_path);
+      }
+    }
+
+    // Header Toolbar Buttons
+    document.getElementById("modalBtnWindows").onclick = () => {
+      if (currentActiveFilePath) {
+        openFileInDesktopViewer(currentActiveFilePath);
+      } else {
+        showToast("No active file to open");
+      }
+    };
+
+    document.getElementById("modalBtnTab").onclick = () => {
+      if (currentActiveFilePath) {
+        const cleanPath = currentActiveFilePath.replace(/\\/g, '/');
+        window.open(`/api/view_file?path=${encodeURIComponent(cleanPath)}`, '_blank');
+      } else {
+        showToast("No active file to open");
+      }
+    };
+
+    document.getElementById("modalBtnFolder").onclick = () => {
+      openActiveFolder();
+    };
+
+    // Backward compatible openFileInViewer
+    window.openFileInViewer = function(filePath, title) {
+      currentActiveFilePath = filePath;
+      const modalTitle = document.getElementById("modalTitle");
+      const modalSerialBadge = document.getElementById("modalSerialBadge");
+      const modalStatusBadge = document.getElementById("modalStatusBadge");
+      const modalMeta = document.getElementById("modalMeta");
+      const modalTabs = document.getElementById("modalTabs");
+
+      modalTitle.textContent = title || "Inspection Artifact Viewer";
+      modalSerialBadge.style.display = "none";
+      modalStatusBadge.innerHTML = "";
+      modalMeta.innerHTML = `<span style="font-family:monospace; font-size:11.5px;">${filePath}</span>`;
+      modalTabs.style.display = "none";
+
+      const ext = filePath.split('.').pop().toLowerCase();
+      const tab = {
+        id: 'file',
+        label: title || 'File',
+        path: filePath,
+        type: ext === 'pdf' ? 'pdf' : 'img'
+      };
+      currentModalTabs = [tab];
+      previewModal.classList.add("active");
+      renderActiveArtifact(tab);
+    };
+
+    // Modal Close handlers
     modalClose.addEventListener("click", () => {
       previewModal.classList.remove("active");
-      modalBody.innerHTML = "";
+      document.getElementById("modalBody").innerHTML = "";
+      currentActiveRecord = null;
+      currentActiveFilePath = "";
     });
+
     previewModal.addEventListener("click", (e) => {
       if (e.target === previewModal) {
         previewModal.classList.remove("active");
-        modalBody.innerHTML = "";
+        document.getElementById("modalBody").innerHTML = "";
+        currentActiveRecord = null;
+        currentActiveFilePath = "";
+      }
+    });
+
+    // Keyboard Shortcuts
+    document.addEventListener("keydown", (e) => {
+      if (previewModal.classList.contains("active")) {
+        if (e.key === "Escape") {
+          previewModal.classList.remove("active");
+          document.getElementById("modalBody").innerHTML = "";
+          currentActiveRecord = null;
+          currentActiveFilePath = "";
+        } else if (e.key === "ArrowRight" && currentModalTabs.length > 1) {
+          const curIdx = currentModalTabs.findIndex(t => t.id === currentActiveTabId);
+          const nextIdx = (curIdx + 1) % currentModalTabs.length;
+          switchModalTab(currentModalTabs[nextIdx].id);
+        } else if (e.key === "ArrowLeft" && currentModalTabs.length > 1) {
+          const curIdx = currentModalTabs.findIndex(t => t.id === currentActiveTabId);
+          const prevIdx = (curIdx - 1 + currentModalTabs.length) % currentModalTabs.length;
+          switchModalTab(currentModalTabs[prevIdx].id);
+        }
       }
     });
 
