@@ -3,27 +3,31 @@ setlocal enabledelayedexpansion
 title SHI Shift Analytics Dashboard
 color 0A
 
+:: Ensure working directory is set to this script's directory or the project folder
+cd /d "%~dp0"
+if not exist "app.py" (
+    if exist "%~dp0shi_deployment_fuellid\app.py" (
+        cd /d "%~dp0shi_deployment_fuellid"
+    )
+)
+
 echo ============================================================
-echo   SHI FUEL DOOR - SHIFT ANALYTICS DASHBOARD (PORT 5050)
+echo   SHI FUEL DOOR - SHIFT ANALYTICS DASHBOARD
 echo ============================================================
 echo.
 
-:: Check if dashboard is already running on port 5050
-netstat -ano | findstr :5050 | findstr LISTENING >nul 2>&1
+:: Check if the main Vision System is already running on Port 5000
+netstat -ano | findstr :5000 | findstr LISTENING >nul 2>&1
 if %errorLevel% equ 0 (
-    echo [INFO] Dashboard server is already active on Port 5050.
-    echo Opening Dashboard in your browser...
-    start http://localhost:5050
-    timeout /t 2 >nul
+    echo [INFO] Application is active on Port 5000.
+    echo Opening Shift Analytics Dashboard in your browser...
+    start http://localhost:5000/dashboard
+    ping 127.0.0.1 -n 3 >nul
     exit /b 0
 )
 
-echo [INFO] Starting Shift Analytics Dashboard server on Port 5050...
-py -3.12 --version >nul 2>&1
-if %errorLevel% equ 0 (
-    set PYTHON_CMD=py -3.12
-) else (
-    set PYTHON_CMD=python
-)
-
-%PYTHON_CMD% dashboard_app.py
+:: If not running on 5000, launch the main application which hosts both UI and Dashboard
+echo [INFO] System is not running yet.
+echo Launching Start_Application.bat...
+start Start_Application.bat
+exit /b 0

@@ -66,19 +66,38 @@ sys.stderr = StreamToLogger(logger, logging.ERROR)
 
 # Load Configuration
 CONFIG_PATH = "config.yaml"
-if os.path.exists(CONFIG_PATH):
-    with open(CONFIG_PATH, "r") as f:
-        APP_CONFIG = yaml.safe_load(f) or {}
-    logger.info("Loaded configuration from config.yaml")
-else:
-    APP_CONFIG = {}
-    logger.warning("config.yaml not found, using default values.")
+_CONFIG_LAST_MTIME = 0
+APP_CONFIG = {}
+OCR_CONF_THRESHOLD = 0.10
+OCR_FALLBACK_TIMEOUT = 3.5
+MODEL_PATH = "best_SHI_FUELDOOR.pt"
+RETENTION_DAYS = 30
+YOLO_CONF_THRESHOLD = 0.10
+CLASS_CONF_THRESHOLDS = {}
 
-# Def config defaults
-OCR_CONF_THRESHOLD = APP_CONFIG.get("ai", {}).get("ocr_confidence_threshold", 0.20)
-OCR_FALLBACK_TIMEOUT = APP_CONFIG.get("ai", {}).get("ocr_fallback_timeout", 3.5)
-MODEL_PATH = APP_CONFIG.get("ai", {}).get("model_path", "best_SHI_FUELDOOR.pt")
-RETENTION_DAYS = APP_CONFIG.get("storage", {}).get("retention_days", 30)
+def reload_config_if_modified():
+    """Reloads config.yaml dynamically if modified on disk without restarting the server."""
+    global APP_CONFIG, _CONFIG_LAST_MTIME, OCR_CONF_THRESHOLD, OCR_FALLBACK_TIMEOUT
+    global MODEL_PATH, RETENTION_DAYS, YOLO_CONF_THRESHOLD, CLASS_CONF_THRESHOLDS
+    try:
+        if os.path.exists(CONFIG_PATH):
+            mtime = os.path.getmtime(CONFIG_PATH)
+            if mtime != _CONFIG_LAST_MTIME:
+                with open(CONFIG_PATH, "r") as f:
+                    new_cfg = yaml.safe_load(f) or {}
+                APP_CONFIG = new_cfg
+                _CONFIG_LAST_MTIME = mtime
+                OCR_CONF_THRESHOLD = APP_CONFIG.get("ai", {}).get("ocr_confidence_threshold", 0.10)
+                OCR_FALLBACK_TIMEOUT = APP_CONFIG.get("ai", {}).get("ocr_fallback_timeout", 3.5)
+                MODEL_PATH = APP_CONFIG.get("ai", {}).get("model_path", "best_SHI_FUELDOOR.pt")
+                RETENTION_DAYS = APP_CONFIG.get("storage", {}).get("retention_days", 30)
+                YOLO_CONF_THRESHOLD = APP_CONFIG.get("ai", {}).get("default_yolo_confidence", 0.10)
+                CLASS_CONF_THRESHOLDS = APP_CONFIG.get("ai", {}).get("class_confidences", {})
+                logger.info(f"[Config] Loaded/updated configuration from {CONFIG_PATH} (mtime={mtime})")
+    except Exception as e:
+        logger.warning(f"[Config] Error reloading config: {e}")
+
+reload_config_if_modified()
 
 
 # --- IKapC SDK Integration ---
@@ -422,9 +441,7 @@ OCR_ENGINE = None
 # -------------------------------
 # Detection Thresholds (adjust here)
 # -------------------------------
-YOLO_CONF_THRESHOLD = APP_CONFIG.get("ai", {}).get("default_yolo_confidence", 0.15)
-CLASS_CONF_THRESHOLDS = APP_CONFIG.get("ai", {}).get("class_confidences", {})
-  # Minimum YOLO confidence (0.0 - 1.0). Lower = more detections, Higher = stricter.
+# Note: YOLO_CONF_THRESHOLD and CLASS_CONF_THRESHOLDS are dynamically managed by reload_config_if_modified()
 
 # Defect class names used for surface defect tracking, overlays, and reports
 SURFACE_DEFECT_CLASSES = [
@@ -1232,8 +1249,15 @@ def finalize_report_and_rename(c_data):
         # Read defects and verify holes
         with lock:
             defects = list(c_data.get("defects_detected", []))
-            if c_data.get("max_holes_detected", 0) < 3:
-                defects.append("missing_holes")
+            
+            # Hole verification check (toggleable via config: check_missing_holes; disabled per user request)
+            check_holes = APP_CONFIG.get("ai", {}).get("check_missing_holes", False)
+            if check_holes:
+                if c_data.get("max_holes_detected", 0) < 3:
+                    defects.append("missing_holes")
+            else:
+                if "missing_holes" in defects:
+                    defects.remove("missing_holes")
             if c_data.get("max_ring_bush_detected", 0) < 1 and c_data.get("max_rod_detected", 0) < 1:
                 defects.append("missing_ring_bush")
             if c_data.get("max_striker_detected", 0) < 2:
@@ -1291,19 +1315,27 @@ def finalize_report_and_rename(c_data):
         
         timestamp_str = datetime.now().strftime("%H%M%S")
         
-        if not serial or serial == "serial_missing":
+        if not serial or serial in ["serial_missing", "------"]:
             folder_name = f"serial_missing - {timestamp_str}"
+            if status == "FAIL":
+                folder_name = f"defect_{folder_name}"
         else:
             base_serial = str(serial).strip()
-            base_path = os.path.join(day_dir, base_serial)
-            if os.path.exists(base_path):
-                # Same serial exists! Use timestamp for folder, images, and report
-                folder_name = f"{base_serial}_{timestamp_str}"
-            else:
-                folder_name = base_serial
-                
-        if status == "FAIL":
-            folder_name = f"defect_{folder_name}"
+            # --- DEDUPLICATION: Delete any previous inspection folders for this serial today ---
+            try:
+                if os.path.exists(day_dir):
+                    for existing_item in os.listdir(day_dir):
+                        existing_path = os.path.join(day_dir, existing_item)
+                        if not os.path.isdir(existing_path):
+                            continue
+                        clean_existing = existing_item[7:] if existing_item.startswith("defect_") else existing_item
+                        if clean_existing == base_serial or clean_existing.startswith(f"{base_serial}_"):
+                            logger.info(f"[Deduplication] Removing previous inspection folder for serial {base_serial}: {existing_path}")
+                            shutil.rmtree(existing_path, ignore_errors=True)
+            except Exception as _dedup_err:
+                logger.warning(f"[Deduplication] Error removing existing inspection folders: {_dedup_err}")
+
+            folder_name = f"defect_{base_serial}" if status == "FAIL" else base_serial
 
         print(f"[Finalize Thread] Building report for Serial: {serial} in {temp_dir} with status: {status}")
 
@@ -1540,10 +1572,11 @@ class CameraStreamer:
         self.last_error_msg = ""
         
         if sdk_available:
-            # Finalize first to release any stale handles left by a previous crashed session
+            # Terminate first to release any stale handles left by a previous crashed session
             # (prevents error 1114141 = SYSTEM_ERROR on first connect attempt)
+            # NOTE: The correct function is ItkManTerminate (NOT ItkManFinalize which doesn't exist)
             try:
-                IKapC.ItkManFinalize()
+                IKapC.ItkManTerminate()
             except Exception:
                 pass
             res = IKapC.ItkManInitialize()
@@ -1559,24 +1592,28 @@ class CameraStreamer:
             return []
         
         # Load target serial from config to highlight the correct camera in UI
-        target_serial = APP_CONFIG.get("camera", {}).get("gige", {}).get("target_serial", "").strip()
+        target_serial = APP_CONFIG.get("camera", {}).get("gige", {}).get("target_serial", "").strip().lower()
         
         cams = []
         for i in range(numCameras):
             res, devInfo = IKapC.ItkManGetDeviceInfo(i)
             if res == IKapCDef.ITKSTATUS_OK:
-                model = devInfo.FullName.decode('utf-8', errors='ignore') if devInfo.FullName else "Unknown"
-                vendor = devInfo.VendorName.decode('utf-8', errors='ignore') if devInfo.VendorName else "I-TEK"
-                sn = devInfo.SerialNumber.decode('utf-8', errors='ignore') if hasattr(devInfo, 'SerialNumber') and devInfo.SerialNumber else "Unknown"
-                name = devInfo.UserDefinedName.decode('utf-8', errors='ignore') if devInfo.UserDefinedName else f"Cam{i}"
+                raw_model = devInfo.FullName.decode('utf-8', errors='ignore') if devInfo.FullName else "Unknown"
+                raw_vendor = devInfo.VendorName.decode('utf-8', errors='ignore') if devInfo.VendorName else "I-TEK"
+                raw_sn = devInfo.SerialNumber.decode('utf-8', errors='ignore') if hasattr(devInfo, 'SerialNumber') and devInfo.SerialNumber else "Unknown"
+                raw_name = devInfo.UserDefinedName.decode('utf-8', errors='ignore') if devInfo.UserDefinedName else f"Cam{i}"
+                model = raw_model.split('\x00')[0].strip()
+                vendor = raw_vendor.split('\x00')[0].strip()
+                sn = raw_sn.split('\x00')[0].strip()
+                name = raw_name.split('\x00')[0].strip()
                 ip = ""
                 try:
                     res_gige, gInfo = IKapC.ItkManGetGigEDeviceInfo(i)
                     if res_gige == IKapCDef.ITKSTATUS_OK and hasattr(gInfo, 'Ip') and gInfo.Ip:
-                        ip = gInfo.Ip.decode('utf-8', errors='ignore')
+                        ip = gInfo.Ip.decode('utf-8', errors='ignore').split('\x00')[0].strip()
                 except Exception:
                     pass
-                is_target = bool(target_serial and sn.strip() == target_serial)
+                is_target = bool(target_serial and (target_serial == sn.lower() or target_serial in sn.lower()))
                 cams.append({
                     "id": i,
                     "index": i,
@@ -1596,14 +1633,18 @@ class CameraStreamer:
         res, numCameras = IKapC.ItkManGetDeviceCount()
         if res != IKapCDef.ITKSTATUS_OK or numCameras == 0:
             return -1
-        serial = serial.strip()
+        serial_norm = serial.strip().lower()
         for i in range(numCameras):
             res, devInfo = IKapC.ItkManGetDeviceInfo(i)
             if res == IKapCDef.ITKSTATUS_OK:
-                sn = devInfo.SerialNumber.decode('utf-8', errors='ignore') if hasattr(devInfo, 'SerialNumber') and devInfo.SerialNumber else ""
-                if sn.strip() == serial:
-                    logger.info(f"[Camera] Serial '{serial}' matched at SDK index {i}")
+                raw_sn = devInfo.SerialNumber.decode('utf-8', errors='ignore') if hasattr(devInfo, 'SerialNumber') and devInfo.SerialNumber else ""
+                sn = raw_sn.split('\x00')[0].strip().lower()
+                if sn == serial_norm or serial_norm in sn or sn in serial_norm:
+                    logger.info(f"[Camera] Serial '{serial}' matched at SDK index {i} (detected sn: '{sn}')")
                     return i
+        if numCameras == 1:
+            logger.info(f"[Camera] Target serial '{serial}' not exact match, but exactly 1 camera detected. Using index 0.")
+            return 0
         logger.warning(f"[Camera] Serial '{serial}' NOT found among {numCameras} detected cameras.")
         return -1
 
@@ -1623,15 +1664,21 @@ class CameraStreamer:
         if target_serial:
             resolved_index = self.find_index_by_serial(target_serial)
             if resolved_index == -1:
-                self.last_error_msg = (
-                    f"Target camera (SN: {target_serial}) not found. "
-                    f"It may be held by another application in EXCLUSIVE mode. "
-                    f"Please close the other application and try again."
-                )
-                logger.error(f"[Camera] {self.last_error_msg}")
-                return False
-            logger.info(f"[Camera] Serial '{target_serial}' resolved to SDK index {resolved_index} (requested index was {index})")
-            index = resolved_index
+                res_cnt, num_cams = IKapC.ItkManGetDeviceCount()
+                if res_cnt == IKapCDef.ITKSTATUS_OK and num_cams == 1:
+                    logger.info(f"[Camera] Target serial not matched but single camera found. Falling back to index 0.")
+                    index = 0
+                else:
+                    self.last_error_msg = (
+                        f"Target camera (SN: {target_serial}) not found. "
+                        f"It may be held by another application in EXCLUSIVE mode. "
+                        f"Please close the other application and try again."
+                    )
+                    logger.error(f"[Camera] {self.last_error_msg}")
+                    return False
+            else:
+                logger.info(f"[Camera] Serial '{target_serial}' resolved to SDK index {resolved_index} (requested index was {index})")
+                index = resolved_index
 
         self.last_connected_cam_id = index
 
@@ -1682,8 +1729,9 @@ class CameraStreamer:
             if res == SYSTEM_ERROR_CODE:
                 logger.warning("[Camera] SDK SYSTEM_ERROR (1114141) — stale device handle detected. "
                                "Re-initializing SDK and retrying...")
+                # NOTE: Use ItkManTerminate (ItkManFinalize does NOT exist in the SDK)
                 try:
-                    IKapC.ItkManFinalize()
+                    IKapC.ItkManTerminate()
                     time.sleep(0.5)
                     IKapC.ItkManInitialize()
                     time.sleep(0.3)
@@ -2141,6 +2189,8 @@ def video_processing_loop():
     global video_cap, is_processing, stream_source, latest_raw_frame, latest_unenhanced_frame, latest_annotated_frame, current_detections
     consecutive_failures = 0
     _vloop_counter = 0
+    _last_reconnect_attempt = 0.0
+    _RECONNECT_INTERVAL = 5.0  # seconds between auto-reconnect attempts
     print("[VideoLoop] Thread started!")
 
     while True:
@@ -2151,9 +2201,28 @@ def video_processing_loop():
 
             if stream_source == "gige":
                 if not cam.is_connected:
-                    time.sleep(0.05)
+                    # ── Auto-reconnect watchdog ──────────────────────────────
+                    # If the camera dropped mid-session, attempt reconnect periodically
+                    # instead of spinning forever and leaving the panel stuck.
+                    now = time.time()
+                    if now - _last_reconnect_attempt >= _RECONNECT_INTERVAL:
+                        _last_reconnect_attempt = now
+                        logger.warning("[VideoLoop] Camera disconnected while stream_source='gige'. "
+                                       "Attempting auto-reconnect...")
+                        target_serial = APP_CONFIG.get("camera", {}).get("gige", {}).get("target_serial", "").strip()
+                        exposure    = APP_CONFIG.get("camera", {}).get("gige", {}).get("exposure", None)
+                        gain        = APP_CONFIG.get("camera", {}).get("gige", {}).get("gain", None)
+                        pixel_fmt   = APP_CONFIG.get("camera", {}).get("gige", {}).get("pixel_format", "BayerRG8")
+                        try:
+                            reconnected = cam.connect(0, exposure=exposure, gain=gain, pixel_format=pixel_fmt)
+                            if reconnected:
+                                logger.info("[VideoLoop] Auto-reconnect SUCCESS.")
+                            else:
+                                logger.warning(f"[VideoLoop] Auto-reconnect FAILED: {cam.last_error_msg}")
+                        except Exception as _rc_err:
+                            logger.warning(f"[VideoLoop] Auto-reconnect exception: {_rc_err}")
+                    time.sleep(0.5)
                     continue
-                # Watchdog removed as requested
                 frame = cam.get_frame()
                 if frame is None:
                     time.sleep(0.01)
@@ -2353,13 +2422,19 @@ def yolo_worker_loop():
             frame_resized = frame_to_process.copy()
             
         try:
+            # Check for live config updates (thresholds, options) from config.yaml
+            reload_config_if_modified()
+            
             # Determine minimum threshold for YOLO to return all relevant boxes
             min_thresh = min(CLASS_CONF_THRESHOLDS.values()) if CLASS_CONF_THRESHOLDS else YOLO_CONF_THRESHOLD
             run_thresh = min(float(min_thresh), float(YOLO_CONF_THRESHOLD))
             
+            # IMPORTANT: Do NOT hold the global lock during YOLO inference.
+            # CPU inference can take 2-4 seconds; holding the lock here would freeze
+            # every other thread (video loop, API responses, state machine) during that time.
+            # YOLO_MODEL is read-only after loading and safe to call without the lock.
             with torch.inference_mode():
-                with lock:
-                    results = YOLO_MODEL(frame_resized, verbose=False, conf=run_thresh, task='segment', imgsz=448, device=YOLO_DEVICE)
+                results = YOLO_MODEL(frame_resized, verbose=False, conf=run_thresh, task='segment', imgsz=448, device=YOLO_DEVICE)
             new_detections = []
             frame_holes = 0
             frame_ring_bush = 0
@@ -2394,6 +2469,11 @@ def yolo_worker_loop():
                     class_name = names[cls_id].lower()
                     conf = float(box.conf[0].cpu().item())
                     
+                    if class_name == "hand" or "hand" in class_name:
+                        hand_conf_limit = CLASS_CONF_THRESHOLDS.get("hand", 0.10)
+                        if conf >= hand_conf_limit:
+                            has_hand_detected = True
+                            
                     if conf < CLASS_CONF_THRESHOLDS.get(class_name, YOLO_CONF_THRESHOLD):
                         continue
                         
@@ -2411,7 +2491,7 @@ def yolo_worker_loop():
                             active_cycle_data["front_first_seen_time"] = time.time()
                     elif class_name in ["back", "circle_back", "cricle_back", "serial", "serial_area"]:
                         has_back_detected = True
-                    elif class_name == "hand":
+                    elif class_name == "hand" or "hand" in class_name:
                         has_hand_detected = True
                 
                 processed_boxes = {}
@@ -2444,6 +2524,24 @@ def yolo_worker_loop():
                     y2 = int(xyxy_resized[3] / scale)
                     x1, y1 = max(0, x1), max(0, y1)
                     x2, y2 = min(w_orig, x2), min(h_orig, y2)
+                    
+                    # Hand class detection: immediate registration, no overlap formula, no filters
+                    if class_name == "hand" or "hand" in class_name:
+                        has_hand_detected = True
+                        new_detections.append({
+                            "box": [x1, y1, x2, y2],
+                            "class_name": "hand",
+                            "mask": mask_polygon,
+                            "conf": conf
+                        })
+                        cv2.rectangle(annotated_frame, (x1, y1), (x2, y2), (0, 140, 255), 3)
+                        label = f"HAND: {int(conf * 100)}%"
+                        (text_w, text_h), _ = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.8, 2)
+                        text_x = x1
+                        text_y = max(y1 - 10, text_h + 10)
+                        cv2.rectangle(annotated_frame, (text_x, text_y - text_h - 4), (text_x + text_w, text_y + 2), (0, 140, 255), -1)
+                        cv2.putText(annotated_frame, label, (text_x, text_y), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 255, 255), 2)
+                        continue
                     
                     # --- Custom Duplicate Filter (IoU > 0.5) ---
                     # Prevents double-counting if YOLO predicts two overlapping boxes for the same class
@@ -2547,7 +2645,6 @@ def yolo_worker_loop():
                     
                     if class_name in SURFACE_DEFECT_CLASSES or class_name in ["dent", "buldge", "bulge", "line_mark", "linemark", "line-mark", "damage", "hole_spec_error", "defect"]:
                         frame_defects.append(class_name)
-                        active_cycle_data["defects_detected"].add(class_name)
                         
                     if class_name == "hole" or class_name == "holes":
                         if has_back_detected:
@@ -2771,10 +2868,16 @@ def yolo_worker_loop():
 
             with lock:
                 current_detections = new_detections
-                current_cycle["hand_detected"] = has_hand_detected
+                
+                # Smooth hold time (0.4s) to prevent flicker between frames
+                now_t = time.time()
+                if has_hand_detected:
+                    active_cycle_data["hand_detected_until"] = now_t + 0.4
+                is_hand_warning = has_hand_detected or (now_t < active_cycle_data.get("hand_detected_until", 0))
 
-                # Hand warning is active whenever hand is detected anywhere in frame during frame capture states
-                hand_warning = has_hand_detected and (state in ["WAITING_FRONT", "WAITING_BACK"])
+                # Hand warning is active WHENEVER hand is detected anywhere in frame (no overlap formula, no state restrictions)
+                hand_warning = bool(is_hand_warning)
+                current_cycle["hand_detected"] = hand_warning
                 current_cycle["hand_warning"] = hand_warning
                 needs_reset = False
                 
@@ -2804,7 +2907,7 @@ def yolo_worker_loop():
                         prev_cx, prev_cy = active_cycle_data.get("front_box_center") or (cx, cy)
                         dist = ((cx - prev_cx)**2 + (cy - prev_cy)**2)**0.5
                         
-                        if dist > 10 or has_hand_detected:
+                        if dist > 10 or hand_warning:
                             active_cycle_data["front_frames_count"] = 0
                             active_cycle_data["front_first_seen_time"] = None
                             
@@ -2818,7 +2921,7 @@ def yolo_worker_loop():
                         
                         active_cycle_data["front_missing_frames"] = 0
                         
-                        if not has_hand_detected and time_stable >= 0.5:
+                        if not hand_warning and time_stable >= 0.5:
                             # --- Capture front image (file I/O done OUTSIDE lock below) ---
                             _front_capture_frame   = frame_to_process.copy()
                             _front_capture_folder  = active_cycle_data["temp_folder"]
@@ -2832,10 +2935,11 @@ def yolo_worker_loop():
                             
                             active_cycle_data["flash_end_time"] = time.time() + 2.0
                             active_cycle_data["flash_message"] = "FRONT OK"
-                                
                             active_cycle_data["state"] = "WAITING_LOCK_STRIKER"
+                            tracker_state = active_cycle_data.get("defect_tracker", {})
                             for d in frame_defects:
-                                active_cycle_data["defects_detected"].add(d)
+                                if tracker_state.get(d, {}).get("status") == "CONFIRMED" or active_cycle_data.get("defect_times", {}).get(d, 0.0) >= 1.0:
+                                    active_cycle_data["defects_detected"].add(d)
                             # Immediate missing checks removed to allow 1.5s detection time before flashing NG
                             if active_cycle_data.get("defects_detected"):
                                 # current_cycle["instruction"] = "NG"  # Removed per user request to keep operator instructions
@@ -2890,6 +2994,16 @@ def yolo_worker_loop():
                         # current_cycle["instruction"] = "NG"  # Removed per user request to keep operator instructions
                         current_cycle["instruction_color"] = "red"
                         current_cycle["result"] = "NG"
+
+                    # ── Hard stuck-state watchdog: reset cycle if WAITING_BACK for > 60s ──
+                    # This catches cases where the back panel is never shown and the state
+                    # hangs indefinitely (e.g. operator removed part without flipping).
+                    _waiting_back_entered = active_cycle_data.get("waiting_back_entered_time")
+                    if _waiting_back_entered is None:
+                        active_cycle_data["waiting_back_entered_time"] = time.time()
+                    elif time.time() - _waiting_back_entered > 60.0:
+                        logger.warning("[State Watchdog] Stuck in WAITING_BACK for >60s — auto-resetting cycle.")
+                        needs_reset = True
                     
                     is_back_visible = (back_box is not None) or has_serial_detected
                     
@@ -2929,7 +3043,7 @@ def yolo_worker_loop():
                             prev_cx, prev_cy = active_cycle_data.get("back_box_center") or (cx, cy)
                             dist = ((cx - prev_cx)**2 + (cy - prev_cy)**2)**0.5
                             
-                            if dist > 50 or has_hand_detected:
+                            if dist > 50 or hand_warning:
                                 active_cycle_data["back_frames_count"] = 0
                                 active_cycle_data["back_first_seen_time"] = None
                                 
@@ -2938,6 +3052,13 @@ def yolo_worker_loop():
                             
                             if active_cycle_data.get("back_first_seen_time") is None:
                                 active_cycle_data["back_first_seen_time"] = time.time()
+                                # ── Also start OCR timeout clock as soon as back is first seen ──
+                                # Previously ocr_start_time was only set when a serial/serial_area
+                                # ROI was detected; if those classes are missing the timeout never
+                                # fired and WAITING_BACK got stuck forever. Now we start the clock
+                                # immediately so the 8-second fallback always triggers.
+                                if active_cycle_data.get("ocr_start_time") is None:
+                                    active_cycle_data["ocr_start_time"] = time.time()
                                 
                             time_stable = time.time() - active_cycle_data["back_first_seen_time"]
                             
@@ -2945,7 +3066,7 @@ def yolo_worker_loop():
                             ocr_start = active_cycle_data.get("ocr_start_time")
                             ocr_timeout = (ocr_start is not None) and (time.time() - ocr_start > 8.0)
                             
-                            if not has_hand_detected and (ocr_done or ocr_timeout) and time_stable >= 0.5:
+                            if not hand_warning and (ocr_done or ocr_timeout) and time_stable >= 0.5:
                                 # --- Capture back image (file I/O done OUTSIDE lock below) ---
                                 _do_back_write = True
                                 _back_capture_frame = frame_to_process.copy()
@@ -2955,8 +3076,10 @@ def yolo_worker_loop():
                                 _back_finalize_data = active_cycle_data  # reference for check_and_finalize_cycle
 
                                 current_cycle["step4_status"] = "OK"
+                                tracker_state = active_cycle_data.get("defect_tracker", {})
                                 for d in frame_defects:
-                                    active_cycle_data["defects_detected"].add(d)
+                                    if tracker_state.get(d, {}).get("status") == "CONFIRMED" or active_cycle_data.get("defect_times", {}).get(d, 0.0) >= 1.0:
+                                        active_cycle_data["defects_detected"].add(d)
 
                                 # Go straight to finalization (called outside lock, after file write)
                                 active_cycle_data["state"] = "WAITING_REMOVE"
@@ -3068,13 +3191,14 @@ def yolo_worker_loop():
                         if has_back_detected:
                             active_cycle_data["back_visible_time"] = active_cycle_data.get("back_visible_time", 0.0) + dt
                             if active_cycle_data["back_visible_time"] >= 1.5:
-                                if active_cycle_data.get("max_holes_detected", 0) < 3:
+                                check_holes = APP_CONFIG.get("ai", {}).get("check_missing_holes", False)
+                                if check_holes and active_cycle_data.get("max_holes_detected", 0) < 3:
                                     active_cycle_data["defects_detected"].add("missing_holes")
                                 if active_cycle_data.get("max_back_hook_detected", 0) < 2:
                                     active_cycle_data["defects_detected"].add("missing_back_hook")
                         
                         # Dynamically clear missing defects if they are eventually found during the cycle
-                        if active_cycle_data.get("max_holes_detected", 0) >= 3:
+                        if active_cycle_data.get("max_holes_detected", 0) >= 3 or not APP_CONFIG.get("ai", {}).get("check_missing_holes", False):
                             active_cycle_data["defects_detected"].discard("missing_holes")
                         if active_cycle_data.get("max_ring_bush_detected", 0) >= 1:
                             active_cycle_data["defects_detected"].discard("missing_ring_bush")
@@ -3087,18 +3211,18 @@ def yolo_worker_loop():
 
                     current_cycle["defects"] = list(active_cycle_data["defects_detected"])
                     
-                    if state == "WAITING_REMOVE":
+                    if hand_warning:
+                        current_cycle["instruction_color"] = "yellow"
+                        current_cycle["instruction"] = "TAKE HAND AWAY FROM THE PART"
+                        current_cycle["status"] = "Hand Detected - Please Remove Hand"
+                    elif state == "WAITING_REMOVE":
                         # User request: At the last sequence until they take the part out, flash OK only, don't flash NG
                         if active_cycle_data.get("remove_frames_count", 0) == 0:
                             current_cycle["instruction_color"] = "green"
                             current_cycle["instruction"] = "REMOVE THE PLATE"
                             current_cycle["result"] = "OK"
                     else:
-                        if hand_warning:
-                            current_cycle["instruction_color"] = "yellow"
-                            current_cycle["instruction"] = "TAKE HAND AWAY FROM THE PART"
-                            current_cycle["status"] = "Hand Detected - Please Remove Hand"
-                        elif active_cycle_data["defects_detected"]:
+                        if active_cycle_data["defects_detected"]:
                             current_cycle["instruction_color"] = "red"
                             current_cycle["result"] = "NG"
                             current_cycle["status"] = "NG - DEFECT DETECTED"
@@ -3383,7 +3507,7 @@ def force_connect_gige():
     # 4. Re-init SDK to flush stale handles
     try:
         import IKapC as _ikc
-        _ikc.ItkManFinalize()
+        _ikc.ItkManTerminate()
         _t.sleep(0.4)
         _ikc.ItkManInitialize()
         _t.sleep(0.3)
@@ -3463,14 +3587,31 @@ def update_gige_features():
 
 @app.route('/camera_status', methods=['GET'])
 def camera_status():
-    global cam
+    global cam, stream_source, is_processing
+    # Consider the camera "connected" if either the SDK reports connected,
+    # OR we are actively streaming from 'gige' source (handles brief is_connected glitches)
+    actually_streaming = cam.is_connected or (stream_source == "gige" and is_processing)
     return jsonify({
-        "connected": cam.is_connected,
-        "status": "Connected" if cam.is_connected else "Disconnected",
+        "connected": actually_streaming,
+        "sdk_connected": cam.is_connected,
+        "status": "Connected" if actually_streaming else "Disconnected",
         "fps": 30,
         "resolution": "High-Res",
-        "model": "IKap GigE Camera" if cam.is_connected else ""
+        "model": "IKap GigE Camera" if actually_streaming else ""
     })
+
+@app.route('/reset_cycle', methods=['POST', 'GET'])
+def reset_cycle():
+    """Emergency: force-reset the inspection cycle state machine.
+    Useful when the panel is stuck in WAITING_BACK or any other intermediate state.
+    Safe to call at any time — it just resets the cycle counter and state variables."""
+    try:
+        state_before = active_cycle_data.get("state", "UNKNOWN")
+        reset_cycle_state()
+        logger.info(f"[Reset Cycle] Manual reset triggered via /reset_cycle (was in state: {state_before})")
+        return jsonify({"status": "success", "message": f"Cycle reset. Was in: {state_before}", "new_state": "WAITING_FRONT"})
+    except Exception as e:
+        return jsonify({"status": "error", "message": str(e)}), 500
 
 @app.route('/camera_diag', methods=['GET'])
 def camera_diag():
@@ -3503,10 +3644,14 @@ def status():
 @app.route('/ui_config', methods=['GET'])
 def ui_config():
     """Serve UI display settings from config.yaml to the frontend."""
+    reload_config_if_modified()
     ui_cfg = APP_CONFIG.get("ui", {})
+    ai_cfg = APP_CONFIG.get("ai", {})
     return jsonify({
         "side_flash_width_percent": ui_cfg.get("side_flash_width_percent", 12),
         "side_flash_max_width_px":  ui_cfg.get("side_flash_max_width_px", 120),
+        "check_missing_holes":      ai_cfg.get("check_missing_holes", False),
+        "hide_holes_in_count_ui":   ai_cfg.get("hide_holes_in_count_ui", True)
     })
 
 @app.route('/trigger_cleanup', methods=['POST', 'GET'])
@@ -3571,8 +3716,20 @@ def cleanup_status():
 # -------------------------------
 @app.route('/dashboard')
 def dashboard():
-    """Redirects to the standalone Shift Analytics Dashboard process running on Port 5050."""
-    return redirect("http://localhost:5050")
+    """Renders the Shift Analytics Dashboard directly on Port 5000."""
+    return send_file("dashboard.html")
+
+@app.route('/logo_shi.webp')
+def shi_logo():
+    if os.path.exists("logo_shi.webp"):
+        return send_file("logo_shi.webp")
+    return "", 404
+
+@app.route('/sungwoo_logo.webp')
+def logo_sungwoo():
+    if os.path.exists("sungwoo_logo.webp"):
+        return send_file("sungwoo_logo.webp")
+    return "", 404
 
 @app.route('/api/dates')
 def get_dates():
@@ -3782,7 +3939,15 @@ def get_records():
         except Exception:
             d_list = []
             
-        records.append({
+        file_paths = resolve_record_paths(
+            folder_path=r["folder_path"],
+            report_path=r["report_path"] or "",
+            defect_image=r["defect_image"] or "",
+            front_image=r["front_image"] or "",
+            back_image=r["back_image"] or ""
+        )
+            
+        record_data = {
             "id": r["id"],
             "timestamp": r["timestamp"],
             "time_str": r["time_str"],
@@ -3791,10 +3956,10 @@ def get_records():
             "status": r["status"],
             "defects": d_list,
             "confidence": r["confidence"],
-            "has_report": bool(r["report_path"] and os.path.exists(r["report_path"])),
-            "has_defect_image": bool(r["defect_image"] and os.path.exists(r["defect_image"])),
             "folder_path": r["folder_path"]
-        })
+        }
+        record_data.update(file_paths)
+        records.append(record_data)
         
     return jsonify({
         "total": total_count,
@@ -3803,31 +3968,156 @@ def get_records():
         "records": records
     })
 
+def resolve_record_paths(folder_path, report_path="", defect_image="", front_image="", back_image=""):
+    """
+    Robustly resolves and verifies physical paths for reports and images.
+    If a stored path is missing or does not exist on disk, scans the folder
+    to locate the actual report PDF and captured inspection images.
+    Returns normalized forward-slash relative web paths.
+    """
+    res = {
+        "report_path": "",
+        "has_report": False,
+        "defect_image": "",
+        "has_defect_image": False,
+        "front_image": "",
+        "has_front_image": False,
+        "back_image": "",
+        "has_back_image": False,
+        "photo_path": "",
+        "has_photo": False,
+        "photos": []
+    }
+    
+    # 1. Verify or find report_path
+    if report_path and os.path.exists(report_path):
+        res["report_path"] = report_path.replace("\\", "/")
+        res["has_report"] = True
+    elif folder_path and os.path.isdir(folder_path):
+        try:
+            files = os.listdir(folder_path)
+            pdfs = [f for f in files if f.lower().endswith(".pdf")]
+            if pdfs:
+                res["report_path"] = os.path.join(folder_path, pdfs[0]).replace("\\", "/")
+                res["has_report"] = True
+        except Exception:
+            pass
+
+    # 2. Verify or find defect_image
+    if defect_image and os.path.exists(defect_image):
+        res["defect_image"] = defect_image.replace("\\", "/")
+        res["has_defect_image"] = True
+    elif folder_path and os.path.isdir(folder_path):
+        try:
+            files = os.listdir(folder_path)
+            dis = [f for f in files if "defect" in f.lower() and f.lower().endswith((".jpg", ".jpeg", ".png"))]
+            if dis:
+                res["defect_image"] = os.path.join(folder_path, dis[0]).replace("\\", "/")
+                res["has_defect_image"] = True
+        except Exception:
+            pass
+
+    # 3. Verify or find front_image
+    if front_image and os.path.exists(front_image):
+        res["front_image"] = front_image.replace("\\", "/")
+        res["has_front_image"] = True
+    elif folder_path and os.path.isdir(folder_path):
+        try:
+            files = os.listdir(folder_path)
+            fis = [f for f in files if "front" in f.lower() and f.lower().endswith((".jpg", ".jpeg", ".png"))]
+            if fis:
+                res["front_image"] = os.path.join(folder_path, fis[0]).replace("\\", "/")
+                res["has_front_image"] = True
+        except Exception:
+            pass
+
+    # 4. Verify or find back_image
+    if back_image and os.path.exists(back_image):
+        res["back_image"] = back_image.replace("\\", "/")
+        res["has_back_image"] = True
+    elif folder_path and os.path.isdir(folder_path):
+        try:
+            files = os.listdir(folder_path)
+            bis = [f for f in files if "back" in f.lower() and f.lower().endswith((".jpg", ".jpeg", ".png"))]
+            if bis:
+                res["back_image"] = os.path.join(folder_path, bis[0]).replace("\\", "/")
+                res["has_back_image"] = True
+        except Exception:
+            pass
+
+    # 5. Build photo list and determine primary photo
+    photos = []
+    if res["has_defect_image"]:
+        photos.append({"type": "defect", "label": "Defect View", "path": res["defect_image"]})
+    if res["has_front_image"]:
+        photos.append({"type": "front", "label": "Front View", "path": res["front_image"]})
+    if res["has_back_image"]:
+        photos.append({"type": "back", "label": "Back View", "path": res["back_image"]})
+        
+    # If no defect/front/back tagged image was found but other images exist in folder:
+    if not photos and folder_path and os.path.isdir(folder_path):
+        try:
+            files = os.listdir(folder_path)
+            other_imgs = [f for f in files if f.lower().endswith((".jpg", ".jpeg", ".png"))]
+            for img in other_imgs:
+                p = os.path.join(folder_path, img).replace("\\", "/")
+                photos.append({"type": "other", "label": img, "path": p})
+        except Exception:
+            pass
+
+    res["photos"] = photos
+    if photos:
+        res["has_photo"] = True
+        res["photo_path"] = photos[0]["path"]
+        
+    return res
+
 @app.route('/api/view_file')
 def view_file():
     """Safely serves PDF reports or inspection images from lid_data."""
     file_path = request.args.get("path")
-    if not file_path or not os.path.exists(file_path):
-        return "File not found", 404
+    if not file_path:
+        return "File path missing", 400
         
-    abs_path = os.path.abspath(file_path)
+    clean_path = os.path.normpath(file_path.strip().replace("/", os.sep))
+    abs_path = os.path.abspath(clean_path)
     base_dir = os.path.abspath("lid_data")
-    if not abs_path.startswith(base_dir):
+    
+    # Secure normalized case-insensitive directory check for Windows
+    if not os.path.normcase(abs_path).startswith(os.path.normcase(base_dir)):
         return "Access denied", 403
         
-    return send_file(abs_path)
+    if not os.path.exists(abs_path) or not os.path.isfile(abs_path):
+        return "File not found", 404
+        
+    ext = os.path.splitext(abs_path)[1].lower()
+    mimetype = "application/pdf" if ext == ".pdf" else (
+        "image/jpeg" if ext in [".jpg", ".jpeg"] else (
+            "image/png" if ext == ".png" else None
+        )
+    )
+    
+    from flask import make_response
+    response = make_response(send_file(abs_path, mimetype=mimetype))
+    response.headers["Content-Disposition"] = f"inline; filename=\"{os.path.basename(abs_path)}\""
+    response.headers["X-Content-Type-Options"] = "nosniff"
+    return response
 
 @app.route('/api/open_folder', methods=['POST', 'GET'])
 def open_folder():
     """Opens the inspection folder directly in Windows File Explorer."""
     folder_path = request.args.get("path")
-    if not folder_path or not os.path.exists(folder_path):
-        return jsonify({"status": "error", "message": "Folder not found"}), 404
+    if not folder_path:
+        return jsonify({"status": "error", "message": "Folder path missing"}), 400
         
-    abs_path = os.path.abspath(folder_path)
+    clean_path = os.path.normpath(folder_path.strip().replace("/", os.sep))
+    abs_path = os.path.abspath(clean_path)
     base_dir = os.path.abspath("lid_data")
-    if not abs_path.startswith(base_dir):
+    if not os.path.normcase(abs_path).startswith(os.path.normcase(base_dir)):
         return jsonify({"status": "error", "message": "Access denied"}), 403
+        
+    if not os.path.exists(abs_path):
+        return jsonify({"status": "error", "message": "Folder not found"}), 404
         
     try:
         if sys.platform == "win32" and hasattr(os, "startfile"):
@@ -3843,20 +4133,24 @@ def open_folder():
 def open_file():
     """Opens a PDF report or image directly in the default Windows desktop viewer."""
     file_path = request.args.get("path")
-    if not file_path or not os.path.exists(file_path):
-        return jsonify({"status": "error", "message": "File not found"}), 404
+    if not file_path:
+        return jsonify({"status": "error", "message": "File path missing"}), 400
         
-    abs_path = os.path.abspath(file_path)
+    clean_path = os.path.normpath(file_path.strip().replace("/", os.sep))
+    abs_path = os.path.abspath(clean_path)
     base_dir = os.path.abspath("lid_data")
-    if not abs_path.startswith(base_dir):
+    if not os.path.normcase(abs_path).startswith(os.path.normcase(base_dir)):
         return jsonify({"status": "error", "message": "Access denied"}), 403
+        
+    if not os.path.exists(abs_path):
+        return jsonify({"status": "error", "message": "File not found"}), 404
         
     try:
         if sys.platform == "win32" and hasattr(os, "startfile"):
             os.startfile(abs_path)
         else:
             import subprocess
-            subprocess.Popen(["start", abs_path], shell=True)
+            subprocess.Popen(["start", "", abs_path], shell=True)
         return jsonify({"status": "success", "message": "File opened in system viewer"})
     except Exception as e:
         return jsonify({"status": "error", "message": str(e)}), 500
@@ -3951,7 +4245,7 @@ if __name__ == '__main__':
         ocr_log = open("logs/ocr_server.log", "w", buffering=1)
         # Try specific Python 3.12 launcher first (runs OCR server on Python 3.12)
         try:
-            py312_path = subprocess.check_output(["py", "-3.12", "-c", "import sys; print(sys.executable)"]).decode().strip()
+            py312_path = subprocess.check_output(["py", "-3.12", "-c", "import sys; print(sys.executable)"], creationflags=0x08000000).decode().strip()
             ocr_process = subprocess.Popen([py312_path, "paddleocr_server.py", "--parent-pid", str(os.getpid())], stdout=ocr_log, stderr=subprocess.STDOUT, env=dict(os.environ, PYTHONUNBUFFERED="1"), creationflags=0x08000000)
         except Exception:
             ocr_process = subprocess.Popen([sys.executable, "paddleocr_server.py", "--parent-pid", str(os.getpid())], stdout=ocr_log, stderr=subprocess.STDOUT, env=dict(os.environ, PYTHONUNBUFFERED="1"), creationflags=0x08000000)
@@ -3972,32 +4266,29 @@ if __name__ == '__main__':
     except Exception as e:
         logger.error(f"[System] Failed to start PaddleOCR server: {e}")
     
-    logger.info("[System] Automatically starting Shift Analytics Dashboard (Port 5050)...")
-    try:
-        dash_log = open("logs/dashboard_server.log", "w", buffering=1)
-        try:
-            py312_path = subprocess.check_output(["py", "-3.12", "-c", "import sys; print(sys.executable)"]).decode().strip()
-            dash_cmd = [py312_path, "dashboard_app.py", "--no-browser"]
-        except Exception:
-            dash_cmd = [sys.executable, "dashboard_app.py", "--no-browser"]
-        dash_process = subprocess.Popen(dash_cmd, stdout=dash_log, stderr=subprocess.STDOUT, env=dict(os.environ, PYTHONUNBUFFERED="1"), creationflags=0x08000000)
-        
-        def cleanup_dash():
-            logger.info("[System] Shutting down Dashboard Server...")
-            try:
-                dash_process.terminate()
-                dash_process.wait(timeout=2)
-                dash_log.close()
-            except Exception:
-                try:
-                    dash_process.kill()
-                except:
-                    pass
-                
-        atexit.register(cleanup_dash)
-    except Exception as e:
-        logger.error(f"[System] Failed to start Dashboard server: {e}")
+    logger.info("[System] Shift Analytics Dashboard is natively integrated at http://localhost:5000/dashboard")
     
+    # Auto-connect GigE camera if target_serial is configured in config.yaml
+    target_serial = APP_CONFIG.get("camera", {}).get("gige", {}).get("target_serial", "").strip()
+    if target_serial:
+        logger.info(f"[Startup] Auto-connecting configured GigE camera SN: {target_serial}...")
+        exposure = APP_CONFIG.get("camera", {}).get("gige", {}).get("exposure", None)
+        gain = APP_CONFIG.get("camera", {}).get("gige", {}).get("gain", None)
+        pixel_fmt = APP_CONFIG.get("camera", {}).get("gige", {}).get("pixel_format", "BayerRG8")
+        try:
+            if cam.connect(0, exposure=exposure, gain=gain, pixel_format=pixel_fmt):
+                stream_source = "gige"
+                is_processing = True
+                logger.info(f"[Startup] Camera SN: {target_serial} connected on startup!")
+            else:
+                logger.warning(f"[Startup] Initial connect failed: {cam.last_error_msg}. Enabling background auto-reconnect watchdog.")
+                stream_source = "gige"
+                is_processing = True
+        except Exception as startup_err:
+            logger.warning(f"[Startup] Camera connect exception: {startup_err}")
+            stream_source = "gige"
+            is_processing = True
+
     # Start the video processing background thread
     processing_thread = threading.Thread(target=video_processing_loop, daemon=True)
     processing_thread.start()

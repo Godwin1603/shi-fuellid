@@ -15,12 +15,12 @@ ai:
     serial: 0.10
     serial_area: 0.10
     line_mark: 0.25
-    hole: 0.40
+    hole: 0.25
     hole_spec_error: 0.35    # Hole specification error defect
     back_hook: 0.40
     back_hook_bend: 0.35     # NEW in V1.2: Back hook bend defect
     lock_striker: 0.20
-    lock_striker_bend: 0.35  # NEW in V1.2: Lock striker bend defect
+    lock_striker_bend: 0.90 # NEW in V1.2: Lock striker bend defect
     ring_bush: 0.30
     striker: 0.35
     striker_bend: 0.35       # NEW in V1.2: Striker bend defect
@@ -28,12 +28,15 @@ ai:
     dent: 0.25                # Surface dent defect
     defect: 0.25              # NEW in V1.2: General defect
     frame_damage: 0.30        # NEW in V1.2: Frame damage defect
-    hand: 0.40                # Hand detection
+    hand: 0.10                # Hand detection (set to 0.20 for sensitive detection)
   # Minimum bounding box area (in pixels) for a defect to be considered valid to prevent false positives quickly
   min_defect_area: 50
   # Default YOLO confidence threshold if a class is not specified above
   default_yolo_confidence: 0.10
   
+  # Hole inspection settings (Set check_missing_holes to true to re-enable NG when hole count < 3)
+  check_missing_holes: false     # Flag NG if holes count not satisfied (disabled per user request)
+  hide_holes_in_count_ui: true   # Hide Holes row from UI counts panel (set to false to show)
 
   # Post-processing thresholds to filter out empty blue foam trays
   part_presence:
