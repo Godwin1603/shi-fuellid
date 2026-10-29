@@ -443,12 +443,73 @@ OCR_ENGINE = None
 # -------------------------------
 # Note: YOLO_CONF_THRESHOLD and CLASS_CONF_THRESHOLDS are dynamically managed by reload_config_if_modified()
 
+# Stage-specific class mappings and defect definitions
+FRONT_CLASSES = {"front", "striker", "ring_bush", "ringbush", "line_mark"}
+FRONT_DEFECT_CLASSES = {"striker_bend", "dent", "buldge", "bulge", "defect", "damage"}
+
+LOCK_STRIKER_CLASSES = {"lock_striker"}
+LOCK_STRIKER_DEFECT_CLASSES = {"lock_striker_bend"}
+
+BACK_CLASSES = {"back", "back_hook", "hole", "holes", "serial", "serial_area"}
+BACK_DEFECT_CLASSES = {"frame_damage", "back_hook_bend", "hole_spec_error"}
+
 # Defect class names used for surface defect tracking, overlays, and reports
-SURFACE_DEFECT_CLASSES = [
-    "dent", "buldge", "bulge", "line_mark", "linemark", "line-mark",
-    "damage", "frame_damage", "hole_spec_error", "back_hook_bend",
-    "lock_striker_bend", "striker_bend", "defect"
-]
+SURFACE_DEFECT_CLASSES = list(FRONT_DEFECT_CLASSES | LOCK_STRIKER_DEFECT_CLASSES | BACK_DEFECT_CLASSES)
+
+def create_missing_defect_image(temp_dir, defects, front_path, back_path, lock_striker_path=None):
+    """
+    Generates an annotated defect image for missing components or missing serial,
+    drawing on the actual captured panel instead of taking an empty camera frame.
+    """
+    target_img_path = None
+    banner_text = "NG: DEFECT DETECTED"
+    
+    # Priority 1: Serial missing -> use Back panel
+    if "serial_missing" in defects:
+        target_img_path = back_path
+        banner_text = "NG: SERIAL NUMBER MISSING / UNREADABLE"
+    # Priority 2: Missing front parts -> use Front panel
+    elif any(d in ["missing_ring_bush", "missing_striker"] for d in defects):
+        target_img_path = front_path
+        missing_names = [d.replace("missing_", "").replace("_", " ").upper() for d in defects if d in ["missing_ring_bush", "missing_striker"]]
+        banner_text = f"NG: MISSING {', '.join(missing_names)}"
+    # Priority 3: Missing back parts -> use Back panel
+    elif any(d in ["missing_back_hook", "missing_holes"] for d in defects):
+        target_img_path = back_path
+        missing_names = [d.replace("missing_", "").replace("_", " ").upper() for d in defects if d in ["missing_back_hook", "missing_holes"]]
+        banner_text = f"NG: MISSING {', '.join(missing_names)}"
+    # Priority 4: Missing lock striker -> use Lock Striker or Front panel
+    elif "missing_lock_striker" in defects:
+        target_img_path = lock_striker_path or front_path
+        banner_text = "NG: MISSING LOCK STRIKER"
+    else:
+        target_img_path = back_path or front_path
+        
+    out_path = os.path.join(temp_dir, "defect_frame.jpg") if temp_dir else None
+    
+    if target_img_path and os.path.exists(target_img_path) and out_path:
+        try:
+            base_img = cv2.imread(target_img_path)
+            if base_img is not None:
+                h, w = base_img.shape[:2]
+                banner_h = max(60, int(h * 0.08))
+                overlay = base_img.copy()
+                cv2.rectangle(overlay, (0, 0), (w, banner_h), (0, 0, 180), -1)
+                cv2.addWeighted(overlay, 0.80, base_img, 0.20, 0, base_img)
+                font_scale = max(0.8, w / 1200.0)
+                thickness = max(2, int(font_scale * 2.5))
+                (tw, th), _ = cv2.getTextSize(banner_text, cv2.FONT_HERSHEY_SIMPLEX, font_scale, thickness)
+                tx = max(15, (w - tw) // 2)
+                ty = int((banner_h + th) / 2)
+                cv2.putText(base_img, banner_text, (tx, ty), cv2.FONT_HERSHEY_SIMPLEX, font_scale, (255, 255, 255), thickness)
+                cv2.imwrite(out_path, base_img, [cv2.IMWRITE_JPEG_QUALITY, 95])
+                logger.info(f"[Defect Image] Generated stamped missing defect frame at {out_path}: {banner_text}")
+                return out_path
+        except Exception as _e:
+            logger.warning(f"[Defect Image] Error creating missing defect frame: {_e}")
+            
+    return None
+
 
 # Global lock for thread safety (using RLock to prevent self-deadlocks on nested acquisitions)
 lock = threading.RLock()
@@ -523,8 +584,7 @@ active_cycle_data = {
     "remove_frames_count": 0,
     "no_panel_frames_count": 0,  # Tracks consecutive frames with sub-features but no front/back panel
     "ocr_start_time": None,  # Timestamp when CHECKING_OCR state began (for timeout)
-    "front_type": None,  # "standard" if 'front' detected, "circle" if 'circle_front' detected
-    "defect_frame_path": None  # Path to annotated frame saved when first defect is detected on front
+    "defect_frame_path": None  # Path to annotated frame saved when defect is detected
 }
 
 # Global placeholders for decoupled streaming speedup
@@ -1290,23 +1350,22 @@ def finalize_report_and_rename(c_data):
 
         status = "FAIL" if defects else "PASS"
         
-        # Guarantee annotated defect image is saved for the PDF report when inspection fails
-        if status == "FAIL" and (not defect_frame or not os.path.exists(defect_frame)) and temp_dir:
-            fallback_defect_path = os.path.join(temp_dir, "defect_frame.jpg")
-            if latest_annotated_frame is not None:
-                try:
-                    if isinstance(latest_annotated_frame, bytes):
-                        with open(fallback_defect_path, "wb") as f_out:
-                            f_out.write(latest_annotated_frame)
-                    else:
-                        cv2.imwrite(fallback_defect_path, latest_annotated_frame, [cv2.IMWRITE_JPEG_QUALITY, 95])
-                    defect_frame = fallback_defect_path
-                    c_data["defect_frame_path"] = defect_frame
-                    logger.info(f"[Finalize Thread] Saved fallback annotated defect frame for report: {defect_frame}")
-                except Exception as _e:
-                    logger.warning(f"[Finalize Thread] Failed to save fallback defect frame: {_e}")
+        # Guarantee annotated defect image is saved for the PDF report and dashboard when inspection fails
+        if status == "FAIL" and temp_dir:
+            defect_frame = c_data.get("defect_frame_path")
             if not defect_frame or not os.path.exists(defect_frame):
-                defect_frame = front or back
+                # When no physical defect image was saved during cycle (e.g., missing parts or missing serial),
+                # generate an annotated defect image using the actual captured panel instead of empty camera feed!
+                defect_frame = create_missing_defect_image(
+                    temp_dir=temp_dir,
+                    defects=defects,
+                    front_path=front,
+                    back_path=back,
+                    lock_striker_path=c_data.get("lock_striker_path")
+                )
+                c_data["defect_frame_path"] = defect_frame
+            if not defect_frame or not os.path.exists(defect_frame):
+                defect_frame = back or front
         
         # Check folder structure and resolve if serial folder already exists
         today_str = datetime.now().strftime("%Y-%m-%d")
@@ -1539,8 +1598,7 @@ def reset_cycle_state():
             "remove_state_start_time": None,
             "no_panel_frames_count": 0,
             "ocr_start_time": None,
-            "front_type": None,  # "standard" if 'front' detected, "circle" if 'circle_front' detected
-            "defect_frame_path": None  # Path to annotated frame saved when first defect is detected on front
+            "defect_frame_path": None  # Path to annotated frame saved when defect is detected
         }
 
 # -------------------------------
@@ -2314,12 +2372,14 @@ def video_processing_loop():
                 class_name = det["class_name"]
                 
                 color = (0, 255, 0)
-                if class_name in ["front", "circle_front"]:
+                if class_name == "front":
                     color = (0, 165, 255)
-                elif class_name in ["back", "circle_back", "cricle_back"]:
+                elif class_name == "back":
                     color = (255, 0, 255)
                 elif class_name in ["serial", "serial_area"]:
                     color = (255, 255, 0)
+                elif class_name == "lock_striker":
+                    color = (0, 255, 128)
                 elif class_name in SURFACE_DEFECT_CLASSES or class_name in ["dent", "buldge", "bulge", "damage", "defect"]:
                     color = (0, 0, 255)
                 elif class_name == "line_mark":
@@ -2435,6 +2495,9 @@ def yolo_worker_loop():
             # YOLO_MODEL is read-only after loading and safe to call without the lock.
             with torch.inference_mode():
                 results = YOLO_MODEL(frame_resized, verbose=False, conf=run_thresh, task='segment', imgsz=448, device=YOLO_DEVICE)
+
+            current_state = active_cycle_data.get("state", "WAITING_FRONT")
+
             new_detections = []
             frame_holes = 0
             frame_ring_bush = 0
@@ -2442,6 +2505,7 @@ def yolo_worker_loop():
             frame_striker = 0
             frame_back_hook = 0
             frame_lock_striker = 0
+            frame_lock_striker_bend = 0
             frame_defects = []
             
             # Frame with annotations for saving
@@ -2450,10 +2514,8 @@ def yolo_worker_loop():
             has_back_detected = False
             front_box = None
             back_box = None
-            front_class = None  # Will be 'front' or 'circle_front'
-            back_class = None   # Will be 'back', 'circle_back', or 'cricle_back'
             
-            # Track sub-feature detections for fallback (circular shapes that don't detect front/back)
+            # Track sub-feature detections for fallback
             sub_feature_boxes = []  # Collect all non-front/back bounding boxes
             has_serial_detected = False
             has_holes_detected = False
@@ -2464,6 +2526,7 @@ def yolo_worker_loop():
                 boxes = results[0].boxes
                 names = results[0].names
                 
+                # --- Pass 1: Global Presence Flags (Strictly Gated by Current State) ---
                 for box in boxes:
                     cls_id = int(box.cls[0].cpu().item())
                     class_name = names[cls_id].lower()
@@ -2477,37 +2540,64 @@ def yolo_worker_loop():
                     if conf < CLASS_CONF_THRESHOLDS.get(class_name, YOLO_CONF_THRESHOLD):
                         continue
                         
-                    if class_name in ["front", "circle_front"]:
-                        has_front_detected = True
-                        xyxy_f = box.xyxy[0].cpu().numpy()
-                        front_box = (
-                            max(0, int(xyxy_f[0] / scale)),
-                            max(0, int(xyxy_f[1] / scale)),
-                            min(w_orig, int(xyxy_f[2] / scale)),
-                            min(h_orig, int(xyxy_f[3] / scale))
-                        )
-                        # Record the first time front class appears this cycle (used for 1-sec settle)
-                        if active_cycle_data.get("front_first_seen_time") is None:
-                            active_cycle_data["front_first_seen_time"] = time.time()
-                    elif class_name in ["back", "circle_back", "cricle_back", "serial", "serial_area"]:
-                        has_back_detected = True
+                    if class_name == "front":
+                        if current_state in ["WAITING_FRONT", "WAITING_REMOVE"]:
+                            has_front_detected = True
+                            xyxy_f = box.xyxy[0].cpu().numpy()
+                            front_box = (
+                                max(0, int(xyxy_f[0] / scale)),
+                                max(0, int(xyxy_f[1] / scale)),
+                                min(w_orig, int(xyxy_f[2] / scale)),
+                                min(h_orig, int(xyxy_f[3] / scale))
+                            )
+                            # Record the first time front class appears this cycle (used for 1-sec settle)
+                            if active_cycle_data.get("front_first_seen_time") is None:
+                                active_cycle_data["front_first_seen_time"] = time.time()
+                    elif class_name in ["back", "serial", "serial_area"]:
+                        if current_state in ["WAITING_BACK", "WAITING_REMOVE"]:
+                            has_back_detected = True
+                            if class_name == "back":
+                                xyxy_b = box.xyxy[0].cpu().numpy()
+                                back_box = (
+                                    max(0, int(xyxy_b[0] / scale)),
+                                    max(0, int(xyxy_b[1] / scale)),
+                                    min(w_orig, int(xyxy_b[2] / scale)),
+                                    min(h_orig, int(xyxy_b[3] / scale))
+                                )
                     elif class_name == "hand" or "hand" in class_name:
                         has_hand_detected = True
                 
+                # --- Pass 2: Box Processing & Stage-Gated Class Filtering ---
                 processed_boxes = {}
                 for box_idx, box in enumerate(boxes):
                     xyxy_resized = box.xyxy[0].cpu().numpy().astype(int)
                     cls_id = int(box.cls[0].cpu().item())
                     class_name = names[cls_id].lower()
-                    
-                    # We process all classes
                     conf = float(box.conf[0].cpu().item())
                     
                     if conf < CLASS_CONF_THRESHOLDS.get(class_name, YOLO_CONF_THRESHOLD):
                         continue
-                        
-                    # Removed the condition that ignores defects if front is not detected
-                    # so that defects are always shown if found.                    
+
+                    # STRICT STAGE FILTERING:
+                    # 1. Front: striker, ring_bush, line_mark, striker_bend, all defect & damage (dent, buldge, defect, damage).
+                    #    Ignore back, back_hook, frame_damage, lock_striker, etc.
+                    # 2. Lock Striker: ONLY lock_striker and lock_striker_bend. Ignore back, front, and other defects.
+                    # 3. Back: back_hook, back_hook_bend, frame_damage, hole, hole_spec_error, serial, serial_area.
+                    #    Ignore dent, buldge, striker_bend, defect, damage, etc.
+                    if class_name != "hand" and "hand" not in class_name:
+                        if current_state == "WAITING_FRONT":
+                            if class_name not in FRONT_CLASSES and class_name not in FRONT_DEFECT_CLASSES:
+                                continue
+                        elif current_state == "WAITING_LOCK_STRIKER":
+                            if class_name not in LOCK_STRIKER_CLASSES and class_name not in LOCK_STRIKER_DEFECT_CLASSES:
+                                continue
+                        elif current_state == "WAITING_BACK":
+                            if class_name not in BACK_CLASSES and class_name not in BACK_DEFECT_CLASSES:
+                                continue
+                        elif current_state == "WAITING_REMOVE":
+                            if class_name not in ["front", "back"]:
+                                continue
+
                     mask_polygon = None
                     if getattr(results[0], 'masks', None) is not None and len(results[0].masks.xy) > box_idx:
                         segment = results[0].masks.xy[box_idx]
@@ -2525,7 +2615,7 @@ def yolo_worker_loop():
                     x1, y1 = max(0, x1), max(0, y1)
                     x2, y2 = min(w_orig, x2), min(h_orig, y2)
                     
-                    # Hand class detection: immediate registration, no overlap formula, no filters
+                    # Hand class detection
                     if class_name == "hand" or "hand" in class_name:
                         has_hand_detected = True
                         new_detections.append({
@@ -2543,8 +2633,7 @@ def yolo_worker_loop():
                         cv2.putText(annotated_frame, label, (text_x, text_y), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 255, 255), 2)
                         continue
                     
-                    # --- Custom Duplicate Filter (IoU > 0.5) ---
-                    # Prevents double-counting if YOLO predicts two overlapping boxes for the same class
+                    # Duplicate filter (IoU > 0.5)
                     is_duplicate = False
                     for px1, py1, px2, py2 in processed_boxes.get(class_name, []):
                         ix1, iy1 = max(x1, px1), max(y1, py1)
@@ -2560,7 +2649,7 @@ def yolo_worker_loop():
                         processed_boxes[class_name] = []
                     processed_boxes[class_name].append((x1, y1, x2, y2))
                     
-                    # --- NEW LOGIC: OpenCV Ring Bush Verification ---
+                    # Ring bush OpenCV verification on Front side
                     if class_name in ["ring_bush", "ringbush"]:
                         if front_box is not None:
                             decision, score, dbg_canvas = verify_ring_bush(frame_to_process, front_box, conf)
@@ -2572,33 +2661,28 @@ def yolo_worker_loop():
                                 continue
                             elif decision == "UNCERTAIN":
                                 logger.info(f"OpenCV uncertain about ring_bush (Score: {score:.2f}) - retaining YOLO decision")
-                                # Pass through
                             else:
                                 logger.info(f"OpenCV verified ring_bush (Score: {score:.2f})")
                         else:
                             logger.info("ring_bush detected but no front_box found for ROI verification - retaining YOLO decision")
                     
-                    # --- NEW LOGIC: Empty Tray Filter ---
-                    # Apply empty tray filtering to all classes
-                    # Load config values
+                    # Empty tray filter for non-defects
                     presence_cfg = APP_CONFIG.get("ai", {}).get("part_presence", {})
                     blue_t = presence_cfg.get("blue_thresh", 0.75)
                     metal_t = presence_cfg.get("metal_min_ratio", 0.15)
                     lap_t = presence_cfg.get("laplacian_variance_min", 150.0)
                     
-                    if class_name not in SURFACE_DEFECT_CLASSES and class_name not in ["dent", "buldge", "bulge", "line_mark", "linemark", "line-mark", "damage", "hole_spec_error", "defect", "hand"]:
+                    if class_name not in SURFACE_DEFECT_CLASSES and class_name not in ["hand", "line_mark"]:
                         roi = frame_to_process[y1:y2, x1:x2]
                         if not has_part(roi, blue_t, metal_t, lap_t):
                             logger.info(f"Filtered out empty tray misclassified as '{class_name}' (conf: {conf:.2f})")
-                            continue # Skip this bounding box
+                            continue
                     else:
-                        # Fast and accurate filter: remove tiny false positive defects based on area
                         box_area = (x2 - x1) * (y2 - y1)
                         min_defect_area = APP_CONFIG.get("ai", {}).get("min_defect_area", 50)
                         if box_area < min_defect_area:
                             logger.info(f"Filtered out {class_name} due to small area ({box_area} < {min_defect_area})")
                             continue
-                    # ------------------------------------
 
                     new_detections.append({
                         "box": [x1, y1, x2, y2],
@@ -2606,22 +2690,22 @@ def yolo_worker_loop():
                         "conf": conf
                     })
                     
-                    # Draw annotations for saved images
+                    # Draw annotations for saved images & live view
                     color = (0, 255, 0)
-                    if class_name in ["front", "circle_front"]: color = (0, 165, 255)
-                    elif class_name in ["back", "circle_back", "cricle_back"]: color = (255, 0, 255)
+                    if class_name == "front": color = (0, 165, 255)
+                    elif class_name == "back": color = (255, 0, 255)
                     elif class_name in ["serial", "serial_area"]: color = (255, 255, 0)
-                    elif class_name in SURFACE_DEFECT_CLASSES or class_name in ["dent", "buldge", "bulge", "damage", "defect"]: color = (0, 0, 255)
-                    elif class_name == "hole_spec_error": color = (0, 128, 255)  # Orange for hole spec errors
+                    elif class_name == "lock_striker": color = (0, 255, 128)
+                    elif class_name in SURFACE_DEFECT_CLASSES: color = (0, 0, 255)  # Bright Red for all verified defects
                     elif class_name == "line_mark": color = (0, 255, 255)
-                    elif class_name == "hand": color = (0, 140, 255)  # Amber / Orange for operator hand
+                    elif class_name == "hand": color = (0, 140, 255)
                     
-                    if class_name in SURFACE_DEFECT_CLASSES or class_name in ["line_mark", "dent", "buldge", "bulge", "damage", "defect"]:
+                    if class_name in SURFACE_DEFECT_CLASSES or class_name == "line_mark":
                         if mask_polygon is not None:
                             pts = np.array(mask_polygon, np.int32).reshape((-1, 1, 2))
                             overlay = annotated_frame.copy()
                             cv2.fillPoly(overlay, [pts], color)
-                            cv2.addWeighted(overlay, 0.3, annotated_frame, 0.7, 0, annotated_frame)
+                            cv2.addWeighted(overlay, 0.35, annotated_frame, 0.65, 0, annotated_frame)
                             cv2.polylines(annotated_frame, [pts], True, color, 3)
                         else:
                             cv2.rectangle(annotated_frame, (x1, y1), (x2, y2), color, 3)
@@ -2635,7 +2719,7 @@ def yolo_worker_loop():
                     cv2.rectangle(annotated_frame, (text_x, text_y - text_h - 4), (text_x + text_w, text_y + 2), color, -1)
                     cv2.putText(annotated_frame, label, (text_x, text_y), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 0, 0), 2)
                     
-                    # Track sub-features for fallback
+                    # Sub-feature tracking for OCR
                     if class_name in ["holes", "serial", "serial_area"]:
                         sub_feature_boxes.append((x1, y1, x2, y2))
                         if class_name in ["serial", "serial_area"]:
@@ -2643,91 +2727,79 @@ def yolo_worker_loop():
                         elif class_name == "holes":
                             has_holes_detected = True
                     
-                    if class_name in SURFACE_DEFECT_CLASSES or class_name in ["dent", "buldge", "bulge", "line_mark", "linemark", "line-mark", "damage", "hole_spec_error", "defect"]:
+                    # Defect collection for active stage
+                    if class_name in SURFACE_DEFECT_CLASSES:
                         frame_defects.append(class_name)
                         
-                    if class_name == "hole" or class_name == "holes":
+                    if class_name in ["hole", "holes"]:
                         if has_back_detected:
                             frame_holes += 1
                     elif class_name in ["ring_bush", "ringbush"]:
-                        if has_front_detected or state in ["WAITING_FRONT", "WAITING_LOCK_STRIKER"]:
+                        if has_front_detected or current_state == "WAITING_FRONT":
                             frame_ring_bush += 1
                     elif class_name == "striker":
-                        if has_front_detected or state in ["WAITING_FRONT", "WAITING_LOCK_STRIKER"]:
+                        if has_front_detected or current_state == "WAITING_FRONT":
                             frame_striker += 1
                     elif class_name == "back_hook":
-                        if has_back_detected:
+                        if has_back_detected or current_state == "WAITING_BACK":
                             frame_back_hook += 1
                     elif class_name == "lock_striker":
                         frame_lock_striker += 1
+                    elif class_name == "lock_striker_bend":
+                        frame_lock_striker_bend += 1
                     elif class_name == "hand":
                         has_hand_detected = True
-                    elif class_name in ["front", "circle_front"]:
+                    elif class_name == "front":
                         front_box = (x1, y1, x2, y2)
-                        front_class = class_name  # Track whether it's 'front' or 'circle_front'
                         global latest_front_crop
                         latest_front_crop = frame_to_process[y1:y2, x1:x2].copy()
-                    elif class_name in ["back", "circle_back", "cricle_back"]:
+                    elif class_name == "back":
                         back_box = (x1, y1, x2, y2)
-                        back_class = class_name  # Track the actual detected back class
 
-                        
-            # --- Defect Frame Save ---
-            # When defects are detected on the front panel, save the annotated frame once per cycle.
-            # annotated_frame already has all defect masks and bounding boxes drawn on it.
-            # This gives us a 3rd image (in addition to clean front + clean back) for the report.
-            if frame_defects and has_front_detected and active_cycle_data["temp_folder"] is not None:
-                with lock:
-                    defect_frame_already_saved = active_cycle_data.get("defect_frame_path") is not None
-                if not defect_frame_already_saved and not has_hand_detected:
-                    defect_file = os.path.join(active_cycle_data["temp_folder"], "defect_frame.jpg")
-                    cv2.imwrite(defect_file, annotated_frame, [cv2.IMWRITE_JPEG_QUALITY, 95])
-                    with lock:
-                        active_cycle_data["defect_frame_path"] = defect_file
-                    logger.info(f"[Defect Frame] Saved annotated defect frame: {defect_file} (defects: {frame_defects})")
-
-            # --- Dynamic Defect Tracker & Freezing Engine ---
+            # --- Anti-Flicker Defect Tracker & Defect Frame Capture ---
             with lock:
                 tracker = active_cycle_data.get("defect_tracker", {})
-                detected_classes = set(frame_defects)
+                current_frame_defects = set(frame_defects)
                 
-                # 1. Update hit counts for currently detected defect classes
-                for d in detected_classes:
+                # 1. Update continuous hits for defects detected in this frame
+                for d in current_frame_defects:
                     if d not in tracker:
-                        tracker[d] = {"hit_count": 1, "miss_count": 0, "status": "PENDING"}
+                        tracker[d] = {"consecutive_hits": 1, "status": "PENDING"}
                     else:
-                        tracker[d]["hit_count"] += 1
-                        tracker[d]["miss_count"] = 0
+                        tracker[d]["consecutive_hits"] = tracker[d].get("consecutive_hits", 0) + 1
                     
-                    # Confirm defect if seen for >= 2 frames
-                    if tracker[d]["hit_count"] >= 2:
-                        tracker[d]["status"] = "CONFIRMED"
+                    # Defect must be in continuous 2 or 3 frames to be confirmed (eliminates 1-frame flickering)
+                    if tracker[d]["consecutive_hits"] >= 3:
+                        if tracker[d]["status"] != "CONFIRMED":
+                            tracker[d]["status"] = "CONFIRMED"
+                            logger.info(f"[Defect Tracker] Confirmed defect '{d}' after {tracker[d]['consecutive_hits']} continuous frames.")
                         active_cycle_data["defects_detected"].add(d)
 
-                # 2. Update miss counts for defects in tracker not present in current frame
-                to_remove = []
-                for d, info in tracker.items():
-                    if d not in detected_classes:
-                        info["miss_count"] += 1
-                        # If pending and missed for 2 frames, remove candidate
-                        if info["status"] == "PENDING" and info["miss_count"] >= 2:
-                            to_remove.append(d)
-                        # Once CONFIRMED, physical defects remain latched for the entire inspection cycle.
-                        # Do NOT discard them when the operator flips the part to lock striker or back side!
-                        pass
-                
-                for d in to_remove:
-                    del tracker[d]
-                
+                # 2. Defect absent in this frame: if pending, reset immediately as false alarm / flicker
+                for d in list(tracker.keys()):
+                    if d not in current_frame_defects:
+                        if tracker[d]["status"] == "PENDING":
+                            del tracker[d]
+
                 active_cycle_data["defect_tracker"] = tracker
 
+                # 3. Live Defect Frame Save:
+                # Save annotated frame showing the exact red box & defect label when any confirmed defect is in view
+                confirmed_in_frame = [d for d in current_frame_defects if tracker.get(d, {}).get("status") == "CONFIRMED"]
+                if confirmed_in_frame and active_cycle_data["temp_folder"] is not None and not has_hand_detected:
+                    defect_frame_already_saved = active_cycle_data.get("defect_frame_path") is not None
+                    if not defect_frame_already_saved:
+                        defect_file = os.path.join(active_cycle_data["temp_folder"], "defect_frame.jpg")
+                        cv2.imwrite(defect_file, annotated_frame, [cv2.IMWRITE_JPEG_QUALITY, 95])
+                        active_cycle_data["defect_frame_path"] = defect_file
+                        logger.info(f"[Defect Frame] Captured live annotated defect frame: {defect_file} (defects: {confirmed_in_frame})")
+
             # --- Lock Striker Frame Save ---
-            if frame_lock_striker > 0 and active_cycle_data["temp_folder"] is not None:
+            if (frame_lock_striker > 0 or frame_lock_striker_bend > 0) and active_cycle_data["temp_folder"] is not None:
                 with lock:
                     ls_frame_already_saved = active_cycle_data.get("lock_striker_path") is not None
                 if not ls_frame_already_saved:
                     ls_file = os.path.join(active_cycle_data["temp_folder"], "lock_striker.jpg")
-                    # Save annotated_frame to show bounding box, or frame_to_process for clean image
                     cv2.imwrite(ls_file, annotated_frame, [cv2.IMWRITE_JPEG_QUALITY, 95])
                     with lock:
                         active_cycle_data["lock_striker_path"] = ls_file
@@ -2742,8 +2814,8 @@ def yolo_worker_loop():
                 # Find the best target for OCR according to priority
                 ocr_target_det = None
                 
-                # Only trigger OCR when back panel (or circle_back) is confirmed in the frame
-                back_in_frame = any(d["class_name"] in ["back", "circle_back", "cricle_back"] for d in new_detections)
+                # Only trigger OCR when back panel is confirmed in the frame
+                back_in_frame = any(d["class_name"] == "back" for d in new_detections)
 
                 # Check for classes in priority order - only proceed if back is visible
                 if back_in_frame:
@@ -2842,11 +2914,11 @@ def yolo_worker_loop():
                                 args=(crop, active_cycle_data["temp_folder"], next_crop_num, active_cycle_data),
                                 daemon=True
                             ).start()
-                        elif class_name in ["circle_back", "cricle_back", "back"]:
+                        elif class_name == "back":
                             # If we couldn't start OCR (thread busy), it's not a complete failure yet, just skipping this frame
                             pass
                     else:
-                        if class_name in ["circle_back", "cricle_back", "back"]:
+                        if class_name == "back":
                             print(f"[OCR ERROR] Back-side detection found but OCR crop was not generated")
                 else:
                     # Serial box temporarily lost or conf dropped. Just wait.
@@ -2925,12 +2997,11 @@ def yolo_worker_loop():
                             # --- Capture front image (file I/O done OUTSIDE lock below) ---
                             _front_capture_frame   = frame_to_process.copy()
                             _front_capture_folder  = active_cycle_data["temp_folder"]
-                            _front_capture_type    = "circle" if front_class == "circle_front" else "standard"
+                            _front_capture_type    = "standard"
                             _front_save_debug_raw  = active_cycle_data.get("save_debug_raw", False) or APP_CONFIG.get("storage", {}).get("save_debug_raw", False)
                             _front_unenhanced      = latest_unenhanced_frame.copy() if latest_unenhanced_frame is not None else None
 
-                            active_cycle_data["front_type"] = _front_capture_type
-                            logger.info(f"[State] Front captured as type='{_front_capture_type}' (class='{front_class}')")
+                            logger.info("[State] Front captured as type='standard'")
                             current_cycle["step2_status"] = "OK"
                             
                             active_cycle_data["flash_end_time"] = time.time() + 2.0
@@ -2940,9 +3011,7 @@ def yolo_worker_loop():
                             for d in frame_defects:
                                 if tracker_state.get(d, {}).get("status") == "CONFIRMED" or active_cycle_data.get("defect_times", {}).get(d, 0.0) >= 1.0:
                                     active_cycle_data["defects_detected"].add(d)
-                            # Immediate missing checks removed to allow 1.5s detection time before flashing NG
                             if active_cycle_data.get("defects_detected"):
-                                # current_cycle["instruction"] = "NG"  # Removed per user request to keep operator instructions
                                 current_cycle["instruction_color"] = "red"
                                 current_cycle["result"] = "NG"
                             # Flag that we need to write the front image (done outside lock after the block)
@@ -2960,29 +3029,23 @@ def yolo_worker_loop():
                     if not active_cycle_data.get("defects_detected"):
                         current_cycle["instruction_color"] = "blue"
                     else:
-                        # current_cycle["instruction"] = "NG"  # Removed per user request to keep operator instructions
                         current_cycle["instruction_color"] = "red"
                         current_cycle["result"] = "NG"
                     
-                    ls_detected = (frame_lock_striker > 0) or (active_cycle_data.get("max_lock_striker_detected", 0) > 0)
+                    ls_detected = (frame_lock_striker > 0) or (frame_lock_striker_bend > 0) or (active_cycle_data.get("max_lock_striker_detected", 0) > 0)
                     
                     with lock:
                         ls_saved = active_cycle_data.get("lock_striker_path") is not None
                     
-                    # Check if operator skipped Lock Striker and flipped directly to Back Side
-                    is_back_panel_visible = (back_box is not None) and (not has_front_detected)
-                    
+                    # Strictly wait for lock_striker or lock_striker_bend to complete the sequence.
+                    # Do NOT check for back panel or switch to back even if back is detected!
                     if ls_detected or ls_saved:
                         logger.info("[Lock Striker] Lock Striker detected! Step 3 -> OK")
                         current_cycle["step3_status"] = "OK"
+                        active_cycle_data["max_lock_striker_detected"] = 1
                         active_cycle_data["flash_end_time"] = time.time() + 2.0
                         active_cycle_data["flash_message"] = "LOCK STRIKER OK"
                         active_cycle_data["defects_detected"].discard("missing_lock_striker")
-                        active_cycle_data["state"] = "WAITING_BACK"
-                    elif is_back_panel_visible:
-                        logger.info("[Lock Striker] Flipped directly to Back Panel without Lock Striker detected.")
-                        if not ls_saved:
-                            active_cycle_data["defects_detected"].add("missing_lock_striker")
                         active_cycle_data["state"] = "WAITING_BACK"
                         
                 elif state == "WAITING_BACK":
@@ -3008,84 +3071,64 @@ def yolo_worker_loop():
                     is_back_visible = (back_box is not None) or has_serial_detected
                     
                     if is_back_visible and not has_front_detected:
-                        # --- Panel Type Mismatch Check ---
-                        # Only run when the back panel itself (not just serial/holes sub-features) is detected
-                        front_type = active_cycle_data.get("front_type")
-                        is_mismatched = False
-                        if back_box is not None and front_type is not None:
-                            if front_type == "standard" and back_class in ["circle_back", "cricle_back"]:
-                                is_mismatched = True
-                            elif front_type == "circle" and back_class == "back":
-                                is_mismatched = True
-
-                        if is_mismatched:
-                            # Wrong part type placed — alert operator and block capture
-                            expected = "STANDARD BACK" if front_type == "standard" else "CIRCLE BACK"
-                            logger.warning(f"[Mismatch] Front type='{front_type}' but detected back_class='{back_class}'. Blocking capture.")
-                            current_cycle["status"] = "Part Type Mismatch!"
-                            current_cycle["instruction"] = "PLACE CORRECT PART"
-                            current_cycle["instruction_color"] = "red"
-                            # Reset back-stability counters so capture does not proceed
+                        # Determine a center for movement tracking
+                        if back_box:
+                            cx = (back_box[0] + back_box[2]) / 2
+                            cy = (back_box[1] + back_box[3]) / 2
+                        elif len(sub_feature_boxes) > 0:
+                            cx = sum([b[0] + b[2] for b in sub_feature_boxes]) / (2 * len(sub_feature_boxes))
+                            cy = sum([b[1] + b[3] for b in sub_feature_boxes]) / (2 * len(sub_feature_boxes))
+                        else:
+                            cx, cy = w_orig / 2, h_orig / 2
+                            
+                        prev_cx, prev_cy = active_cycle_data.get("back_box_center") or (cx, cy)
+                        dist = ((cx - prev_cx)**2 + (cy - prev_cy)**2)**0.5
+                        
+                        if dist > 50 or hand_warning:
                             active_cycle_data["back_frames_count"] = 0
                             active_cycle_data["back_first_seen_time"] = None
+                            
+                        active_cycle_data["back_box_center"] = (cx, cy)
+                        active_cycle_data["back_frames_count"] += 1
+                        
+                        if active_cycle_data.get("back_first_seen_time") is None:
+                            active_cycle_data["back_first_seen_time"] = time.time()
+                            # Start OCR timeout clock as soon as back is first seen
+                            if active_cycle_data.get("ocr_start_time") is None:
+                                active_cycle_data["ocr_start_time"] = time.time()
+                            
+                        time_stable = time.time() - active_cycle_data["back_first_seen_time"]
+                        
+                        ocr_done = active_cycle_data.get("serial_number") is not None
+                        ocr_start = active_cycle_data.get("ocr_start_time")
+                        fallback_timeout = max(3.5, APP_CONFIG.get("ai", {}).get("ocr_fallback_timeout", 3.5))
+                        ocr_timeout = (ocr_start is not None) and (time.time() - ocr_start > fallback_timeout)
+                        
+                        if ocr_timeout and not ocr_done:
+                            active_cycle_data["serial_number"] = "serial_missing"
+                            active_cycle_data["defects_detected"].add("serial_missing")
+                            current_cycle["serial"] = "SERIAL MISSING"
+                        
+                        if not hand_warning and (ocr_done or ocr_timeout) and time_stable >= 0.5:
+                            # --- Capture back image while part is present on the table ---
+                            _do_back_write = True
+                            _back_capture_frame = frame_to_process.copy()
+                            _back_capture_folder = active_cycle_data["temp_folder"]
+                            _back_save_debug_raw = active_cycle_data.get("save_debug_raw", False) or APP_CONFIG.get("storage", {}).get("save_debug_raw", False)
+                            _back_unenhanced = latest_unenhanced_frame.copy() if latest_unenhanced_frame is not None else None
+                            _back_finalize_data = active_cycle_data
+
+                            current_cycle["step4_status"] = "OK"
+                            tracker_state = active_cycle_data.get("defect_tracker", {})
+                            for d in frame_defects:
+                                if tracker_state.get(d, {}).get("status") == "CONFIRMED" or active_cycle_data.get("defect_times", {}).get(d, 0.0) >= 1.0:
+                                    active_cycle_data["defects_detected"].add(d)
+
+                            # Go straight to finalization
+                            active_cycle_data["state"] = "WAITING_REMOVE"
                         else:
-                            # Correct panel (or only sub-features visible) — proceed normally
-                            # Determine a center for movement tracking
-                            if back_box:
-                                cx = (back_box[0] + back_box[2]) / 2
-                                cy = (back_box[1] + back_box[3]) / 2
-                            elif len(sub_feature_boxes) > 0:
-                                cx = sum([b[0] + b[2] for b in sub_feature_boxes]) / (2 * len(sub_feature_boxes))
-                                cy = sum([b[1] + b[3] for b in sub_feature_boxes]) / (2 * len(sub_feature_boxes))
-                            else:
-                                cx, cy = w_orig / 2, h_orig / 2
-                                
-                            prev_cx, prev_cy = active_cycle_data.get("back_box_center") or (cx, cy)
-                            dist = ((cx - prev_cx)**2 + (cy - prev_cy)**2)**0.5
-                            
-                            if dist > 50 or hand_warning:
-                                active_cycle_data["back_frames_count"] = 0
-                                active_cycle_data["back_first_seen_time"] = None
-                                
-                            active_cycle_data["back_box_center"] = (cx, cy)
-                            active_cycle_data["back_frames_count"] += 1
-                            
-                            if active_cycle_data.get("back_first_seen_time") is None:
-                                active_cycle_data["back_first_seen_time"] = time.time()
-                                # ── Also start OCR timeout clock as soon as back is first seen ──
-                                # Previously ocr_start_time was only set when a serial/serial_area
-                                # ROI was detected; if those classes are missing the timeout never
-                                # fired and WAITING_BACK got stuck forever. Now we start the clock
-                                # immediately so the 8-second fallback always triggers.
-                                if active_cycle_data.get("ocr_start_time") is None:
-                                    active_cycle_data["ocr_start_time"] = time.time()
-                                
-                            time_stable = time.time() - active_cycle_data["back_first_seen_time"]
-                            
-                            ocr_done = active_cycle_data.get("serial_number") is not None
-                            ocr_start = active_cycle_data.get("ocr_start_time")
-                            ocr_timeout = (ocr_start is not None) and (time.time() - ocr_start > 8.0)
-                            
-                            if not hand_warning and (ocr_done or ocr_timeout) and time_stable >= 0.5:
-                                # --- Capture back image (file I/O done OUTSIDE lock below) ---
-                                _do_back_write = True
-                                _back_capture_frame = frame_to_process.copy()
-                                _back_capture_folder = active_cycle_data["temp_folder"]
-                                _back_save_debug_raw = active_cycle_data.get("save_debug_raw", False) or APP_CONFIG.get("storage", {}).get("save_debug_raw", False)
-                                _back_unenhanced = latest_unenhanced_frame.copy() if latest_unenhanced_frame is not None else None
-                                _back_finalize_data = active_cycle_data  # reference for check_and_finalize_cycle
-
-                                current_cycle["step4_status"] = "OK"
-                                tracker_state = active_cycle_data.get("defect_tracker", {})
-                                for d in frame_defects:
-                                    if tracker_state.get(d, {}).get("status") == "CONFIRMED" or active_cycle_data.get("defect_times", {}).get(d, 0.0) >= 1.0:
-                                        active_cycle_data["defects_detected"].add(d)
-
-                                # Go straight to finalization (called outside lock, after file write)
-                                active_cycle_data["state"] = "WAITING_REMOVE"
-                            else:
-                                current_cycle["instruction"] = "DETECTING SERIAL NUMBER..."
-                                active_cycle_data["back_frames_count"] = 1 # Keep it below threshold until serial is seen
+                            current_cycle["instruction"] = "DETECTING SERIAL NUMBER..."
+                            active_cycle_data["back_frames_count"] = 1
                     else:
                         active_cycle_data["back_frames_count"] = 0
                         active_cycle_data["back_first_seen_time"] = None
@@ -3197,16 +3240,20 @@ def yolo_worker_loop():
                                 if active_cycle_data.get("max_back_hook_detected", 0) < 2:
                                     active_cycle_data["defects_detected"].add("missing_back_hook")
                         
-                        # Dynamically clear missing defects if they are eventually found during the cycle
+                        # Dynamic recovery: clear missing defects as soon as parts appear
                         if active_cycle_data.get("max_holes_detected", 0) >= 3 or not APP_CONFIG.get("ai", {}).get("check_missing_holes", False):
                             active_cycle_data["defects_detected"].discard("missing_holes")
-                        if active_cycle_data.get("max_ring_bush_detected", 0) >= 1:
+                        if active_cycle_data.get("max_ring_bush_detected", 0) >= 1 or frame_ring_bush >= 1:
+                            active_cycle_data["max_ring_bush_detected"] = 1
                             active_cycle_data["defects_detected"].discard("missing_ring_bush")
-                        if active_cycle_data.get("max_striker_detected", 0) >= 2:
+                        if active_cycle_data.get("max_striker_detected", 0) >= 2 or frame_striker >= 2:
+                            active_cycle_data["max_striker_detected"] = 2
                             active_cycle_data["defects_detected"].discard("missing_striker")
-                        if active_cycle_data.get("max_back_hook_detected", 0) >= 2:
+                        if active_cycle_data.get("max_back_hook_detected", 0) >= 2 or frame_back_hook >= 2:
+                            active_cycle_data["max_back_hook_detected"] = 2
                             active_cycle_data["defects_detected"].discard("missing_back_hook")
-                        if active_cycle_data["max_lock_striker_detected"] >= 1:
+                        if active_cycle_data.get("max_lock_striker_detected", 0) >= 1 or frame_lock_striker >= 1:
+                            active_cycle_data["max_lock_striker_detected"] = 1
                             active_cycle_data["defects_detected"].discard("missing_lock_striker")
 
                     current_cycle["defects"] = list(active_cycle_data["defects_detected"])
@@ -3220,17 +3267,21 @@ def yolo_worker_loop():
                         if active_cycle_data.get("remove_frames_count", 0) == 0:
                             current_cycle["instruction_color"] = "green"
                             current_cycle["instruction"] = "REMOVE THE PLATE"
-                            current_cycle["result"] = "OK"
+                            if not active_cycle_data["defects_detected"]:
+                                current_cycle["result"] = "OK"
                     else:
                         if active_cycle_data["defects_detected"]:
                             current_cycle["instruction_color"] = "red"
                             current_cycle["result"] = "NG"
                             current_cycle["status"] = "NG - DEFECT DETECTED"
                         else:
+                            # Dynamic recovery: when missing part appears, remove NG and restore status to OK
                             current_cycle["instruction_color"] = "blue"
-                            current_cycle["result"] = "Awaiting analysis..."
+                            current_cycle["result"] = "OK" if current_cycle["step2_status"] == "OK" else "Awaiting analysis..."
+                            if current_cycle["status"] == "NG - DEFECT DETECTED":
+                                current_cycle["status"] = "Inspecting..."
 
-                        # Allow the 2-second sequence success flash to override the current state ONLY IF NO DEFECT IS DETECTED AND NO HAND WARNING
+                        # Allow sequence success flash to override
                         flash_end = active_cycle_data.get("flash_end_time", 0)
                         if time.time() < flash_end and not active_cycle_data["defects_detected"] and not hand_warning:
                             current_cycle["instruction_color"] = "green"
