@@ -7,3 +7,6 @@ scratch/
 nssm.exe
 *.pt
 *.zip
+
+*.bak
+measured_user_uploaded.jpg
