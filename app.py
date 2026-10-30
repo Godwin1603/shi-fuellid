@@ -28,6 +28,10 @@ import numpy as np
 import yaml
 import logging
 from logging.handlers import RotatingFileHandler
+from distance_gauge import DistanceGauge
+
+distance_gauge = None
+latest_distance_result = None
 
 # --- Initialization: Config & Logging ---
 os.makedirs("logs", exist_ok=True)
@@ -451,7 +455,7 @@ LOCK_STRIKER_CLASSES = {"lock_striker"}
 LOCK_STRIKER_DEFECT_CLASSES = {"lock_striker_bend"}
 
 BACK_CLASSES = {"back", "back_hook", "hole", "holes", "serial", "serial_area"}
-BACK_DEFECT_CLASSES = {"frame_damage", "back_hook_bend", "hole_spec_error"}
+BACK_DEFECT_CLASSES = {"frame_damage", "back_hook_bend", "hole_spec_error", "dimension_out_of_spec", "dimension_not_found"}
 
 # Defect class names used for surface defect tracking, overlays, and reports
 SURFACE_DEFECT_CLASSES = list(FRONT_DEFECT_CLASSES | LOCK_STRIKER_DEFECT_CLASSES | BACK_DEFECT_CLASSES)
@@ -468,6 +472,10 @@ def create_missing_defect_image(temp_dir, defects, front_path, back_path, lock_s
     if "serial_missing" in defects:
         target_img_path = back_path
         banner_text = "NG: SERIAL NUMBER MISSING / UNREADABLE"
+    # Priority 1.5: Dimension out of spec -> use Back panel
+    elif any("dimension" in d for d in defects):
+        target_img_path = back_path
+        banner_text = "NG: DISTANCE OUT OF SPEC (128.4 +/- 0.7 mm)"
     # Priority 2: Missing front parts -> use Front panel
     elif any(d in ["missing_ring_bush", "missing_striker"] for d in defects):
         target_img_path = front_path
@@ -558,7 +566,13 @@ current_cycle = {
     "instruction": "WAITING FOR PART",
     "instruction_color": "blue",
     "hand_detected": False,
-    "hand_warning": False
+    "hand_warning": False,
+    "distance_mm": None,
+    "distance_dev": None,
+    "distance_status": "Pending",
+    "distance_spec": "128.4 ± 0.7 mm",
+    "placed_side": "NONE",
+    "placed_side_in_seq": True
 }
 
 active_cycle_data = {
@@ -588,7 +602,10 @@ active_cycle_data = {
     "remove_frames_count": 0,
     "no_panel_frames_count": 0,  # Tracks consecutive frames with sub-features but no front/back panel
     "ocr_start_time": None,  # Timestamp when CHECKING_OCR state began (for timeout)
-    "defect_frame_path": None  # Path to annotated frame saved when defect is detected
+    "defect_frame_path": None,  # Path to annotated frame saved when defect is detected
+    "last_distance_result": None,
+    "back_distance_mm": None,
+    "back_distance_passed": None
 }
 
 # Global placeholders for decoupled streaming speedup
@@ -681,6 +698,16 @@ def init_models():
     if OCR_ENGINE is None:
         print("Connecting to PaddleOCR Microservice...")
         OCR_ENGINE = PaddleOCR()
+    global distance_gauge
+    if distance_gauge is None:
+        try:
+            gauge_cfg = APP_CONFIG.get("ai", {}).get("distance_measurement", {})
+            model_name = gauge_cfg.get("model", "BC4I")
+            cfg_dir = gauge_cfg.get("cfg_dir", "gauge_cfg")
+            distance_gauge = DistanceGauge(model=model_name, base_dir=cfg_dir)
+            logger.info(f"[DistanceGauge] Initialized {model_name} (valid={distance_gauge.is_valid})")
+        except Exception as e:
+            logger.error(f"[DistanceGauge] Failed to initialize: {e}")
     print("Models Initialized.")
 
 # -------------------------------
@@ -1339,6 +1366,17 @@ def finalize_report_and_rename(c_data):
                 defects.append("missing_back_hook")
             if c_data.get("max_lock_striker_detected", 0) < 1:
                 defects.append("missing_lock_striker")
+
+            # Distance measurement verification (BC4I: Catch plug -> trimline 128.4 +/- 0.7 mm)
+            gauge_enabled = APP_CONFIG.get("ai", {}).get("distance_measurement", {}).get("enabled", True)
+            if gauge_enabled:
+                dist_passed = c_data.get("back_distance_passed")
+                dist_mm = c_data.get("back_distance_mm")
+                if dist_passed is False:
+                    if dist_mm is not None:
+                        defects.append(f"dimension_out_of_spec ({dist_mm:.2f}mm)")
+                    else:
+                        defects.append("dimension_not_found")
                 
             if serial == "serial_missing" or not serial:
                 defects.append("serial_missing")
@@ -1590,6 +1628,13 @@ def reset_cycle_state():
         current_cycle["instruction_color"] = "blue"
         current_cycle["hand_detected"] = False
         current_cycle["hand_warning"] = False
+        current_cycle["distance_mm"] = None
+        current_cycle["distance_dev"] = None
+        current_cycle["distance_status"] = "Pending"
+        current_cycle["placed_side"] = "NONE"
+        current_cycle["placed_side_in_seq"] = True
+        global latest_distance_result
+        latest_distance_result = None
         
         active_cycle_data = {
             "temp_folder": None,
@@ -1621,7 +1666,10 @@ def reset_cycle_state():
             "remove_state_start_time": None,
             "no_panel_frames_count": 0,
             "ocr_start_time": None,
-            "defect_frame_path": None  # Path to annotated frame saved when defect is detected
+            "defect_frame_path": None,  # Path to annotated frame saved when defect is detected
+            "last_distance_result": None,
+            "back_distance_mm": None,
+            "back_distance_passed": None
         }
 
 # -------------------------------
@@ -2267,7 +2315,7 @@ cam = CameraStreamer()
 atexit.register(cam.disconnect)
 
 def video_processing_loop():
-    global video_cap, is_processing, stream_source, latest_raw_frame, latest_unenhanced_frame, latest_annotated_frame, current_detections
+    global video_cap, is_processing, stream_source, latest_raw_frame, latest_unenhanced_frame, latest_annotated_frame, current_detections, latest_distance_result, distance_gauge
     consecutive_failures = 0
     _vloop_counter = 0
     _last_reconnect_attempt = 0.0
@@ -2418,13 +2466,19 @@ def video_processing_loop():
                     cv2.polylines(annotated_frame, [pts], True, color, 2)
                 cv2.rectangle(annotated_frame, (x1, y1), (x2, y2), color, 2)
 
-                # Draw label without confidence percentage
+                # Draw standard model class label
                 label = f"{class_name}"
                 (text_w, text_h), _ = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.5, 2)
                 text_x = x1
                 text_y = max(y1 - 5, text_h + 5)
                 cv2.rectangle(annotated_frame, (text_x, text_y - text_h - 4), (text_x + text_w, text_y + 2), color, -1)
                 cv2.putText(annotated_frame, label, (text_x, text_y), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 0), 2)
+
+            # Draw distance measurement overlay if active (when back panel is in view)
+            with lock:
+                dist_res = latest_distance_result
+            if dist_res is not None and distance_gauge is not None and distance_gauge.is_valid:
+                distance_gauge.draw_overlay(annotated_frame, dist_res, scale=scale_ann)
 
             # Encode annotated frame to JPEG with lower quality for UI performance
             ret2, buffer = cv2.imencode('.jpg', annotated_frame, [int(cv2.IMWRITE_JPEG_QUALITY), 40])
@@ -2473,7 +2527,7 @@ def video_processing_loop():
 # Dedicated Background YOLO Worker Thread
 # -------------------------------
 def yolo_worker_loop():
-    global YOLO_MODEL, latest_raw_frame, current_detections, active_cycle_data, current_cycle
+    global YOLO_MODEL, latest_raw_frame, current_detections, active_cycle_data, current_cycle, latest_distance_result, distance_gauge
     init_models()
     
     _debug_counter = 0
@@ -2549,7 +2603,11 @@ def yolo_worker_loop():
                 boxes = results[0].boxes
                 names = results[0].names
                 
-                # --- Pass 1: Global Presence Flags (Strictly Gated by Current State) ---
+                # --- Pass 1: Global Presence Flags & Side Placement Detection ---
+                raw_front_detected = False
+                raw_back_detected = False
+                raw_lock_striker_detected = False
+
                 for box in boxes:
                     cls_id = int(box.cls[0].cpu().item())
                     class_name = names[cls_id].lower()
@@ -2564,29 +2622,33 @@ def yolo_worker_loop():
                         continue
                         
                     if class_name == "front":
+                        raw_front_detected = True
+                        xyxy_f = box.xyxy[0].cpu().numpy()
+                        f_box = (
+                            max(0, int(xyxy_f[0] / scale)),
+                            max(0, int(xyxy_f[1] / scale)),
+                            min(w_orig, int(xyxy_f[2] / scale)),
+                            min(h_orig, int(xyxy_f[3] / scale))
+                        )
                         if current_state in ["WAITING_FRONT", "WAITING_REMOVE"]:
                             has_front_detected = True
-                            xyxy_f = box.xyxy[0].cpu().numpy()
-                            front_box = (
-                                max(0, int(xyxy_f[0] / scale)),
-                                max(0, int(xyxy_f[1] / scale)),
-                                min(w_orig, int(xyxy_f[2] / scale)),
-                                min(h_orig, int(xyxy_f[3] / scale))
-                            )
-                            # Record the first time front class appears this cycle (used for 1-sec settle)
+                            front_box = f_box
                             if active_cycle_data.get("front_first_seen_time") is None:
                                 active_cycle_data["front_first_seen_time"] = time.time()
-                    elif class_name in ["back", "serial", "serial_area"]:
-                        if current_state in ["WAITING_BACK", "WAITING_REMOVE"]:
+                    elif class_name in BACK_CLASSES or class_name in BACK_DEFECT_CLASSES:
+                        raw_back_detected = True
+                        if class_name in ["back", "frame_damage"] and back_box is None:
+                            xyxy_b = box.xyxy[0].cpu().numpy()
+                            back_box = (
+                                max(0, int(xyxy_b[0] / scale)),
+                                max(0, int(xyxy_b[1] / scale)),
+                                min(w_orig, int(xyxy_b[2] / scale)),
+                                min(h_orig, int(xyxy_b[3] / scale))
+                            )
+                        if current_state in ["WAITING_BACK", "WAITING_REMOVE"] or raw_back_detected:
                             has_back_detected = True
-                            if class_name == "back":
-                                xyxy_b = box.xyxy[0].cpu().numpy()
-                                back_box = (
-                                    max(0, int(xyxy_b[0] / scale)),
-                                    max(0, int(xyxy_b[1] / scale)),
-                                    min(w_orig, int(xyxy_b[2] / scale)),
-                                    min(h_orig, int(xyxy_b[3] / scale))
-                                )
+                    elif class_name == "lock_striker":
+                        raw_lock_striker_detected = True
                     elif class_name == "hand" or "hand" in class_name:
                         has_hand_detected = True
                 
@@ -2601,25 +2663,14 @@ def yolo_worker_loop():
                     if conf < CLASS_CONF_THRESHOLDS.get(class_name, YOLO_CONF_THRESHOLD):
                         continue
 
-                    # STRICT STAGE FILTERING:
-                    # 1. Front: striker, ring_bush, line_mark, striker_bend, all defect & damage (dent, buldge, defect, damage).
-                    #    Ignore back, back_hook, frame_damage, lock_striker, etc.
-                    # 2. Lock Striker: ONLY lock_striker and lock_striker_bend. Ignore back, front, and other defects.
-                    # 3. Back: back_hook, back_hook_bend, frame_damage, hole, hole_spec_error, serial, serial_area.
-                    #    Ignore dent, buldge, striker_bend, defect, damage, etc.
-                    if class_name != "hand" and "hand" not in class_name:
-                        if current_state == "WAITING_FRONT":
-                            if class_name not in FRONT_CLASSES and class_name not in FRONT_DEFECT_CLASSES:
-                                continue
-                        elif current_state == "WAITING_LOCK_STRIKER":
-                            if class_name not in LOCK_STRIKER_CLASSES and class_name not in LOCK_STRIKER_DEFECT_CLASSES:
-                                continue
-                        elif current_state == "WAITING_BACK":
-                            if class_name not in BACK_CLASSES and class_name not in BACK_DEFECT_CLASSES:
-                                continue
-                        elif current_state == "WAITING_REMOVE":
-                            if class_name not in ["front", "back"]:
-                                continue
+                    # Determine active panel in view (handles both live camera and recorded video)
+                    is_back_in_view = raw_back_detected or (current_state in ["WAITING_BACK", "WAITING_REMOVE"])
+                    is_front_in_view = raw_front_detected or (current_state == "WAITING_FRONT")
+                    is_ls_in_view = raw_lock_striker_detected or (current_state == "WAITING_LOCK_STRIKER")
+
+                    # Always show live annotations for any valid detected class
+                    # Sequence rules and compliance are tracked via is_in_seq without hiding visual feedback
+                    allowed = True
 
                     mask_polygon = None
                     if getattr(results[0], 'masks', None) is not None and len(results[0].masks.xy) > box_idx:
@@ -2695,7 +2746,7 @@ def yolo_worker_loop():
                     metal_t = presence_cfg.get("metal_min_ratio", 0.15)
                     lap_t = presence_cfg.get("laplacian_variance_min", 150.0)
                     
-                    if class_name not in SURFACE_DEFECT_CLASSES and class_name not in ["hand", "line_mark"]:
+                    if class_name in ["front", "back"]:
                         roi = frame_to_process[y1:y2, x1:x2]
                         if not has_part(roi, blue_t, metal_t, lap_t):
                             logger.info(f"Filtered out empty tray misclassified as '{class_name}' (conf: {conf:.2f})")
@@ -2707,10 +2758,16 @@ def yolo_worker_loop():
                             logger.info(f"Filtered out {class_name} due to small area ({box_area} < {min_defect_area})")
                             continue
 
+                    is_in_seq = (
+                        (is_front_in_view and (class_name in FRONT_CLASSES or class_name in FRONT_DEFECT_CLASSES)) or
+                        (is_back_in_view and (class_name in BACK_CLASSES or class_name in BACK_DEFECT_CLASSES)) or
+                        (is_ls_in_view and (class_name in LOCK_STRIKER_CLASSES or class_name in LOCK_STRIKER_DEFECT_CLASSES))
+                    )
                     new_detections.append({
                         "box": [x1, y1, x2, y2],
                         "class_name": class_name, "mask": mask_polygon,
-                        "conf": conf
+                        "conf": conf,
+                        "is_in_sequence": is_in_seq
                     })
                     
                     # Draw annotations for saved images & live view
@@ -2754,7 +2811,7 @@ def yolo_worker_loop():
                     if class_name in SURFACE_DEFECT_CLASSES:
                         frame_defects.append(class_name)
                         
-                    if class_name in ["hole", "holes"]:
+                    if class_name in ["hole", "holes", "hole_spec_error"]:
                         if has_back_detected:
                             frame_holes += 1
                     elif class_name in ["ring_bush", "ringbush"]:
@@ -2776,7 +2833,7 @@ def yolo_worker_loop():
                         front_box = (x1, y1, x2, y2)
                         global latest_front_crop
                         latest_front_crop = frame_to_process[y1:y2, x1:x2].copy()
-                    elif class_name == "back":
+                    elif class_name in ["back", "frame_damage"] and back_box is None:
                         back_box = (x1, y1, x2, y2)
 
             # --- Anti-Flicker Defect Tracker & Defect Frame Capture ---
@@ -2827,6 +2884,29 @@ def yolo_worker_loop():
                     with lock:
                         active_cycle_data["lock_striker_path"] = ls_file
                     logger.info(f"[Lock Striker] Saved annotated lock striker frame: {ls_file}")
+
+            # --- Live Distance Measurement (When Back is in View) ---
+            back_visible = is_back_in_view or (back_box is not None) or any(d["class_name"] in BACK_CLASSES or d["class_name"] in BACK_DEFECT_CLASSES for d in new_detections)
+            gauge_enabled = APP_CONFIG.get("ai", {}).get("distance_measurement", {}).get("enabled", True)
+            now_t = time.time()
+            if back_visible and gauge_enabled and distance_gauge is not None and distance_gauge.is_valid:
+                dist_result = distance_gauge.measure(frame_to_process, back_box=back_box)
+                with lock:
+                    if dist_result.get("mm") is not None:
+                        latest_distance_result = dist_result
+                        active_cycle_data["last_distance_result"] = dist_result
+                        active_cycle_data["distance_hold_until"] = now_t + 1.2
+                        current_cycle["distance_mm"] = dist_result["mm"]
+                        current_cycle["distance_dev"] = dist_result["dev"]
+                        current_cycle["distance_status"] = dist_result["status"]
+                        active_cycle_data["back_distance_mm"] = dist_result["mm"]
+                        active_cycle_data["back_distance_passed"] = dist_result["passed"]
+                    elif now_t > active_cycle_data.get("distance_hold_until", 0):
+                        current_cycle["distance_status"] = "NOT_FOUND"
+            elif not back_visible and raw_front_detected:
+                with lock:
+                    latest_distance_result = None
+                    current_cycle["distance_status"] = "Pending"
 
             # OCR logic (runs asynchronously)
             # GUARD: Only attempt OCR after front has been captured (temp_folder exists)
@@ -2961,8 +3041,24 @@ def yolo_worker_loop():
             _back_unenhanced = None
             _back_finalize_data = None
 
+            # Determine current placed side
+            if raw_front_detected and not raw_back_detected:
+                cur_placed_side = "FRONT"
+                cur_side_in_seq = (current_state == "WAITING_FRONT")
+            elif raw_back_detected and not raw_front_detected:
+                cur_placed_side = "BACK"
+                cur_side_in_seq = (current_state == "WAITING_BACK")
+            elif raw_lock_striker_detected and not raw_front_detected and not raw_back_detected:
+                cur_placed_side = "LOCK STRIKER"
+                cur_side_in_seq = (current_state == "WAITING_LOCK_STRIKER")
+            else:
+                cur_placed_side = "NONE"
+                cur_side_in_seq = True
+
             with lock:
                 current_detections = new_detections
+                current_cycle["placed_side"] = cur_placed_side
+                current_cycle["placed_side_in_seq"] = cur_side_in_seq
                 
                 # Smooth hold time (0.4s) to prevent flicker between frames
                 now_t = time.time()
@@ -2978,6 +3074,16 @@ def yolo_worker_loop():
                 
                 # Strict State Machine Logic
                 if state == "WAITING_FRONT":
+                    # If recorded video shows back side first, allow smooth transition to WAITING_BACK
+                    if raw_back_detected and not has_front_detected:
+                        if active_cycle_data.get("back_first_seen_time") is None:
+                            active_cycle_data["back_first_seen_time"] = time.time()
+                        elif (time.time() - active_cycle_data["back_first_seen_time"] > 0.8) and (stream_source != "gige" or not front_box):
+                            active_cycle_data["state"] = "WAITING_BACK"
+                            state = "WAITING_BACK"
+                            logger.info("[State Machine] Back side detected — activated WAITING_BACK stage.")
+
+                if state == "WAITING_FRONT":
                     current_cycle["status"] = "Waiting for Front Panel"
                     current_cycle["instruction"] = "PLACE FUEL DOOR (FRONT)"
                     if not active_cycle_data.get("defects_detected"):
@@ -2987,6 +3093,8 @@ def yolo_worker_loop():
                         current_cycle["instruction_color"] = "red"
                         current_cycle["result"] = "NG"
                     
+
+
                     if front_box and not has_back_detected:
                         if active_cycle_data["temp_folder"] is None:
                             today_str = datetime.now().strftime("%Y-%m-%d")
@@ -3091,6 +3199,8 @@ def yolo_worker_loop():
                         logger.warning("[State Watchdog] Stuck in WAITING_BACK for >60s — auto-resetting cycle.")
                         needs_reset = True
                     
+
+
                     is_back_visible = (back_box is not None) or has_serial_detected
                     
                     if is_back_visible and not has_front_detected:
@@ -3348,7 +3458,13 @@ def yolo_worker_loop():
                         debug_raw_file = os.path.join(_back_capture_folder, "back_raw_debug.jpg")
                         cv2.imwrite(debug_raw_file, _back_unenhanced, [cv2.IMWRITE_JPEG_QUALITY, 95])
                         logger.info(f"[Debug] Saved original un-enhanced back image: {debug_raw_file}")
-                    cv2.imwrite(back_file, _back_capture_frame, [cv2.IMWRITE_JPEG_QUALITY, 95])
+                    # Stamp distance measurement overlay on saved back frame if available
+                    back_to_save = _back_capture_frame.copy()
+                    if distance_gauge is not None and distance_gauge.is_valid:
+                        final_dist = distance_gauge.measure(back_to_save, back_box=None)
+                        if final_dist.get("pt_A") is not None:
+                            distance_gauge.draw_overlay(back_to_save, final_dist, scale=1.0)
+                    cv2.imwrite(back_file, back_to_save, [cv2.IMWRITE_JPEG_QUALITY, 95])
                     with lock:
                         if _back_finalize_data is not None:
                             _back_finalize_data["back_path"] = back_file

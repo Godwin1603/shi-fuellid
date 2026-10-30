@@ -38,6 +38,15 @@ ai:
   check_missing_holes: false     # Flag NG if holes count not satisfied (disabled per user request)
   hide_holes_in_count_ui: true   # Hide Holes row from UI counts panel (set to false to show)
 
+  # BC4I Fuel Door Distance Measurement (Catch Plug -> Trimline: 128.4 +/- 0.7 mm)
+  distance_measurement:
+    enabled: true
+    model: "BC4I"
+    cfg_dir: "gauge_cfg"
+    nominal_mm: 128.4
+    tolerance_mm: 0.7
+    min_match_score: 0.70
+
   # Post-processing thresholds to filter out empty blue foam trays
   part_presence:
     blue_thresh: 0.75
