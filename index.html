@@ -607,6 +607,41 @@
         .step-active .step-label { color: var(--text-main); }
         .step-active .step-status { color: var(--accent-blue); }
 
+        /* Distance Gauge Card */
+        .gauge-card {
+            background: var(--bg-card);
+            border: 1.5px solid var(--border);
+            border-radius: 10px;
+            padding: 10px 12px 10px 12px;
+            display: flex;
+            align-items: center;
+            gap: 12px;
+            transition: border-color 0.3s, background 0.3s;
+        }
+        .gauge-card.gauge-ok  { border-color: #10b981; background: rgba(16,185,129,0.06); }
+        .gauge-card.gauge-ng  { border-color: #ef4444; background: rgba(239,68,68,0.06); }
+        .gauge-badge {
+            min-width: 48px;
+            height: 48px;
+            border-radius: 8px;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            font-size: 18px;
+            font-weight: 800;
+            letter-spacing: 1px;
+            background: #f1f5f9;
+            color: var(--text-muted);
+            transition: background 0.3s, color 0.3s;
+        }
+        .gauge-badge.badge-ok { background: rgba(16,185,129,0.15); color: #10b981; }
+        .gauge-badge.badge-ng { background: rgba(239,68,68,0.15); color: #ef4444; }
+        .gauge-info { display: flex; flex-direction: column; gap: 3px; flex: 1; min-width: 0; }
+        .gauge-label { font-size: 10px; font-weight: 600; color: var(--text-muted); text-transform: uppercase; letter-spacing: 0.5px; }
+        .gauge-value { font-size: 18px; font-weight: 800; color: var(--text-main); letter-spacing: 0.5px; }
+        .gauge-dev   { font-size: 11px; font-weight: 600; color: var(--text-muted); }
+        .gauge-spec  { font-size: 10px; color: var(--text-muted); margin-top: 1px; }
+
         /* Traceability serial */
         .trace-content {
             display: flex;
@@ -1019,6 +1054,20 @@
                             <span>Back Side Captured</span>
                         </div>
                         <span class="step-status" id="step-4-status">Pending</span>
+                    </div>
+                </div>
+            </div>
+
+            <!-- Catch Plug Distance Gauge Card -->
+            <div class="sidebar-section" id="gauge-card-section">
+                <div class="section-title">Catch Plug Distance</div>
+                <div class="gauge-card" id="gauge-card">
+                    <div class="gauge-badge" id="gauge-badge">--</div>
+                    <div class="gauge-info">
+                        <div class="gauge-label">Measured Value</div>
+                        <div class="gauge-value" id="gauge-mm">-- mm</div>
+                        <div class="gauge-dev"  id="gauge-dev">deviation: --</div>
+                        <div class="gauge-spec">Nominal: 128.4 mm &nbsp;|&nbsp; Tol: &plusmn;0.7 mm</div>
                     </div>
                 </div>
             </div>
@@ -1650,23 +1699,44 @@
                     }
                 }
 
-                // Update Distance Gauge Metric
+                // Update Distance Gauge Metric (small inline + prominent card)
                 const distEl = document.getElementById('ui-distance-val');
-                if (distEl) {
-                    if (data.distance_mm !== null && data.distance_mm !== undefined) {
-                        const sign = data.distance_dev >= 0 ? '+' : '';
+                const gCard  = document.getElementById('gauge-card');
+                const gBadge = document.getElementById('gauge-badge');
+                const gMm    = document.getElementById('gauge-mm');
+                const gDev   = document.getElementById('gauge-dev');
+                if (data.distance_mm !== null && data.distance_mm !== undefined) {
+                    const sign = data.distance_dev >= 0 ? '+' : '';
+                    const isOk = data.distance_status === 'OK';
+                    // Small inline (Part Status panel)
+                    if (distEl) {
                         distEl.textContent = `${data.distance_mm.toFixed(2)} mm (${sign}${data.distance_dev.toFixed(2)})`;
-                        distEl.style.color = data.distance_status === 'OK' ? '#10b981' : '#ef4444';
-                    } else if (data.distance_status === 'Pending') {
-                        distEl.textContent = 'Pending';
-                        distEl.style.color = 'var(--text-muted)';
-                    } else if (data.distance_status === 'NOT_FOUND') {
-                        distEl.textContent = 'NOT FOUND';
-                        distEl.style.color = '#ef4444';
-                    } else {
-                        distEl.textContent = '-- mm';
-                        distEl.style.color = 'var(--text-main)';
+                        distEl.style.color = isOk ? '#10b981' : '#ef4444';
                     }
+                    // Prominent Gauge Card
+                    if (gCard) {
+                        gCard.className = 'gauge-card ' + (isOk ? 'gauge-ok' : 'gauge-ng');
+                    }
+                    if (gBadge) {
+                        gBadge.textContent = isOk ? 'OK' : 'NG';
+                        gBadge.className = 'gauge-badge ' + (isOk ? 'badge-ok' : 'badge-ng');
+                    }
+                    if (gMm)  gMm.textContent  = `${data.distance_mm.toFixed(2)} mm`;
+                    if (gMm)  gMm.style.color  = isOk ? '#10b981' : '#ef4444';
+                    if (gDev) gDev.textContent = `deviation: ${sign}${data.distance_dev.toFixed(2)} mm`;
+                    if (gDev) gDev.style.color = isOk ? '#10b981' : '#ef4444';
+                } else {
+                    // Reset card to idle state
+                    const isPending = data.distance_status === 'Pending';
+                    const label = isPending ? 'Pending' : (data.distance_status === 'NOT_FOUND' ? 'NOT FOUND' : '--');
+                    if (distEl) {
+                        distEl.textContent = label === 'Pending' ? 'Pending' : (label === 'NOT FOUND' ? 'NOT FOUND' : '-- mm');
+                        distEl.style.color = label === 'NOT FOUND' ? '#ef4444' : 'var(--text-muted)';
+                    }
+                    if (gCard)  gCard.className  = 'gauge-card';
+                    if (gBadge) { gBadge.textContent = '--'; gBadge.className = 'gauge-badge'; }
+                    if (gMm)  { gMm.textContent  = label + (label === '--' ? ' mm' : ''); gMm.style.color = label === 'NOT FOUND' ? '#ef4444' : 'var(--text-muted)'; }
+                    if (gDev) { gDev.textContent = 'deviation: --'; gDev.style.color = 'var(--text-muted)'; }
                 }
 
                 // Update Holes Count
