@@ -227,7 +227,7 @@ def sync_existing_lid_data(lid_data_dir="lid_data", db_path=DB_PATH):
                 
             # Inspect folder contents
             files = os.listdir(folder_path)
-            is_ng = folder_name.startswith("defect_") or any("defect" in f.lower() for f in files)
+            is_ng = folder_name.startswith("defect_")
             status = "NG" if is_ng else "OK"
             
             # Determine serial

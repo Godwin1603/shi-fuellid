@@ -7,7 +7,7 @@ ai:
   # Confidence threshold for detecting the OCR target regions (serial, back, etc.)
   ocr_confidence_threshold: 0.10
   # Fallback timeout (in seconds) before attempting to read the back panel if serial is missing
-  ocr_fallback_timeout: 3.5
+  ocr_fallback_timeout: 8.0
   # Per-class YOLO confidence thresholds. If a class is not listed, the default threshold below is used.
   class_confidences:
     front: 0.40

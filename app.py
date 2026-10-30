@@ -444,8 +444,8 @@ OCR_ENGINE = None
 # Note: YOLO_CONF_THRESHOLD and CLASS_CONF_THRESHOLDS are dynamically managed by reload_config_if_modified()
 
 # Stage-specific class mappings and defect definitions
-FRONT_CLASSES = {"front", "striker", "ring_bush", "ringbush", "line_mark"}
-FRONT_DEFECT_CLASSES = {"striker_bend", "dent", "buldge", "bulge", "defect", "damage"}
+FRONT_CLASSES = {"front", "striker", "ring_bush", "ringbush"}
+FRONT_DEFECT_CLASSES = {"striker_bend", "dent", "buldge", "bulge", "defect", "damage", "line_mark", "linemark", "line-mark"}
 
 LOCK_STRIKER_CLASSES = {"lock_striker"}
 LOCK_STRIKER_DEFECT_CLASSES = {"lock_striker_bend"}
@@ -482,6 +482,10 @@ def create_missing_defect_image(temp_dir, defects, front_path, back_path, lock_s
     elif "missing_lock_striker" in defects:
         target_img_path = lock_striker_path or front_path
         banner_text = "NG: MISSING LOCK STRIKER"
+    elif any(d in FRONT_DEFECT_CLASSES for d in defects):
+        target_img_path = front_path or back_path
+        front_def = [d.replace("_", " ").upper() for d in defects if d in FRONT_DEFECT_CLASSES]
+        banner_text = f"NG: {', '.join(front_def)}"
     else:
         target_img_path = back_path or front_path
         
@@ -1162,6 +1166,9 @@ def process_ocr_async(crop_img, temp_folder, crop_num, c_data):
 
                     c_data["serial_number"] = final_serial
                     c_data["ocr_confidence"] = final_conf
+                    c_data.get("defects_detected", set()).discard("serial_missing")
+                    if "serial_missing" in active_cycle_data.get("defects_detected", set()):
+                        active_cycle_data["defects_detected"].discard("serial_missing")
                     
                     logger.info(f"\n[OCR FINAL]")
                     logger.info(f"serial_number = {final_serial}")
@@ -1215,6 +1222,9 @@ def finalize_report_and_rename(c_data):
                     c_data["serial_number"] = best_vote["text"]
                     c_data["ocr_confidence"] = best_vote["confidence"]
                     c_data["final_crop_path"] = best_vote.get("crop_path")
+                    c_data.get("defects_detected", set()).discard("serial_missing")
+                    if "serial_missing" in active_cycle_data.get("defects_detected", set()):
+                        active_cycle_data["defects_detected"].discard("serial_missing")
                     if c_data is active_cycle_data:
                         current_cycle["serial"] = best_vote["text"]
                         current_cycle["confidence"] = f"{best_vote['confidence']:.1f}%"
@@ -1230,6 +1240,9 @@ def finalize_report_and_rename(c_data):
                     c_data["serial_number"] = best_vote["text"]
                     c_data["ocr_confidence"] = best_vote["confidence"]
                     c_data["final_crop_path"] = best_vote.get("crop_path")
+                    c_data.get("defects_detected", set()).discard("serial_missing")
+                    if "serial_missing" in active_cycle_data.get("defects_detected", set()):
+                        active_cycle_data["defects_detected"].discard("serial_missing")
                     if c_data is active_cycle_data:
                         current_cycle["serial"] = best_vote["text"]
                         current_cycle["confidence"] = f"{best_vote['confidence']:.1f}%"
@@ -1327,12 +1340,22 @@ def finalize_report_and_rename(c_data):
             if c_data.get("max_lock_striker_detected", 0) < 1:
                 defects.append("missing_lock_striker")
                 
-            if serial == "serial_missing":
+            if serial == "serial_missing" or not serial:
                 defects.append("serial_missing")
+            else:
+                # Real serial exists: ensure serial_missing is completely purged
+                defects = [d for d in defects if d != "serial_missing"]
+                c_data.get("defects_detected", set()).discard("serial_missing")
+                if "serial_missing" in active_cycle_data.get("defects_detected", set()):
+                    active_cycle_data["defects_detected"].discard("serial_missing")
+                if not defects:
+                    defect_frame = None
+                    c_data["defect_frame_path"] = None
 
-            # If defect_frame exists, guarantee defect is recorded
-            if defect_frame and os.path.exists(defect_frame) and not defects:
-                defects.append("defect_detected")
+            # Guarantee clean PASS when no verified defects exist
+            if not defects:
+                defect_frame = None
+                c_data["defect_frame_path"] = None
 
             defects = list(set(defects))
 
@@ -2380,10 +2403,10 @@ def video_processing_loop():
                     color = (255, 255, 0)
                 elif class_name == "lock_striker":
                     color = (0, 255, 128)
+                elif class_name in ["line_mark", "linemark", "line-mark"]:
+                    color = (0, 255, 255)
                 elif class_name in SURFACE_DEFECT_CLASSES or class_name in ["dent", "buldge", "bulge", "damage", "defect"]:
                     color = (0, 0, 255)
-                elif class_name == "line_mark":
-                    color = (0, 255, 255)
                 elif class_name == "hand":
                     color = (0, 140, 255)
 
@@ -2696,8 +2719,8 @@ def yolo_worker_loop():
                     elif class_name == "back": color = (255, 0, 255)
                     elif class_name in ["serial", "serial_area"]: color = (255, 255, 0)
                     elif class_name == "lock_striker": color = (0, 255, 128)
+                    elif class_name in ["line_mark", "linemark", "line-mark"]: color = (0, 255, 255)
                     elif class_name in SURFACE_DEFECT_CLASSES: color = (0, 0, 255)  # Bright Red for all verified defects
-                    elif class_name == "line_mark": color = (0, 255, 255)
                     elif class_name == "hand": color = (0, 140, 255)
                     
                     if class_name in SURFACE_DEFECT_CLASSES or class_name == "line_mark":
@@ -2835,8 +2858,8 @@ def yolo_worker_loop():
                     is_ocr_target = False
 
                     if class_name in ["serial", "serial_area"]:
-                        # User-requested 3.0s delay to ensure the part is perfectly stable and motion blur is gone
-                        if time_elapsed >= 3.0:
+                        # 1.2s settle delay ensures part is placed and stable before triggering OCR
+                        if time_elapsed >= 1.2:
                             is_ocr_target = True
                     else:
                         is_ocr_target = False
@@ -3099,15 +3122,23 @@ def yolo_worker_loop():
                             
                         time_stable = time.time() - active_cycle_data["back_first_seen_time"]
                         
-                        ocr_done = active_cycle_data.get("serial_number") is not None
+                        ocr_done = (active_cycle_data.get("serial_number") is not None and 
+                                    active_cycle_data.get("serial_number") != "serial_missing")
                         ocr_start = active_cycle_data.get("ocr_start_time")
-                        fallback_timeout = max(3.5, APP_CONFIG.get("ai", {}).get("ocr_fallback_timeout", 3.5))
+                        fallback_timeout = max(8.0, APP_CONFIG.get("ai", {}).get("ocr_fallback_timeout", 8.0))
                         ocr_timeout = (ocr_start is not None) and (time.time() - ocr_start > fallback_timeout)
                         
                         if ocr_timeout and not ocr_done:
-                            active_cycle_data["serial_number"] = "serial_missing"
-                            active_cycle_data["defects_detected"].add("serial_missing")
-                            current_cycle["serial"] = "SERIAL MISSING"
+                            if active_cycle_data.get("serial_votes"):
+                                best_vote = max(active_cycle_data["serial_votes"], key=lambda v: v["confidence"])
+                                active_cycle_data["serial_number"] = best_vote["text"]
+                                active_cycle_data["ocr_confidence"] = best_vote["confidence"]
+                                active_cycle_data["defects_detected"].discard("serial_missing")
+                                ocr_done = True
+                            else:
+                                active_cycle_data["serial_number"] = "serial_missing"
+                                active_cycle_data["defects_detected"].add("serial_missing")
+                                current_cycle["serial"] = "SERIAL MISSING"
                         
                         if not hand_warning and (ocr_done or ocr_timeout) and time_stable >= 0.5:
                             # --- Capture back image while part is present on the table ---
@@ -3255,6 +3286,9 @@ def yolo_worker_loop():
                         if active_cycle_data.get("max_lock_striker_detected", 0) >= 1 or frame_lock_striker >= 1:
                             active_cycle_data["max_lock_striker_detected"] = 1
                             active_cycle_data["defects_detected"].discard("missing_lock_striker")
+                        # Dynamic recovery for serial number:
+                        if (active_cycle_data.get("serial_number") and active_cycle_data["serial_number"] != "serial_missing") or active_cycle_data.get("serial_votes"):
+                            active_cycle_data["defects_detected"].discard("serial_missing")
 
                     current_cycle["defects"] = list(active_cycle_data["defects_detected"])
                     
@@ -4206,61 +4240,6 @@ def open_file():
     except Exception as e:
         return jsonify({"status": "error", "message": str(e)}), 500
 
-@app.route('/api/export_csv')
-def export_csv():
-    """Generates a downloadable CSV of inspection records for quality auditing."""
-    selected_date = request.args.get("date")
-    selected_shift = request.args.get("shift", "all").upper()
-    
-    _, current_prod_date = db_logger.get_shift_and_production_date()
-    if not selected_date:
-        selected_date = current_prod_date
-        
-    where_clauses = ["production_date = ?"]
-    params = [selected_date]
-    if selected_shift in ["A", "B", "C"]:
-        where_clauses.append("shift = ?")
-        params.append(selected_shift)
-        
-    where_sql = "WHERE " + " AND ".join(where_clauses)
-    
-    with db_logger.get_db_connection() as conn:
-        rows = conn.execute(f"""
-            SELECT timestamp, time_str, production_date, shift, serial, status, defects, confidence, folder_path
-            FROM inspections
-            {where_sql}
-            ORDER BY timestamp ASC
-        """, params).fetchall()
-    
-    si = _io.StringIO()
-    writer = _csv.writer(si)
-    writer.writerow(["Timestamp", "Time", "Production Date", "Shift", "Serial Number", "Result Status", "Defects Detected", "Confidence %", "Folder Path"])
-    
-    for r in rows:
-        try:
-            d_list = _json.loads(r["defects"]) if r["defects"] else []
-            d_str = "; ".join(d_list)
-        except Exception:
-            d_str = r["defects"] or ""
-            
-        writer.writerow([
-            r["timestamp"],
-            r["time_str"],
-            r["production_date"],
-            f"Shift {r['shift']}",
-            r["serial"],
-            r["status"],
-            d_str,
-            f"{r['confidence']:.1f}%",
-            r["folder_path"]
-        ])
-        
-    filename = f"fuel_door_inspections_{selected_date}_Shift_{selected_shift}.csv"
-    return Response(
-        si.getvalue(),
-        mimetype="text/csv",
-        headers={"Content-disposition": f"attachment; filename={filename}"}
-    )
 
 @app.route('/api/sync', methods=['POST', 'GET'])
 def sync_data():

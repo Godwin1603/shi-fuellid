@@ -477,61 +477,8 @@ def open_file():
         return jsonify({"status": "error", "message": str(e)}), 500
 
 
-@app.route("/api/export_csv")
-def export_csv():
-    """Generates a downloadable CSV of inspection records for quality auditing."""
-    selected_date = request.args.get("date")
-    selected_shift = request.args.get("shift", "all").upper()
-    
-    _, current_prod_date = db_logger.get_shift_and_production_date()
-    if not selected_date:
-        selected_date = current_prod_date
-        
-    where_clauses = ["production_date = ?"]
-    params = [selected_date]
-    if selected_shift in ["A", "B", "C"]:
-        where_clauses.append("shift = ?")
-        params.append(selected_shift)
-        
-    where_sql = "WHERE " + " AND ".join(where_clauses)
-    
-    conn = get_db()
-    rows = conn.execute(f"""
-        SELECT timestamp, time_str, production_date, shift, serial, status, defects, confidence, folder_path
-        FROM inspections
-        {where_sql}
-        ORDER BY timestamp ASC
-    """, params).fetchall()
-    
-    si = io.StringIO()
-    writer = csv.writer(si)
-    writer.writerow(["Timestamp", "Time", "Production Date", "Shift", "Serial Number", "Result Status", "Defects Detected", "Confidence %", "Folder Path"])
-    
-    for r in rows:
-        try:
-            d_list = json.loads(r["defects"]) if r["defects"] else []
-            d_str = "; ".join(d_list)
-        except Exception:
-            d_str = r["defects"] or ""
-            
-        writer.writerow([
-            r["timestamp"],
-            r["time_str"],
-            r["production_date"],
-            f"Shift {r['shift']}",
-            r["serial"],
-            r["status"],
-            d_str,
-            f"{r['confidence']:.1f}%",
-            r["folder_path"]
-        ])
-        
-    filename = f"fuel_door_inspections_{selected_date}_Shift_{selected_shift}.csv"
-    return Response(
-        si.getvalue(),
-        mimetype="text/csv",
-        headers={"Content-disposition": f"attachment; filename={filename}"}
-    )
+
+
 
 
 @app.route("/api/sync", methods=["POST", "GET"])
