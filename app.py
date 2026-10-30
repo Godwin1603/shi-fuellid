@@ -2474,10 +2474,13 @@ def video_processing_loop():
                 cv2.rectangle(annotated_frame, (text_x, text_y - text_h - 4), (text_x + text_w, text_y + 2), color, -1)
                 cv2.putText(annotated_frame, label, (text_x, text_y), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 0), 2)
 
-            # Draw distance measurement overlay if active (when back panel is in view)
+            # Draw distance measurement overlay only when back panel is in view
+            # (state must be WAITING_BACK or WAITING_REMOVE - never during WAITING_FRONT)
             with lock:
                 dist_res = latest_distance_result
-            if dist_res is not None and distance_gauge is not None and distance_gauge.is_valid:
+                _gauge_state = active_cycle_data.get("state", "WAITING_FRONT")
+            _back_phase = _gauge_state in ("WAITING_BACK", "WAITING_REMOVE")
+            if dist_res is not None and _back_phase and distance_gauge is not None and distance_gauge.is_valid:
                 distance_gauge.draw_overlay(annotated_frame, dist_res, scale=scale_ann)
 
             # Encode annotated frame to JPEG with lower quality for UI performance
