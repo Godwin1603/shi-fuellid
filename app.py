@@ -605,7 +605,8 @@ active_cycle_data = {
     "defect_frame_path": None,  # Path to annotated frame saved when defect is detected
     "last_distance_result": None,
     "back_distance_mm": None,
-    "back_distance_passed": None
+    "back_distance_passed": None,
+    "distance_vote_buffer": []  # Rolling median voting buffer
 }
 
 # Global placeholders for decoupled streaming speedup
@@ -1487,6 +1488,8 @@ def finalize_report_and_rename(c_data):
             defects=defects,
             defect_image_path=defect_frame,  # Annotated front frame showing detected defects
             lock_striker_image_path=active_cycle_data.get("lock_striker_path"),
+            catch_plug_mm=c_data.get("back_distance_mm"),
+            catch_plug_passed=c_data.get("back_distance_passed"),
             output_path=temp_report_path
         )
 
@@ -1669,7 +1672,8 @@ def reset_cycle_state():
             "defect_frame_path": None,  # Path to annotated frame saved when defect is detected
             "last_distance_result": None,
             "back_distance_mm": None,
-            "back_distance_passed": None
+            "back_distance_passed": None,
+            "distance_vote_buffer": []  # Rolling median voting buffer
         }
 
 # -------------------------------
@@ -2888,27 +2892,49 @@ def yolo_worker_loop():
                         active_cycle_data["lock_striker_path"] = ls_file
                     logger.info(f"[Lock Striker] Saved annotated lock striker frame: {ls_file}")
 
-            # --- Live Distance Measurement (When Back is in View) ---
+            # --- Live Distance Measurement with Median Voting (When Back is in View) ---
+            # Operator adjusts part position; we collect a rolling buffer of readings
+            # and use the median to pick the stable, settled value.
             back_visible = is_back_in_view or (back_box is not None) or any(d["class_name"] in BACK_CLASSES or d["class_name"] in BACK_DEFECT_CLASSES for d in new_detections)
             gauge_enabled = APP_CONFIG.get("ai", {}).get("distance_measurement", {}).get("enabled", True)
+            _gauge_vote_window = APP_CONFIG.get("ai", {}).get("distance_measurement", {}).get("vote_window", 10)
             now_t = time.time()
             if back_visible and gauge_enabled and distance_gauge is not None and distance_gauge.is_valid:
                 dist_result = distance_gauge.measure(frame_to_process, back_box=back_box)
                 with lock:
                     if dist_result.get("mm") is not None:
-                        latest_distance_result = dist_result
-                        active_cycle_data["last_distance_result"] = dist_result
+                        # Append to rolling vote buffer (keep last N readings)
+                        _buf = active_cycle_data.setdefault("distance_vote_buffer", [])
+                        _buf.append(dist_result["mm"])
+                        if len(_buf) > _gauge_vote_window:
+                            _buf.pop(0)
+                        # Stable median value from the buffer
+                        _sorted = sorted(_buf)
+                        _n = len(_sorted)
+                        _median_mm = (_sorted[_n // 2] if _n % 2 == 1
+                                      else (_sorted[_n // 2 - 1] + _sorted[_n // 2]) / 2.0)
+                        # Build stable result using median mm
+                        _nominal = distance_gauge.nominal_mm
+                        _tolerance = distance_gauge.tolerance_mm
+                        _dev = round(_median_mm - _nominal, 2)
+                        _passed = abs(_dev) <= _tolerance
+                        _status = "OK" if _passed else "NG"
+                        stable_dist = {"mm": round(_median_mm, 2), "dev": _dev, "passed": _passed, "status": _status,
+                                       "pt_A": dist_result["pt_A"], "pt_B": dist_result["pt_B"]}
+                        latest_distance_result = stable_dist
+                        active_cycle_data["last_distance_result"] = stable_dist
                         active_cycle_data["distance_hold_until"] = now_t + 1.2
-                        current_cycle["distance_mm"] = dist_result["mm"]
-                        current_cycle["distance_dev"] = dist_result["dev"]
-                        current_cycle["distance_status"] = dist_result["status"]
-                        active_cycle_data["back_distance_mm"] = dist_result["mm"]
-                        active_cycle_data["back_distance_passed"] = dist_result["passed"]
+                        current_cycle["distance_mm"] = stable_dist["mm"]
+                        current_cycle["distance_dev"] = stable_dist["dev"]
+                        current_cycle["distance_status"] = stable_dist["status"]
+                        active_cycle_data["back_distance_mm"] = stable_dist["mm"]
+                        active_cycle_data["back_distance_passed"] = stable_dist["passed"]
                     elif now_t > active_cycle_data.get("distance_hold_until", 0):
                         current_cycle["distance_status"] = "NOT_FOUND"
             elif not back_visible and raw_front_detected:
                 with lock:
                     latest_distance_result = None
+                    active_cycle_data["distance_vote_buffer"] = []  # Reset buffer when part removed
                     current_cycle["distance_status"] = "Pending"
 
             # OCR logic (runs asynchronously)

@@ -77,6 +77,8 @@ def create_inspection_report(
     defects=None,
     defect_image_path=None,
     lock_striker_image_path=None,
+    catch_plug_mm=None,
+    catch_plug_passed=None,
     output_path=None
 ):
     """Generates a professional 3-page A4 PDF inspection report:
@@ -371,10 +373,20 @@ def create_inspection_report(
         except ValueError:
             pass
 
+    # Build catch plug distance row for result table
+    if catch_plug_mm is not None:
+        _cp_status_str = "OK" if catch_plug_passed else "NG"
+        _cp_color = "#10b981" if catch_plug_passed else "#ef4444"
+        _cp_text = (f'<font color="{_cp_color}"><b>{_cp_status_str}</b></font>'
+                    f'  \u2014  {catch_plug_mm:.2f} mm')
+    else:
+        _cp_text = "<font color='#64748b'>Not Measured</font>"
+
     result_details = [
         [Paragraph("<b>Product Serial:</b>", cell_style), Paragraph(display_serial, cell_style)],
         [Paragraph("<b>Confidence:</b>", cell_style), Paragraph(conf_str, cell_style)],
-        [Paragraph("<b>Inspection Timestamp:</b>", cell_style), Paragraph(f"{date_str} {time_str}", cell_style)]
+        [Paragraph("<b>Inspection Timestamp:</b>", cell_style), Paragraph(f"{date_str} {time_str}", cell_style)],
+        [Paragraph("<b>Catch Plug Distance:</b>", cell_style), Paragraph(_cp_text, cell_style)],
     ]
 
     result_details_table = Table(result_details, colWidths=[140, 183.27])
