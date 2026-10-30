@@ -611,23 +611,23 @@
         .gauge-card {
             background: var(--bg-card);
             border: 1.5px solid var(--border);
-            border-radius: 10px;
-            padding: 10px 12px 10px 12px;
+            border-radius: 7px;
+            padding: 5px 8px;
             display: flex;
             align-items: center;
-            gap: 12px;
+            gap: 8px;
             transition: border-color 0.3s, background 0.3s;
         }
         .gauge-card.gauge-ok  { border-color: #10b981; background: rgba(16,185,129,0.06); }
         .gauge-card.gauge-ng  { border-color: #ef4444; background: rgba(239,68,68,0.06); }
         .gauge-badge {
-            min-width: 48px;
-            height: 48px;
-            border-radius: 8px;
+            min-width: 30px;
+            height: 30px;
+            border-radius: 5px;
             display: flex;
             align-items: center;
             justify-content: center;
-            font-size: 18px;
+            font-size: 11px;
             font-weight: 800;
             letter-spacing: 1px;
             background: #f1f5f9;
@@ -636,11 +636,11 @@
         }
         .gauge-badge.badge-ok { background: rgba(16,185,129,0.15); color: #10b981; }
         .gauge-badge.badge-ng { background: rgba(239,68,68,0.15); color: #ef4444; }
-        .gauge-info { display: flex; flex-direction: column; gap: 3px; flex: 1; min-width: 0; }
-        .gauge-label { font-size: 10px; font-weight: 600; color: var(--text-muted); text-transform: uppercase; letter-spacing: 0.5px; }
-        .gauge-value { font-size: 18px; font-weight: 800; color: var(--text-main); letter-spacing: 0.5px; }
-        .gauge-dev   { font-size: 11px; font-weight: 600; color: var(--text-muted); }
-        .gauge-spec  { font-size: 10px; color: var(--text-muted); margin-top: 1px; }
+        .gauge-info { display: flex; flex-direction: column; gap: 1px; flex: 1; min-width: 0; }
+        .gauge-label { font-size: 9px; font-weight: 600; color: var(--text-muted); text-transform: uppercase; letter-spacing: 0.5px; }
+        .gauge-value { font-size: 13px; font-weight: 800; color: var(--text-main); letter-spacing: 0.5px; }
+        .gauge-dev   { font-size: 10px; font-weight: 600; color: var(--text-muted); }
+        .gauge-spec  { font-size: 9px; color: var(--text-muted); margin-top: 0px; }
 
         /* Traceability serial */
         .trace-content {
