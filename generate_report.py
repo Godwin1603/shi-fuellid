@@ -79,12 +79,14 @@ def create_inspection_report(
     lock_striker_image_path=None,
     catch_plug_mm=None,
     catch_plug_passed=None,
+    catch_plug_dev=None,
+    part_counts=None,
     output_path=None
 ):
     """Generates a professional 3-page A4 PDF inspection report:
-       - Page 1: Inspection Details & Front View Image
-       - Page 2: Back View Image & Defect Analysis (if defects exist)
-       - Page 3: Lock Striker (small) & Final Inspection Result
+       - Page 1: Inspection Details, Front View Image & Front Detected Component Status (OK/NG)
+       - Page 2: Back View Image, Back Detected Component Status (Holes, Hooks, Distance mm, Serial) & Defect Analysis
+       - Page 3: Lock Striker (small), Lock Striker Status (OK/NG) & Final Inspection Result
     """
     # Enforce status to FAIL whenever any defects are present
     if defects and len(defects) > 0:
@@ -123,19 +125,19 @@ def create_inspection_report(
         'ReportTitle',
         parent=styles['Normal'],
         fontName='Helvetica-Bold',
-        fontSize=20,
-        leading=24,
+        fontSize=18,
+        leading=22,
         textColor=colors.HexColor('#1a365d'),
         alignment=1, # Center
-        spaceAfter=10
+        spaceAfter=8
     )
     
     header_style = ParagraphStyle(
         'SectionHeader',
         parent=styles['Normal'],
         fontName='Helvetica-Bold',
-        fontSize=12,
-        leading=14,
+        fontSize=11,
+        leading=13,
         textColor=colors.HexColor('#1a365d'),
     )
     
@@ -143,8 +145,8 @@ def create_inspection_report(
         'TableCell',
         parent=styles['Normal'],
         fontName='Helvetica',
-        fontSize=9.5,
-        leading=13,
+        fontSize=9,
+        leading=12,
         textColor=colors.HexColor('#1e293b')
     )
     
@@ -152,23 +154,59 @@ def create_inspection_report(
         'ImageCaption',
         parent=styles['Normal'],
         fontName='Helvetica',
-        fontSize=9,
-        leading=12,
+        fontSize=8.5,
+        leading=11,
         alignment=1, # Center
         textColor=colors.HexColor('#475569')
     )
-    
-    story = []
-    
+
+    # Table styles for detection status tables
+    th_style = ParagraphStyle('TH', fontName='Helvetica-Bold', fontSize=8, leading=10, textColor=colors.white)
+    th_center = ParagraphStyle('THC', parent=th_style, alignment=1)
+    td_bold = ParagraphStyle('TDBold', fontName='Helvetica-Bold', fontSize=8, leading=10, textColor=colors.HexColor('#1e293b'))
+    td_norm = ParagraphStyle('TDNorm', fontName='Helvetica', fontSize=8, leading=10, textColor=colors.HexColor('#334155'))
+    badge_ok = ParagraphStyle('BOK', fontName='Helvetica-Bold', fontSize=8.5, leading=10.5, alignment=1, textColor=colors.HexColor('#0f5132'))
+    badge_ng = ParagraphStyle('BNG', fontName='Helvetica-Bold', fontSize=8.5, leading=10.5, alignment=1, textColor=colors.HexColor('#842029'))
+
+    def make_inspection_items_table(items):
+        """Constructs a clean 3-column table showing item name, detected/measured details, and an OK/NG badge."""
+        data = [[Paragraph("Inspection Item", th_style), Paragraph("Detected / Measured Detail", th_style), Paragraph("Status", th_center)]]
+        table_style = [
+            ('BACKGROUND', (0,0), (-1,0), colors.HexColor('#1a365d')),
+            ('VALIGN', (0,0), (-1,-1), 'MIDDLE'),
+            ('GRID', (0,0), (-1,-1), 0.5, colors.HexColor('#cbd5e1')),
+            ('TOPPADDING', (0,0), (-1,-1), 2.5),
+            ('BOTTOMPADDING', (0,0), (-1,-1), 2.5),
+            ('LEFTPADDING', (0,0), (-1,-1), 6),
+            ('RIGHTPADDING', (0,0), (-1,-1), 6),
+            ('ALIGN', (2,0), (2,-1), 'CENTER'),
+        ]
+        
+        for idx, (name, detail, is_ok) in enumerate(items, start=1):
+            badge_p = Paragraph("OK", badge_ok) if is_ok else Paragraph("NG", badge_ng)
+            data.append([
+                Paragraph(name, td_bold),
+                Paragraph(detail, td_norm),
+                badge_p
+            ])
+            row_bg = colors.HexColor('#f8fafc') if idx % 2 == 1 else colors.white
+            table_style.append(('BACKGROUND', (0, idx), (1, idx), row_bg))
+            cell_bg = colors.HexColor('#d1e7dd') if is_ok else colors.HexColor('#f8d7da')
+            table_style.append(('BACKGROUND', (2, idx), (2, idx), cell_bg))
+            
+        t = Table(data, colWidths=[140, 313.27, 70])
+        t.setStyle(TableStyle(table_style))
+        return t
+
     # Helper to generate section headers with underline
     def make_section_header(title):
         t = Table([[Paragraph(title, header_style)]], colWidths=[523.27])
         t.setStyle(TableStyle([
-            ('BOTTOMPADDING', (0,0), (-1,-1), 4),
-            ('TOPPADDING', (0,0), (-1,-1), 4),
+            ('BOTTOMPADDING', (0,0), (-1,-1), 3),
+            ('TOPPADDING', (0,0), (-1,-1), 3),
             ('LEFTPADDING', (0,0), (-1,-1), 0),
             ('RIGHTPADDING', (0,0), (-1,-1), 0),
-            ('LINEBELOW', (0,0), (-1,-1), 1.5, colors.HexColor('#1a365d')),
+            ('LINEBELOW', (0,0), (-1,-1), 1.25, colors.HexColor('#1a365d')),
         ]))
         return t
 
@@ -176,13 +214,13 @@ def create_inspection_report(
     def make_page_header():
         t = Table([
             [
-                Paragraph("<b>VISION INSPECTION REPORT</b>", ParagraphStyle('PageHeaderL', parent=styles['Normal'], fontName='Helvetica-Bold', fontSize=10, textColor=colors.HexColor('#1a365d'))),
-                Paragraph(f"Serial: <b>{display_serial}</b> &nbsp;|&nbsp; Date: <b>{date_str}</b>", ParagraphStyle('PageHeaderR', parent=styles['Normal'], fontName='Helvetica', fontSize=9, textColor=colors.HexColor('#64748b'), alignment=2))
+                Paragraph("<b>VISION INSPECTION REPORT</b>", ParagraphStyle('PageHeaderL', parent=styles['Normal'], fontName='Helvetica-Bold', fontSize=9.5, textColor=colors.HexColor('#1a365d'))),
+                Paragraph(f"Serial: <b>{display_serial}</b> &nbsp;|&nbsp; Date: <b>{date_str}</b>", ParagraphStyle('PageHeaderR', parent=styles['Normal'], fontName='Helvetica', fontSize=8.5, textColor=colors.HexColor('#64748b'), alignment=2))
             ]
         ], colWidths=[261.63, 261.64])
         t.setStyle(TableStyle([
             ('VALIGN', (0,0), (-1,-1), 'MIDDLE'),
-            ('BOTTOMPADDING', (0,0), (-1,-1), 4),
+            ('BOTTOMPADDING', (0,0), (-1,-1), 3),
             ('TOPPADDING', (0,0), (-1,-1), 0),
             ('LEFTPADDING', (0,0), (-1,-1), 0),
             ('RIGHTPADDING', (0,0), (-1,-1), 0),
@@ -211,16 +249,38 @@ def create_inspection_report(
         ]))
         return wrapper
 
+    # Parse counts and defects for breakdown tables
+    defects_set = set(defects or [])
+    part_counts = part_counts or {}
+
+    ring_bush_cnt = part_counts.get("ring_bush", 0 if ("missing_ring_bush" in defects_set or "missing_rod" in defects_set) else 1)
+    striker_cnt = part_counts.get("striker", 0 if "missing_striker" in defects_set else 2)
+    holes_cnt = part_counts.get("holes", 0 if ("missing_holes" in defects_set or "hole_spec_error" in defects_set) else 3)
+    back_hook_cnt = part_counts.get("back_hook", 0 if "missing_back_hook" in defects_set else 2)
+    ls_cnt = part_counts.get("lock_striker", 0 if "missing_lock_striker" in defects_set else 1)
+
+    # Format confidence score string
+    conf_str = f"{confidence}"
+    if isinstance(confidence, (int, float)):
+        conf_str = f"{confidence:.2f}%"
+    elif isinstance(confidence, str) and not confidence.endswith('%'):
+        try:
+            conf_str = f"{float(confidence):.2f}%"
+        except ValueError:
+            pass
+
+    story = []
+
     # =========================================================
     # PAGE 1: Front View & Inspection Details
     # =========================================================
     # 1. Report Title
     story.append(Paragraph("VISION INSPECTION REPORT", title_style))
-    story.append(Spacer(1, 8))
+    story.append(Spacer(1, 6))
     
     # 2. Inspection Details
     story.append(make_section_header("Inspection Details"))
-    story.append(Spacer(1, 6))
+    story.append(Spacer(1, 5))
     
     status_color = '#10b981' if status.upper() == 'PASS' else '#ef4444'
     status_html = f"<font color='{status_color}'><b>{status.upper()}</b></font>"
@@ -241,27 +301,44 @@ def create_inspection_report(
         ('BACKGROUND', (0,0), (0,-1), colors.HexColor('#f8fafc')),
         ('BACKGROUND', (2,0), (2,-1), colors.HexColor('#f8fafc')),
         ('GRID', (0,0), (-1,-1), 0.5, colors.HexColor('#cbd5e1')),
-        ('PADDING', (0,0), (-1,-1), 5),
+        ('PADDING', (0,0), (-1,-1), 4),
         ('VALIGN', (0,0), (-1,-1), 'MIDDLE'),
     ]))
     story.append(details_table)
-    story.append(Spacer(1, 14))
+    story.append(Spacer(1, 10))
     
     # 3. Front View Inspection Image
     story.append(make_section_header("Front View Inspection"))
-    story.append(Spacer(1, 8))
+    story.append(Spacer(1, 6))
     
-    max_fw, max_fh = 460, 320
+    max_fw, max_fh = 460, 240
     w_f, h_f = get_scaled_image_dims(front_image_path, max_fw, max_fh)
     if front_image_path and os.path.exists(front_image_path):
         img_f = Image(front_image_path, width=w_f, height=h_f)
     else:
         img_f = Paragraph("<font color='#ef4444'>[Front Image Not Found]</font>", caption_style)
-        w_f, h_f = max_fw, 80
+        w_f, h_f = max_fw, 70
 
     story.append(wrap_centered_image(img_f, w_f, h_f, '#94a3b8', 0.75))
     story.append(Spacer(1, 6))
-    story.append(Paragraph("<b>Front View</b><br/>Front image captured during inspection", caption_style))
+
+    # Front Detection Status Breakdown Table
+    rb_ok = ("missing_ring_bush" not in defects_set and "missing_rod" not in defects_set and ring_bush_cnt >= 1)
+    rb_detail = f"{ring_bush_cnt} / 1 Detected" if rb_ok else f"Missing Ring Bush ({ring_bush_cnt} / 1 Detected)"
+    
+    st_ok = ("missing_striker" not in defects_set and striker_cnt >= 2)
+    st_detail = f"{striker_cnt} / 2 Detected" if st_ok else f"Missing Striker ({striker_cnt} / 2 Detected)"
+    
+    front_defects_found = [d for d in defects_set if d in {"dent", "bulge", "buldge", "line_mark", "linemark", "line-mark", "damage", "defect", "striker_bend"}]
+    surf_ok = (len(front_defects_found) == 0)
+    surf_detail = "Clean — No Dent, Bulge, Line Mark, or Damage" if surf_ok else f"Defect Detected: {', '.join(d.replace('_', ' ').title() for d in front_defects_found)}"
+
+    front_table_items = [
+        ("Ring Bush (Req: 1)", rb_detail, rb_ok),
+        ("Striker (Req: 2)", st_detail, st_ok),
+        ("Front Surface Defects", surf_detail, surf_ok),
+    ]
+    story.append(make_inspection_items_table(front_table_items))
 
     # Page break to Page 2
     story.append(PageBreak())
@@ -270,46 +347,90 @@ def create_inspection_report(
     # PAGE 2: Back View & Defect Analysis
     # =========================================================
     story.append(make_page_header())
-    story.append(Spacer(1, 8))
+    story.append(Spacer(1, 6))
     story.append(make_section_header("Back View Inspection"))
-    story.append(Spacer(1, 8))
+    story.append(Spacer(1, 6))
 
     actual_defects = [d for d in (defects or []) if d != "serial_missing"]
     has_defect_img = bool(defect_image_path and os.path.exists(defect_image_path))
 
     # Size Back image according to whether Defect Analysis image is also on Page 2
     if has_defect_img:
-        max_bw, max_bh = 460, 230
+        max_bw, max_bh = 460, 160
     else:
-        max_bw, max_bh = 460, 340
+        max_bw, max_bh = 460, 250
 
     w_b, h_b = get_scaled_image_dims(back_image_path, max_bw, max_bh)
     if back_image_path and os.path.exists(back_image_path):
         img_b = Image(back_image_path, width=w_b, height=h_b)
     else:
         img_b = Paragraph("<font color='#ef4444'>[Back Image Not Found]</font>", caption_style)
-        w_b, h_b = max_bw, 80
+        w_b, h_b = max_bw, 70
 
     story.append(wrap_centered_image(img_b, w_b, h_b, '#94a3b8', 0.75))
     story.append(Spacer(1, 6))
-    story.append(Paragraph("<b>Back View</b><br/>Back image captured during inspection", caption_style))
+
+    # Back Detection Status Breakdown Table (Holes, Hooks, Distance mm, Serial, Surface)
+    holes_err = "hole_spec_error" in defects_set
+    holes_missing = "missing_holes" in defects_set or (part_counts and holes_cnt < 3)
+    holes_ok = not holes_err and not holes_missing
+    if holes_ok:
+        holes_detail = f"{holes_cnt} / 3 Detected"
+    elif holes_err:
+        holes_detail = "Hole Spec Error Detected"
+    else:
+        holes_detail = f"Missing Holes ({holes_cnt} / 3 Detected)"
+
+    hook_ok = ("missing_back_hook" not in defects_set and back_hook_cnt >= 2)
+    hook_detail = f"{back_hook_cnt} / 2 Detected" if hook_ok else f"Missing Back Hook ({back_hook_cnt} / 2 Detected)"
+
+    # Catch Plug Distance
+    if catch_plug_mm is not None:
+        dev_val = catch_plug_dev if catch_plug_dev is not None else round(catch_plug_mm - 128.40, 2)
+        dev_sign = '+' if dev_val >= 0 else ''
+        cp_ok = (catch_plug_passed is True) or (catch_plug_passed is None and abs(dev_val) <= 0.70)
+        cp_detail = f"<b>{catch_plug_mm:.2f} mm</b> &nbsp;|&nbsp; Dev: {dev_sign}{dev_val:.2f} mm &nbsp;|&nbsp; Spec: 128.40 ± 0.70 mm"
+    elif "dimension_not_found" in defects_set:
+        cp_ok = False
+        cp_detail = "Dimension Not Found / Unmeasurable &nbsp;|&nbsp; Spec: 128.40 ± 0.70 mm"
+    elif any("dimension" in d for d in defects_set):
+        cp_ok = False
+        cp_detail = "Distance Out of Spec &nbsp;|&nbsp; Spec: 128.40 ± 0.70 mm"
+    else:
+        cp_ok = True
+        cp_detail = "Not Measured &nbsp;|&nbsp; Spec: 128.40 ± 0.70 mm"
+
+    serial_ok = bool(serial_number and serial_number not in ["serial_missing", "------"] and "serial_missing" not in defects_set)
+    serial_detail = f"OCR Confirmed: <b>{display_serial}</b> (Conf: {conf_str})" if serial_ok else "Serial Missing / Unreadable"
+
+    back_defects_found = [d for d in defects_set if d in {"frame_damage", "back_hook_bend"}]
+    back_surf_ok = (len(back_defects_found) == 0)
+    back_surf_detail = "Clean — No Frame Damage or Hook Bend" if back_surf_ok else f"Defect Detected: {', '.join(d.replace('_', ' ').title() for d in back_defects_found)}"
+
+    back_table_items = [
+        ("Holes (Req: 3)", holes_detail, holes_ok),
+        ("Back Hook (Req: 2)", hook_detail, hook_ok),
+        ("Catch Plug Distance", cp_detail, cp_ok),
+        ("Traceability Serial", serial_detail, serial_ok),
+        ("Back Surface Defects", back_surf_detail, back_surf_ok),
+    ]
+    story.append(make_inspection_items_table(back_table_items))
 
     # Defect Analysis (annotated frame) if defect image exists
     if has_defect_img:
-        story.append(Spacer(1, 10))
+        story.append(Spacer(1, 8))
         story.append(make_section_header("Defect Analysis"))
-        story.append(Spacer(1, 6))
+        story.append(Spacer(1, 4))
 
-        max_dw, max_dh = 460, 200
+        max_dw, max_dh = 460, 140
         dw, dh = get_scaled_image_dims(defect_image_path, max_dw, max_dh)
         defect_img = Image(defect_image_path, width=dw, height=dh)
 
-        story.append(wrap_centered_image(defect_img, dw, dh, '#ef4444', 1.5))
-        story.append(Spacer(1, 4))
+        story.append(wrap_centered_image(defect_img, dw, dh, '#ef4444', 1.25))
+        story.append(Spacer(1, 3))
         defect_label_str = ", ".join(d.replace("_", " ").title() for d in (actual_defects or defects or ["Defect Detected"]))
         defect_caption = Paragraph(
-            f"<b>Detected Defects:</b> <font color='#ef4444'>{defect_label_str}</font><br/>"
-            f"Annotated frame — defect regions highlighted with bounding boxes and masks",
+            f"<b>Detected Defects:</b> <font color='#ef4444'><b>{defect_label_str}</b></font> &nbsp;|&nbsp; Highlighted with bounding boxes",
             caption_style
         )
         story.append(defect_caption)
@@ -321,27 +442,39 @@ def create_inspection_report(
     # PAGE 3: Lock Striker (Small) & Final Inspection Result
     # =========================================================
     story.append(make_page_header())
-    story.append(Spacer(1, 8))
+    story.append(Spacer(1, 6))
     story.append(make_section_header("Lock Striker Capture"))
-    story.append(Spacer(1, 8))
+    story.append(Spacer(1, 6))
 
-    # Lock Striker displayed in small size (fits nicely in a compact footprint)
-    max_ls_w, max_ls_h = 240, 150
+    # Lock Striker displayed in small size
+    max_ls_w, max_ls_h = 240, 120
     if lock_striker_image_path and os.path.exists(lock_striker_image_path):
         w_ls, h_ls = get_scaled_image_dims(lock_striker_image_path, max_ls_w, max_ls_h)
         ls_img = Image(lock_striker_image_path, width=w_ls, height=h_ls)
     else:
         ls_img = Paragraph("<font color='#64748b'>[Lock Striker Image Not Captured]</font>", caption_style)
-        w_ls, h_ls = max_ls_w, 60
+        w_ls, h_ls = max_ls_w, 50
 
     story.append(wrap_centered_image(ls_img, w_ls, h_ls, '#94a3b8', 0.75))
-    story.append(Spacer(1, 5))
-    story.append(Paragraph("<b>Lock Striker Detected</b><br/>Component image captured during cycle", caption_style))
-    story.append(Spacer(1, 16))
+    story.append(Spacer(1, 6))
+
+    # Lock Striker Detection Table
+    ls_ok = ("missing_lock_striker" not in defects_set and ls_cnt >= 1)
+    ls_detail = f"{ls_cnt} / 1 Detected" if ls_ok else f"Missing Lock Striker ({ls_cnt} / 1 Detected)"
+    
+    ls_bend_ok = ("lock_striker_bend" not in defects_set)
+    ls_bend_detail = "Normal Alignment (No Bend)" if ls_bend_ok else "Lock Striker Bend Detected"
+
+    ls_table_items = [
+        ("Lock Striker (Req: 1)", ls_detail, ls_ok),
+        ("Striker Alignment", ls_bend_detail, ls_bend_ok),
+    ]
+    story.append(make_inspection_items_table(ls_table_items))
+    story.append(Spacer(1, 14))
 
     # Inspection Result Section
     story.append(make_section_header("Inspection Result"))
-    story.append(Spacer(1, 10))
+    story.append(Spacer(1, 8))
 
     badge_bg = '#d1e7dd' if status.upper() == 'PASS' else '#f8d7da'
     badge_fg = '#0f5132' if status.upper() == 'PASS' else '#842029'
@@ -349,13 +482,13 @@ def create_inspection_report(
     badge_text_style = ParagraphStyle(
         'ResultBadgeText',
         fontName='Helvetica-Bold',
-        fontSize=26,
-        leading=30,
+        fontSize=24,
+        leading=28,
         alignment=1, # Center
         textColor=colors.HexColor(badge_fg)
     )
 
-    badge_table = Table([[Paragraph(status.upper(), badge_text_style)]], colWidths=[180], rowHeights=[60])
+    badge_table = Table([[Paragraph(status.upper(), badge_text_style)]], colWidths=[180], rowHeights=[55])
     badge_table.setStyle(TableStyle([
         ('BACKGROUND', (0,0), (-1,-1), colors.HexColor(badge_bg)),
         ('BOX', (0,0), (-1,-1), 1.5, colors.HexColor(badge_fg)),
@@ -363,20 +496,10 @@ def create_inspection_report(
         ('ALIGN', (0,0), (-1,-1), 'CENTER'),
     ]))
 
-    # Format confidence score
-    conf_str = f"{confidence}"
-    if isinstance(confidence, (int, float)):
-        conf_str = f"{confidence:.2f}%"
-    elif isinstance(confidence, str) and not confidence.endswith('%'):
-        try:
-            conf_str = f"{float(confidence):.2f}%"
-        except ValueError:
-            pass
-
     # Build catch plug distance row for result table
     if catch_plug_mm is not None:
-        _cp_status_str = "OK" if catch_plug_passed else "NG"
-        _cp_color = "#10b981" if catch_plug_passed else "#ef4444"
+        _cp_status_str = "OK" if cp_ok else "NG"
+        _cp_color = "#10b981" if cp_ok else "#ef4444"
         _cp_text = (f'<font color="{_cp_color}"><b>{_cp_status_str}</b></font>'
                     f'  \u2014  {catch_plug_mm:.2f} mm')
     else:
@@ -384,7 +507,7 @@ def create_inspection_report(
 
     result_details = [
         [Paragraph("<b>Product Serial:</b>", cell_style), Paragraph(display_serial, cell_style)],
-        [Paragraph("<b>Confidence:</b>", cell_style), Paragraph(conf_str, cell_style)],
+        [Paragraph("<b>OCR Confidence:</b>", cell_style), Paragraph(conf_str, cell_style)],
         [Paragraph("<b>Inspection Timestamp:</b>", cell_style), Paragraph(f"{date_str} {time_str}", cell_style)],
         [Paragraph("<b>Catch Plug Distance:</b>", cell_style), Paragraph(_cp_text, cell_style)],
     ]
@@ -392,7 +515,7 @@ def create_inspection_report(
     result_details_table = Table(result_details, colWidths=[140, 183.27])
     result_details_table.setStyle(TableStyle([
         ('LINEBELOW', (0,0), (-1,-2), 0.5, colors.HexColor('#e2e8f0')),
-        ('PADDING', (0,0), (-1,-1), 4),
+        ('PADDING', (0,0), (-1,-1), 3.5),
         ('VALIGN', (0,0), (-1,-1), 'MIDDLE'),
     ]))
 
@@ -409,15 +532,15 @@ def create_inspection_report(
     story.append(result_layout)
 
     if defects:
-        defect_str = ", ".join(defects).replace('_', ' ')
-        defect_text = f"<font color='#ef4444'><b>Defects detected : {defect_str}</b></font>"
-        story.append(Spacer(1, 10))
+        defect_str = ", ".join(d.replace('_', ' ').title() for d in defects)
+        defect_text = f"<font color='#ef4444'><b>Defects detected: {defect_str}</b></font>"
+        story.append(Spacer(1, 8))
         story.append(Paragraph(defect_text, ParagraphStyle(
             'DefectText',
             parent=styles['Normal'],
             fontName='Helvetica',
-            fontSize=12,
-            leading=16,
+            fontSize=11,
+            leading=14,
             alignment=1 # Center
         )))
 
@@ -452,16 +575,20 @@ if __name__ == "__main__":
         serial_number="220926022A1033",
         model_name="IP Cam",
         status="PASS",
-        date_str="2026-10-24",
-        time_str="10:45:00",
+        date_str="2026-10-31",
+        time_str="14:05:00",
         traceability_id="TRC220926022A1033",
         front_image_path=sample_front,
         back_image_path=sample_back,
         ocr_serial="220926022A1033",
         confidence=98.50,
-        defects=["hole_spec_error"] if sample_defect else None,
+        defects=["dent"] if sample_defect else None,
         defect_image_path=sample_defect,
         lock_striker_image_path=sample_ls,
+        catch_plug_mm=128.42,
+        catch_plug_passed=True,
+        catch_plug_dev=0.02,
+        part_counts={"ring_bush": 1, "striker": 2, "holes": 3, "back_hook": 2, "lock_striker": 1},
         output_path=test_out
     )
     print(f"Generated test report at: {res}")

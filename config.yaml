@@ -11,41 +11,48 @@ ai:
   # Per-class YOLO confidence thresholds. If a class is not listed, the default threshold below is used.
   class_confidences:
     front: 0.40
-    back: 0.40
+    back: 0.35
     serial: 0.10
     serial_area: 0.10
-    line_mark: 0.25
-    hole: 0.25
-    hole_spec_error: 0.35    # Hole specification error defect
-    back_hook: 0.40
-    back_hook_bend: 0.35     # NEW in V1.2: Back hook bend defect
-    lock_striker: 0.20
-    lock_striker_bend: 0.90 # NEW in V1.2: Lock striker bend defect
-    ring_bush: 0.30
-    striker: 0.35
-    striker_bend: 0.35       # NEW in V1.2: Striker bend defect
-    buldge: 0.25              # Surface bulge defect
-    dent: 0.25                # Surface dent defect
-    defect: 0.25              # NEW in V1.2: General defect
-    frame_damage: 0.30        # NEW in V1.2: Frame damage defect
-    hand: 0.10                # Hand detection (set to 0.20 for sensitive detection)
+    line_mark: 0.30
+    hole: 0.20
+    hole_spec_error: 0.45    # Hole specification error defect
+    back_hook: 0.20          # Back hook component (relaxed to ensure both hooks detected)
+    back_hook_bend: 0.45     # Back hook bend defect
+    lock_striker: 0.20       # Lock striker component (reliable capture)
+    lock_striker_bend: 0.50  # Lock striker bend defect
+    ring_bush: 0.20          # Ring bush component
+    striker: 0.25            # Striker component (ensures both strikers detected)
+    striker_bend: 0.45       # Striker bend defect
+    buldge: 0.45             # Surface bulge defect
+    dent: 0.45               # Surface dent defect
+    defect: 0.45             # General defect
+    frame_damage: 0.45       # Frame damage defect
+    hand: 0.25               # Hand detection (avoids false hand alarms)
   # Minimum bounding box area (in pixels) for a defect to be considered valid to prevent false positives quickly
   min_defect_area: 50
   # Default YOLO confidence threshold if a class is not specified above
-  default_yolo_confidence: 0.10
+  default_yolo_confidence: 0.15
   
-  # Hole inspection settings (Set check_missing_holes to true to re-enable NG when hole count < 3)
-  check_missing_holes: false     # Flag NG if holes count not satisfied (disabled per user request)
-  hide_holes_in_count_ui: true   # Hide Holes row from UI counts panel (set to false to show)
+  # Stabilization delay (in seconds) to capture a clear, steady lock striker image
+  lock_striker_delay: 0.4
+  
+  # Defect inspection & false-positive prevention settings
+  check_missing_holes: false       # Flag NG if holes count not satisfied (disabled per user request)
+  hide_holes_in_count_ui: true     # Hide Holes row from UI counts panel (set to false to show)
+  check_missing_serial_ng: false   # If false: unread serial will not fail part as NG (only flags NG if physical defect)
+  verify_stills_before_ng: true    # Cross-verify defects on captured high-resolution stills before logging NG
 
   # BC4I Fuel Door Distance Measurement (Catch Plug -> Trimline: 128.4 +/- 0.7 mm)
   distance_measurement:
     enabled: true
+    flag_as_ng: true               # Strictly enforce client specification (+/- 0.7 mm)
     model: "BC4I"
     cfg_dir: "gauge_cfg"
     nominal_mm: 128.4
-    tolerance_mm: 0.7
-    min_match_score: 0.70
+    tolerance_mm: 0.7              # Client drawing specification: 128.4 +/- 0.7 mm
+    min_match_score: 0.50          # Template matching confidence floor
+    vote_window: 10
 
   # Post-processing thresholds to filter out empty blue foam trays
   part_presence:
@@ -54,7 +61,8 @@ ai:
     laplacian_variance_min: 150.0  # Threshold for texture/edge density
 
   ring_bush_verification:
-    debug_mode: true
+    enabled: false                 # Disabled: YOLO model is primary source of truth; OpenCV ROI rejection caused false NGs
+    debug_mode: false
     lab_l_threshold: 200
     min_contour_area: 50
     max_contour_area: 5000
@@ -67,8 +75,6 @@ ai:
       position: 0.2
       shape: 0.2
 
-
-  
 # --- Data Management ---
 storage:
   # Number of days to keep old inspection reports and images before auto-deleting them

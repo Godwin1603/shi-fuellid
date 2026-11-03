@@ -114,7 +114,7 @@ def log_inspection(
         dt = custom_dt if custom_dt else datetime.now()
         
         # Normalize status to standard 'OK' or 'NG'
-        norm_status = "NG" if (status and status.upper() in ["FAIL", "NG"]) or (defects and len(defects) > 0) or (defect_image and os.path.exists(defect_image)) else "OK"
+        norm_status = "NG" if (status and status.upper() in ["FAIL", "NG"]) or (defects and len(defects) > 0) else "OK"
         
         # Check if 14-char serial provides shift letter directly: DDMMYY(6)+NNN(3)+[ABC](1)+HHMM(4)
         shift_from_serial = None

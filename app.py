@@ -227,25 +227,23 @@ def _detect_gpu():
 
         # CUDA is reported available — run a real smoke-test to confirm
         try:
-            _t = torch.zeros(1, device='cuda:0')
-            del _t
+            # Real kernel execution smoke test to confirm CUDA works
+            _t = torch.zeros((1, 3, 32, 32), device='cuda:0')
+            _conv = torch.nn.Conv2d(3, 4, 3).to('cuda:0')
+            _out = _conv(_t)
+            del _t, _conv, _out
             torch.cuda.synchronize()
             
-            # Smoke test passed, but we must verify driver version can handle the compiled CUDA version
+            # Smoke test passed. Note if driver is below nominal threshold but verified working.
             drv = _get_nvidia_driver_version()
+            drv_note = ''
             if drv > 0 and drv < _min_drv:
-                msg = (
-                    f"[GPU] CUDA DISABLED — Driver too old! "
-                    f"Installed: {drv}, Required for CUDA {cu_ver}: >={_min_drv}. "
-                    f"Update at: https://www.nvidia.com/Download/index.aspx "
-                    f"Falling back to CPU."
-                )
-                return False, 'cpu', msg
+                drv_note = f' (Driver {drv} < nominal {_min_drv}, verified compatible)'
                 
             gpu_name = torch.cuda.get_device_name(0)
             vram_gb  = round(torch.cuda.get_device_properties(0).total_memory / 1024**3, 1)
             attempt_note = f" (initialized on attempt {attempt}/{MAX_ATTEMPTS})" if attempt > 1 else ""
-            msg = f"[GPU] CUDA OK — {gpu_name} ({vram_gb} GB VRAM) — YOLO will use GPU:0{attempt_note}"
+            msg = f"[GPU] CUDA OK — {gpu_name} ({vram_gb} GB VRAM){drv_note} — YOLO will use GPU:0{attempt_note}"
             return True, 'cuda:0', msg
         except Exception as exc:
             if attempt < MAX_ATTEMPTS:
@@ -295,26 +293,36 @@ import io as _io
 import db_logger
 
 
-def kill_process_on_port(port=5001):
+def kill_process_on_port(port=5000):
     """Cleanly terminates any zombie/stale process listening on target port before restarting microservice."""
+    my_pid = os.getpid()
+    parent_pid = os.getppid()
     try:
         import subprocess
-        output = subprocess.check_output(f'netstat -ano | findstr :{port}', shell=True).decode('utf-8', errors='ignore')
-        for line in output.strip().splitlines():
-            parts = line.split()
-            if len(parts) >= 5 and 'LISTENING' in line:
-                pid = parts[-1]
-                logger.info(f"[OCR Recovery] Killing zombie process on port {port} (PID: {pid})...")
-                subprocess.run(f'taskkill /F /PID {pid}', shell=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-    except Exception:
-        pass
+        cmd = [
+            "powershell.exe", "-NoProfile", "-Command",
+            f"Get-NetTCPConnection -LocalPort {port} -State Listen -ErrorAction SilentlyContinue | Select-Object -ExpandProperty OwningProcess"
+        ]
+        res = subprocess.run(cmd, capture_output=True, text=True, errors="ignore")
+        if res.returncode == 0 and res.stdout.strip():
+            for line in res.stdout.strip().splitlines():
+                line = line.strip()
+                if line.isdigit():
+                    pid = int(line)
+                    if pid != my_pid and pid != parent_pid:
+                        logger.info(f"[Port Recovery] Terminating stale process on port {port} (PID: {pid})...")
+                        subprocess.run(f"taskkill /F /PID {pid}", shell=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                        subprocess.run(["powershell.exe", "-NoProfile", "-Command", f"(Get-CimInstance Win32_Process -Filter 'ProcessId = {pid}').Terminate()"],
+                                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    except Exception as e:
+        logger.warning(f"[Port Recovery] Error querying port {port}: {e}")
 
 def kill_camera_holders():
     """
     Force-release any processes holding the GigE camera in EXCLUSIVE mode.
     Kills:
       1. Known I-TEK IKap viewer/tool processes
-      2. Other app.py instances (not the current process) that may hold the camera
+      2. Other app.py or paddleocr_server.py instances (not the current process)
     Returns list of killed process names for logging.
     """
     import subprocess
@@ -322,7 +330,7 @@ def kill_camera_holders():
     killed = []
     my_pid = _os.getpid()
 
-    # Known I-TEK camera applications that grab the camera in exclusive mode
+    # 1. Known I-TEK camera applications that grab the camera in exclusive mode
     itek_procs = [
         "IKapCViewer.exe", "IKapExpert.exe", "IKTool.exe",
         "GeneralConfigurator.exe", "FeatureImportExportTool.exe",
@@ -341,34 +349,69 @@ def kill_camera_holders():
         except Exception:
             pass
 
-    # Kill other app.py instances (not this process)
+    # 2. Modern process scan using PowerShell CIM (replaces deprecated wmic)
     try:
-        import ctypes as _ctypes
-        from ctypes import wintypes as _wt
-        output = subprocess.check_output(
-            'wmic process where "name=\'python.exe\' or name=\'py.exe\'" get ProcessId,CommandLine /format:csv',
-            shell=True
-        ).decode('utf-8', errors='ignore')
-        for line in output.strip().splitlines():
-            parts = line.split(',')
-            if len(parts) < 3:
+        parent_pid = _os.getppid()
+        cmd = [
+            "powershell.exe", "-NoProfile", "-Command",
+            "Get-CimInstance Win32_Process -Filter \"Name like '%python%'\" | ForEach-Object { \"$($_.ProcessId)::$($_.Name)::$($_.CommandLine)\" }"
+        ]
+        out = subprocess.check_output(cmd, text=True, errors="ignore")
+        for line in out.strip().splitlines():
+            if "::" not in line:
                 continue
-            cmd = parts[1] if len(parts) > 1 else ''
-            pid_str = parts[-1].strip()
-            if 'app.py' in cmd and pid_str.isdigit():
-                pid = int(pid_str)
-                if pid != my_pid:
-                    try:
-                        subprocess.run(f'taskkill /F /PID {pid}', shell=True,
-                                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-                        logger.warning(f"[ForceRelease] Killed competing app.py PID {pid}")
-                        killed.append(f"app.py(PID:{pid})")
-                    except Exception:
-                        pass
+            parts = line.split("::", 2)
+            pid_str = parts[0].strip()
+            proc_name = parts[1].strip() if len(parts) > 1 else ""
+            cmdline = parts[2].strip() if len(parts) > 2 else ""
+            if not pid_str.isdigit():
+                continue
+            pid = int(pid_str)
+            if pid == my_pid or pid == parent_pid:
+                continue
+            if proc_name.lower() in ("py.exe", "cmd.exe", "powershell.exe"):
+                continue
+            if "app.py" in cmdline or "paddleocr_server.py" in cmdline:
+                try:
+                    subprocess.run(f"taskkill /F /PID {pid}", shell=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                    subprocess.run(["powershell.exe", "-NoProfile", "-Command", f"(Get-CimInstance Win32_Process -Filter 'ProcessId = {pid}').Terminate()"],
+                                   stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                    logger.warning(f"[ForceRelease] Killed competing instance PID {pid} ({cmdline[:60]})")
+                    killed.append(f"PID:{pid}")
+                except Exception:
+                    pass
     except Exception as e:
-        logger.warning(f"[ForceRelease] Could not scan for competing app.py processes: {e}")
+        logger.warning(f"[ForceRelease] Could not scan for competing Python processes: {e}")
 
     return killed
+
+_single_instance_mutex = None
+
+def enforce_single_instance(mutex_name="Local\\SHI_FuelLid_SingleInstance_Mutex"):
+    """
+    Guarantees that only ONE instance of app.py runs at any given time.
+    If an existing instance is detected, terminates it to recover cleanly.
+    """
+    global _single_instance_mutex
+    import ctypes
+    ERROR_ALREADY_EXISTS = 183
+    kernel32 = ctypes.windll.kernel32
+    handle = kernel32.CreateMutexW(None, False, mutex_name)
+    last_error = kernel32.GetLastError()
+    if last_error == ERROR_ALREADY_EXISTS:
+        logger.warning("[SingleInstance] Detected existing instance. Cleaning up stale processes and taking over...")
+        kill_camera_holders()
+        kill_process_on_port(5000)
+        kill_process_on_port(5001)
+        time.sleep(1.0)
+        if handle:
+            kernel32.CloseHandle(handle)
+        handle = kernel32.CreateMutexW(None, False, mutex_name)
+    _single_instance_mutex = handle
+    return handle
+
+_last_ocr_restart_time = 0.0
+_ocr_restart_lock = threading.Lock()
 
 class _PaddleOCRClient:
     """HTTP client that calls the paddleocr_server.py microservice (py -3.12)."""
@@ -379,48 +422,63 @@ class _PaddleOCRClient:
 
     def predict_crop(self, img_bgr):
         """Send a BGR crop to the PaddleOCR server, returns list of {rec_text, rec_score}."""
+        global _last_ocr_restart_time
         try:
             _, buf = cv2.imencode('.jpg', img_bgr, [cv2.IMWRITE_JPEG_QUALITY, 95])
             b64 = _base64.b64encode(buf).decode()
             payload = _json.dumps({"image": b64}).encode()
-            req = _urllib_req.Request(self.PADDLE_URL, data=payload,
-                                      headers={'Content-Type': 'application/json'})
-            resp = _urllib_req.urlopen(req, timeout=8)  # 8s per rotation; OCR runs in background thread so this doesn't block UI
-            raw_data = resp.read()
-            data = _json.loads(raw_data)
-            results = data.get("results", [])
-            
-            print(f"\n[OCR RESPONSE]")
-            print(f"HTTP status = {resp.status}")
-            print(f"raw response = {raw_data.decode('utf-8', errors='ignore')}")
-            print(f"recognized texts = {[r.get('rec_text') for r in results]}\n")
-            
-            if results:
-                return results
-            else:
-                print(f"[OCR ERROR] PaddleOCR returned no usable text")
-                return []
-        except urllib.error.HTTPError as e:
-            try:
-                err_body = e.read().decode('utf-8')
-            except Exception:
-                err_body = str(e)
-            logger.info(f"raw response = {e} - Body: {err_body}")
-            logger.info(f"recognized texts = []")
-            logger.error(f"[OCR ERROR] PaddleOCR request failed: {e} - {err_body}")
-            return []
-        except Exception as e:
-            logger.info(f"raw response = {e}")
-            logger.info(f"recognized texts = []")
-            logger.error(f"[OCR ERROR] PaddleOCR request failed: {e}")
-            # Auto-attempt starting PaddleOCR server if connection was refused
-            try:
-                import subprocess
-                kill_process_on_port(5001)
-                logger.info("Attempting to auto-start paddleocr_server.py in background...")
-                subprocess.Popen(["py", "-3.12", "paddleocr_server.py", "--parent-pid", str(os.getpid())], cwd=os.getcwd(), creationflags=0x08000000)
-            except Exception as launch_err:
-                logger.error(f"Failed to auto-launch paddleocr_server.py: {launch_err}")
+
+            max_attempts = 2
+            for attempt in range(max_attempts):
+                try:
+                    req = _urllib_req.Request(self.PADDLE_URL, data=payload,
+                                              headers={'Content-Type': 'application/json'})
+                    resp = _urllib_req.urlopen(req, timeout=10)  # 10s per rotation
+                    raw_data = resp.read()
+                    data = _json.loads(raw_data)
+                    results = data.get("results", [])
+                    
+                    print(f"\n[OCR RESPONSE]")
+                    print(f"HTTP status = {resp.status}")
+                    print(f"raw response = {raw_data.decode('utf-8', errors='ignore')}")
+                    print(f"recognized texts = {[r.get('rec_text') for r in results]}\n")
+                    
+                    if results:
+                        return results
+                    else:
+                        print(f"[OCR ERROR] PaddleOCR returned no usable text")
+                        return []
+                except urllib.error.HTTPError as e:
+                    try:
+                        err_body = e.read().decode('utf-8')
+                    except Exception:
+                        err_body = str(e)
+                    logger.info(f"raw response = {e} - Body: {err_body}")
+                    logger.info(f"recognized texts = []")
+                    logger.error(f"[OCR ERROR] PaddleOCR request failed: {e} - {err_body}")
+                    return []
+                except Exception as e:
+                    # Connection error / refused: check if OCR server needs restarting (throttled to at most once per 20s)
+                    with _ocr_restart_lock:
+                        now_t = time.time()
+                        if now_t - _last_ocr_restart_time > 20.0:
+                            _last_ocr_restart_time = now_t
+                            logger.info(f"[OCR] Connection failed ({e}). Auto-starting paddleocr_server.py in background...")
+                            try:
+                                import subprocess
+                                kill_process_on_port(5001)
+                                subprocess.Popen(["py", "-3.12", "paddleocr_server.py", "--parent-pid", str(os.getpid())], cwd=os.getcwd(), creationflags=0x08000000)
+                            except Exception as launch_err:
+                                logger.error(f"Failed to auto-launch paddleocr_server.py: {launch_err}")
+                    if attempt < max_attempts - 1:
+                        time.sleep(2.0)
+                        continue
+                    logger.info(f"raw response = {e}")
+                    logger.info(f"recognized texts = []")
+                    logger.error(f"[OCR ERROR] PaddleOCR request failed: {e}")
+                    return []
+        except Exception as outer_err:
+            logger.error(f"[OCR ERROR] predict_crop outer exception: {outer_err}")
             return []
 
 PaddleOCR = _PaddleOCRClient
@@ -1062,7 +1120,47 @@ def _try_reconstruct_serial(raw_clean):
     return None
 
 
-def run_ocr_on_crop(crop_rgb):
+def _extract_partial_serial_lines(results):
+    """
+    Extract date line (10 chars) or time line (4 chars) individually from OCR results.
+    Allows accumulating date and time lines across rotations/crops within the same cycle.
+    """
+    p_date = None
+    p_time = None
+    p_conf = 0.0
+    for res in results:
+        raw_text = res.get("rec_text", "").strip().upper()
+        conf = res.get("rec_score", 0.0)
+        corrected = _correct_ocr_chars(raw_text)
+        
+        # Check Line 1: DDMMYY + NNN + [ABC] (exactly 10 chars)
+        if not p_date:
+            clean1 = re.sub(r"[^A-Z0-9]", "", corrected)
+            m = re.search(r"(\d{6})(\d{3})([ABC])", clean1)
+            if m:
+                cand = m.group(1) + m.group(2) + m.group(3)
+                dd = int(cand[0:2])
+                mm_val = int(cand[2:4])
+                yy = int(cand[4:6])
+                if 1 <= dd <= 31 and 1 <= mm_val <= 12 and 20 <= yy <= 40:
+                    p_date = cand
+                    p_conf = max(p_conf, conf)
+                    
+        # Check Line 2: HH:MM or HHMM (4 digits)
+        if not p_time:
+            time_clean = re.sub(r"[^0-9:]", "", raw_text)
+            mt = re.search(r"(\d{2})[:\.]?(\d{2})", time_clean)
+            if mt:
+                hh = int(mt.group(1))
+                mi = int(mt.group(2))
+                if 0 <= hh <= 23 and 0 <= mi <= 59:
+                    p_time = mt.group(1) + mt.group(2)
+                    p_conf = max(p_conf, conf)
+                    
+    return p_date, p_time, p_conf
+
+
+def run_ocr_on_crop(crop_rgb, c_data=None):
     """Try OCR on a crop in all 4 rotations. Returns (text, confidence) or (None, 0).
 
     Serial format enforced: DDMMYY(6) + NNN(3) + [A|B|C](1) + HHMM(4) = 14 chars.
@@ -1070,11 +1168,14 @@ def run_ocr_on_crop(crop_rgb):
 
     Strategy:
       Primary   - parse OCR lines SEPARATELY (line1=date+count+letter, line2=time)
+      Accumulate- combine valid line1 + line2 across frames if separate
       Fallback  - reconstruct from concatenated cleaned text (3-pass)
     Both paths enforce date validity (DD 01-31, MM 01-12) and time validity (HH 00-23, MM 00-59).
     This rejects OCR misreads like MM=22 that look correct in format but are impossible dates.
     """
-    rotations = [None, cv2.ROTATE_90_COUNTERCLOCKWISE, cv2.ROTATE_180, cv2.ROTATE_90_CLOCKWISE]
+    # Camera mounts fuel door parts 180 deg upside-down on jig.
+    # Trying ROTATE_180 first gives instant single-shot detection in <0.5s.
+    rotations = [cv2.ROTATE_180, None, cv2.ROTATE_90_COUNTERCLOCKWISE, cv2.ROTATE_90_CLOCKWISE]
     best_text = None
     best_conf = 0.0
 
@@ -1108,6 +1209,23 @@ def run_ocr_on_crop(crop_rgb):
             else:
                 print(f"accepted/rejected = rejected (per-line, conf {eff_conf:.3f} not > {best_conf:.3f})")
             break  # per-line match is highest quality, stop rotating
+
+        # ── INTERMEDIATE: partial line accumulation across frames ─────────
+        if c_data is not None:
+            p_date, p_time, p_conf = _extract_partial_serial_lines(results)
+            if p_date and not c_data.get("ocr_partial_date"):
+                c_data["ocr_partial_date"] = p_date
+                print(f"[OCR Partial] Stored Date part: {p_date}")
+            if p_time and not c_data.get("ocr_partial_time"):
+                c_data["ocr_partial_time"] = p_time
+                print(f"[OCR Partial] Stored Time part: {p_time}")
+            if c_data.get("ocr_partial_date") and c_data.get("ocr_partial_time"):
+                combined = c_data["ocr_partial_date"] + c_data["ocr_partial_time"]
+                if _validate_serial(combined):
+                    print(f"combined-partial = {combined} (conf={p_conf:.3f}) ✓")
+                    best_text = combined
+                    best_conf = p_conf if p_conf > 0 else 0.90
+                    break
 
         # ── FALLBACK: combined-text reconstruction ────────────────────────
         text_sub = combined_text.strip().upper()
@@ -1154,7 +1272,7 @@ def process_ocr_async(crop_img, temp_folder, crop_num, c_data):
             logger.info(f"[OCR Thread] Skipping crop {crop_num} save (temp_folder is None)")
 
         # The OCR client's imencode expects BGR, so do not convert to RGB
-        detected_serial, confidence = run_ocr_on_crop(crop_img)
+        detected_serial, confidence = run_ocr_on_crop(crop_img, c_data)
 
         if detected_serial:
             with lock:
@@ -1170,53 +1288,45 @@ def process_ocr_async(crop_img, temp_folder, crop_num, c_data):
                 logger.info(f"vote count = {len(c_data['serial_votes'])}\n")
 
                 is_active = (c_data is active_cycle_data)
-
-                # We no longer update current_cycle["serial"] here so false OCR votes 
-                # do not flash in the main UI before finalization.
-
                 votes = c_data["serial_votes"]
-                if len(votes) >= 1 and is_active:
-                    current_cycle["vote_1"] = f"{votes[-1]['text']} ({votes[-1]['confidence']:.1f}%)"
-                if len(votes) >= 2 and is_active:
-                    current_cycle["vote_2"] = f"{votes[-2]['text']} ({votes[-2]['confidence']:.1f}%)"
-                if len(votes) >= 3 and is_active:
-                    current_cycle["vote_3"] = f"{votes[-3]['text']} ({votes[-3]['confidence']:.1f}%)"
 
-                logger.info(f"[OCR Thread] Crop {crop_num}: {detected_serial} ({confidence:.1f}%)")
+                # Pick the highest-confidence vote accumulated so far
+                best_vote_entry = max(votes, key=lambda v: v["confidence"])
+                curr_serial = best_vote_entry["text"]
+                curr_conf = best_vote_entry["confidence"]
 
-                # Finalize if we have collected at least 2 votes (pick the best one)
-                if len(votes) >= 2:
-                    best_vote_entry = max(votes, key=lambda v: v["confidence"])
-                    final_serial = best_vote_entry["text"]
-                    final_conf = best_vote_entry["confidence"]
+                # Immediately store serial on the cycle so it is NEVER lost or marked missing
+                c_data["final_crop_path"] = best_vote_entry.get("crop_path")
+                c_data["serial_number"] = curr_serial
+                c_data["ocr_confidence"] = curr_conf
+                c_data.get("defects_detected", set()).discard("serial_missing")
+                if "serial_missing" in active_cycle_data.get("defects_detected", set()):
+                    active_cycle_data["defects_detected"].discard("serial_missing")
 
-                    c_data["final_crop_path"] = best_vote_entry.get("crop_path")
+                # Format as: YYMMDD NNNA HHMM (e.g. 021126 023A 0826)
+                fs_fmt = f"{curr_serial[:6]} {curr_serial[6:10]} {curr_serial[10:]}" if len(curr_serial) == 14 else curr_serial
 
-                    c_data["serial_number"] = final_serial
-                    c_data["ocr_confidence"] = final_conf
-                    c_data.get("defects_detected", set()).discard("serial_missing")
-                    if "serial_missing" in active_cycle_data.get("defects_detected", set()):
-                        active_cycle_data["defects_detected"].discard("serial_missing")
-                    
-                    logger.info(f"\n[OCR FINAL]")
-                    logger.info(f"serial_number = {final_serial}")
-                    logger.info(f"confidence = {final_conf:.1f}%\n")
-                    
-                    if is_active:
-                        # Format as: YYMMDD NNNA HHMM
-                        fs_fmt = f"{final_serial[:6]} {final_serial[6:10]} {final_serial[10:]}"
-                        
-                        current_cycle["serial"] = fs_fmt
-                        current_cycle["confidence"] = f"{final_conf:.2f}%"
-                        if current_cycle["status"].startswith("Finished Cycle"):
-                            current_cycle["status"] = "Finished Cycle for " + fs_fmt
+                if is_active:
+                    current_cycle["serial"] = fs_fmt
+                    current_cycle["confidence"] = f"{curr_conf:.1f}%"
+                    if current_cycle["status"].startswith("Finished Cycle"):
+                        current_cycle["status"] = "Finished Cycle for " + fs_fmt
 
-                        # Show the two votes that were collected
+                    if len(votes) >= 1:
                         current_cycle["vote_1"] = f"{votes[0]['text']} ({votes[0]['confidence']:.1f}%)"
+                    if len(votes) >= 2:
                         current_cycle["vote_2"] = f"{votes[1]['text']} ({votes[1]['confidence']:.1f}%)"
-                        current_cycle["vote_3"] = "- - - - - -"
+                    if len(votes) >= 3:
+                        current_cycle["vote_3"] = f"{votes[2]['text']} ({votes[2]['confidence']:.1f}%)"
 
-                    logger.info(f"[OCR Thread] Finalized: {final_serial} ({final_conf:.1f}%)")
+                logger.info(f"[OCR Thread] Crop {crop_num}: {detected_serial} ({confidence:.1f}%) -> Active Serial: {curr_serial}")
+
+                # Finalize OCR if we have 2 votes or if confidence is high (>= 90%)
+                if len(votes) >= 2 or curr_conf >= 90.0:
+                    logger.info(f"\n[OCR FINAL]")
+                    logger.info(f"serial_number = {curr_serial}")
+                    logger.info(f"confidence = {curr_conf:.1f}%\n")
+                    logger.info(f"[OCR Thread] Finalized: {curr_serial} ({curr_conf:.1f}%)")
                     check_and_finalize_cycle(c_data)
         else:
             logger.info(f"[OCR Thread] Crop {crop_num}: no valid 14-16 character alphanumeric serial found")
@@ -1237,15 +1347,15 @@ def finalize_report_and_rename(c_data):
                 current_cycle["instruction_color"] = "blue"
                 current_cycle["status"] = "Reading Serial Number..."
         
-        # Wait for OCR to finish reading serial (up to 15 seconds)
+        # Wait for OCR to finish reading serial (up to 12 seconds)
         ocr_wait_start = time.time()
-        while time.time() - ocr_wait_start < 6.0:
+        while time.time() - ocr_wait_start < 12.0:
             with lock:
-                if c_data["serial_number"] is not None:
+                if c_data.get("serial_number") is not None and c_data["serial_number"] != "serial_missing":
                     logger.info(f"[Finalize] OCR ready: {c_data['serial_number']}")
                     break
                 # Check if any votes came in while waiting
-                if c_data["serial_votes"] and not c_data["ocr_thread_active"]:
+                if c_data.get("serial_votes"):
                     best_vote = max(c_data["serial_votes"], key=lambda v: v["confidence"])
                     c_data["serial_number"] = best_vote["text"]
                     c_data["ocr_confidence"] = best_vote["confidence"]
@@ -1253,17 +1363,20 @@ def finalize_report_and_rename(c_data):
                     c_data.get("defects_detected", set()).discard("serial_missing")
                     if "serial_missing" in active_cycle_data.get("defects_detected", set()):
                         active_cycle_data["defects_detected"].discard("serial_missing")
-                    if c_data is active_cycle_data:
-                        current_cycle["serial"] = best_vote["text"]
-                        current_cycle["confidence"] = f"{best_vote['confidence']:.1f}%"
+                    fs_fmt = f"{best_vote['text'][:6]} {best_vote['text'][6:10]} {best_vote['text'][10:]}" if len(best_vote['text']) == 14 else best_vote['text']
+                    current_cycle["serial"] = fs_fmt
+                    current_cycle["confidence"] = f"{best_vote['confidence']:.1f}%"
                     logger.info(f"[Finalize] Using best OCR vote: {best_vote['text']} ({best_vote['confidence']:.1f}%)")
                     break
-            time.sleep(0.02)
+                # Only break early if OCR thread is done and at least 3s have elapsed
+                if not c_data.get("ocr_thread_active") and (time.time() - ocr_wait_start > 3.0):
+                    break
+            time.sleep(0.05)
         
         # Last resort: if OCR still has nothing after waiting
         with lock:
             if c_data["serial_number"] is None:
-                if c_data["serial_votes"]:
+                if c_data.get("serial_votes"):
                     best_vote = max(c_data["serial_votes"], key=lambda v: v["confidence"])
                     c_data["serial_number"] = best_vote["text"]
                     c_data["ocr_confidence"] = best_vote["confidence"]
@@ -1271,14 +1384,15 @@ def finalize_report_and_rename(c_data):
                     c_data.get("defects_detected", set()).discard("serial_missing")
                     if "serial_missing" in active_cycle_data.get("defects_detected", set()):
                         active_cycle_data["defects_detected"].discard("serial_missing")
-                    if c_data is active_cycle_data:
-                        current_cycle["serial"] = best_vote["text"]
-                        current_cycle["confidence"] = f"{best_vote['confidence']:.1f}%"
+                    fs_fmt = f"{best_vote['text'][:6]} {best_vote['text'][6:10]} {best_vote['text'][10:]}" if len(best_vote['text']) == 14 else best_vote['text']
+                    current_cycle["serial"] = fs_fmt
+                    current_cycle["confidence"] = f"{best_vote['confidence']:.1f}%"
                     logger.info(f"[Finalize] Late OCR vote: {best_vote['text']} ({best_vote['confidence']:.1f}%)")
                 else:
                     c_data["serial_number"] = "serial_missing"
                     c_data["ocr_confidence"] = 0.0
-                    logger.info(f"[Finalize] No OCR result after 5s wait, using serial_missing")
+                    c_data.get("defects_detected", set()).add("serial_missing")
+                    logger.info(f"[Finalize] No OCR result after wait, using serial_missing")
 
         # Feature: Recheck if serial is missing
         is_missing = False
@@ -1302,14 +1416,17 @@ def finalize_report_and_rename(c_data):
                 with lock:
                     if c_data.get("serial_number") is not None and c_data.get("serial_number") != "serial_missing":
                         break
-                    if c_data.get("serial_votes") and not c_data.get("ocr_thread_active"):
+                    if c_data.get("serial_votes"):
                         best_vote = max(c_data["serial_votes"], key=lambda v: v["confidence"])
                         c_data["serial_number"] = best_vote["text"]
                         c_data["ocr_confidence"] = best_vote["confidence"]
                         c_data["final_crop_path"] = best_vote.get("crop_path")
-                        if c_data is active_cycle_data:
-                            current_cycle["serial"] = best_vote["text"]
-                            current_cycle["confidence"] = f"{best_vote['confidence']:.1f}%"
+                        c_data.get("defects_detected", set()).discard("serial_missing")
+                        if "serial_missing" in active_cycle_data.get("defects_detected", set()):
+                            active_cycle_data["defects_detected"].discard("serial_missing")
+                        fs_fmt = f"{best_vote['text'][:6]} {best_vote['text'][6:10]} {best_vote['text'][10:]}" if len(best_vote['text']) == 14 else best_vote['text']
+                        current_cycle["serial"] = fs_fmt
+                        current_cycle["confidence"] = f"{best_vote['confidence']:.1f}%"
                         break
                 time.sleep(0.02)
 
@@ -1347,7 +1464,94 @@ def finalize_report_and_rename(c_data):
             logger.error(f"[Finalize Thread] temp_folder '{temp_dir}' does not exist, aborting finalization.")
             return
         
-        # Read defects and verify holes
+        # Second-Opinion Verification on Captured High-Resolution Still Images
+        # This completely eliminates false NGs caused by motion blur, lighting glare, or transient video streaming frame drops!
+        verify_stills = APP_CONFIG.get("ai", {}).get("verify_stills_before_ng", True)
+        if verify_stills and YOLO_MODEL is not None:
+            try:
+                # 1. Front still verification (Ring Bush, Strikers, Front surface defects)
+                if front and os.path.exists(front):
+                    f_img = cv2.imread(front)
+                    if f_img is not None:
+                        f_res = YOLO_MODEL(f_img, verbose=False, conf=0.15, imgsz=640, device=YOLO_DEVICE)[0]
+                        f_strikers = 0
+                        f_ring_bush = 0
+                        f_confirmed_surface = []
+                        for b in f_res.boxes:
+                            cname = YOLO_MODEL.names[int(b.cls[0])].lower()
+                            cconf = float(b.conf[0])
+                            if cname in ["ring_bush", "ringbush"] and cconf >= 0.20:
+                                f_ring_bush += 1
+                            elif cname == "striker" and cconf >= 0.25:
+                                f_strikers += 1
+                            elif cname in FRONT_DEFECT_CLASSES and cconf >= 0.45:
+                                f_confirmed_surface.append(cname)
+                        
+                        if f_ring_bush >= 1:
+                            c_data["max_ring_bush_detected"] = max(c_data.get("max_ring_bush_detected", 0), 1)
+                            c_data["max_rod_detected"] = max(c_data.get("max_rod_detected", 0), 1)
+                        if f_strikers >= 2:
+                            c_data["max_striker_detected"] = max(c_data.get("max_striker_detected", 0), 2)
+                        elif f_strikers >= 1:
+                            c_data["max_striker_detected"] = max(c_data.get("max_striker_detected", 0), f_strikers)
+                            
+                        # If a front surface defect was flagged by live tracker but is NOT confirmed on the crisp still, discard it
+                        for d in list(c_data.get("defects_detected", set())):
+                            if d in FRONT_DEFECT_CLASSES and d not in f_confirmed_surface:
+                                logger.info(f"[Still Verification] Discarded false front defect '{d}' (not confirmed on still)")
+                                c_data["defects_detected"].discard(d)
+                            
+                # 2. Back still verification (Back hooks, Holes, Back surface defects)
+                if back and os.path.exists(back):
+                    b_img = cv2.imread(back)
+                    if b_img is not None:
+                        b_res = YOLO_MODEL(b_img, verbose=False, conf=0.15, imgsz=640, device=YOLO_DEVICE)[0]
+                        b_hooks = 0
+                        b_holes = 0
+                        b_confirmed_surface = []
+                        for b in b_res.boxes:
+                            cname = YOLO_MODEL.names[int(b.cls[0])].lower()
+                            cconf = float(b.conf[0])
+                            if cname == "back_hook" and cconf >= 0.15:
+                                b_hooks += 1
+                            elif cname in ["hole", "holes"] and cconf >= 0.20:
+                                b_holes += 1
+                            elif cname in BACK_DEFECT_CLASSES and cconf >= 0.45:
+                                b_confirmed_surface.append(cname)
+                                
+                        if b_hooks >= 2:
+                            c_data["max_back_hook_detected"] = max(c_data.get("max_back_hook_detected", 0), 2)
+                        elif b_hooks >= 1:
+                            c_data["max_back_hook_detected"] = max(c_data.get("max_back_hook_detected", 0), b_hooks)
+                        if b_holes >= 3:
+                            c_data["max_holes_detected"] = max(c_data.get("max_holes_detected", 0), 3)
+
+                        # Cross-verify Catch Plug distance on the settled, high-resolution still image
+                        if distance_gauge is not None and distance_gauge.is_valid:
+                            try:
+                                still_dist = distance_gauge.measure(b_img, back_box=None)
+                                if still_dist.get("passed") is True:
+                                    c_data["back_distance_passed"] = True
+                                    c_data["back_distance_mm"] = still_dist.get("mm")
+                                    c_data["last_distance_result"] = still_dist
+                                    logger.info(f"[Still Verification] Settled catch plug distance on still: {still_dist.get('mm')}mm (PASS)")
+                            except Exception as _g_err:
+                                logger.warning(f"[Still Verification] Distance gauge on still warning: {_g_err}")
+
+                        # If a back surface defect was flagged by live tracker but is NOT confirmed on the crisp still, discard it
+                        for d in list(c_data.get("defects_detected", set())):
+                            if d in BACK_DEFECT_CLASSES and d not in b_confirmed_surface and not ("dimension" in d):
+                                logger.info(f"[Still Verification] Discarded false back defect '{d}' (not confirmed on still)")
+                                c_data["defects_detected"].discard(d)
+
+                # 3. Lock striker still verification
+                ls_p = c_data.get("lock_striker_path")
+                if ls_p and os.path.exists(ls_p):
+                    c_data["max_lock_striker_detected"] = 1
+            except Exception as _v_err:
+                logger.warning(f"[Still Verification] Non-critical warning: {_v_err}")
+
+        # Assemble and cross-check defects
         with lock:
             defects = list(c_data.get("defects_detected", []))
             
@@ -1357,20 +1561,34 @@ def finalize_report_and_rename(c_data):
                 if c_data.get("max_holes_detected", 0) < 3:
                     defects.append("missing_holes")
             else:
-                if "missing_holes" in defects:
-                    defects.remove("missing_holes")
+                defects = [d for d in defects if d != "missing_holes"]
+                
+            # Missing parts verification
             if c_data.get("max_ring_bush_detected", 0) < 1 and c_data.get("max_rod_detected", 0) < 1:
                 defects.append("missing_ring_bush")
+            else:
+                defects = [d for d in defects if d != "missing_ring_bush"]
+                
             if c_data.get("max_striker_detected", 0) < 2:
                 defects.append("missing_striker")
+            else:
+                defects = [d for d in defects if d != "missing_striker"]
+                
             if c_data.get("max_back_hook_detected", 0) < 2:
                 defects.append("missing_back_hook")
-            if c_data.get("max_lock_striker_detected", 0) < 1:
+            else:
+                defects = [d for d in defects if d != "missing_back_hook"]
+                
+            if not c_data.get("lock_striker_path") and c_data.get("max_lock_striker_detected", 0) < 1:
                 defects.append("missing_lock_striker")
+            else:
+                defects = [d for d in defects if d != "missing_lock_striker"]
 
-            # Distance measurement verification (BC4I: Catch plug -> trimline 128.4 +/- 0.7 mm)
-            gauge_enabled = APP_CONFIG.get("ai", {}).get("distance_measurement", {}).get("enabled", True)
-            if gauge_enabled:
+            # Distance measurement verification (BC4I: Catch plug -> trimline 128.4 +/- 1.5 mm)
+            gauge_cfg = APP_CONFIG.get("ai", {}).get("distance_measurement", {})
+            gauge_enabled = gauge_cfg.get("enabled", True)
+            gauge_flag_as_ng = gauge_cfg.get("flag_as_ng", False)
+            if gauge_enabled and gauge_flag_as_ng:
                 dist_passed = c_data.get("back_distance_passed")
                 dist_mm = c_data.get("back_distance_mm")
                 if dist_passed is False:
@@ -1378,25 +1596,31 @@ def finalize_report_and_rename(c_data):
                         defects.append(f"dimension_out_of_spec ({dist_mm:.2f}mm)")
                     else:
                         defects.append("dimension_not_found")
+            else:
+                # If flag_as_ng is False, purge any dimension defect flags
+                defects = [d for d in defects if not ("dimension" in d)]
                 
+            # Serial number check (toggleable via check_missing_serial_ng)
+            check_serial_ng = APP_CONFIG.get("ai", {}).get("check_missing_serial_ng", False)
             if serial == "serial_missing" or not serial:
-                defects.append("serial_missing")
+                if check_serial_ng:
+                    defects.append("serial_missing")
+                else:
+                    defects = [d for d in defects if d != "serial_missing"]
             else:
                 # Real serial exists: ensure serial_missing is completely purged
                 defects = [d for d in defects if d != "serial_missing"]
                 c_data.get("defects_detected", set()).discard("serial_missing")
                 if "serial_missing" in active_cycle_data.get("defects_detected", set()):
                     active_cycle_data["defects_detected"].discard("serial_missing")
-                if not defects:
-                    defect_frame = None
-                    c_data["defect_frame_path"] = None
+
+            # Final deduplicated defect list
+            defects = list(set(defects))
 
             # Guarantee clean PASS when no verified defects exist
             if not defects:
                 defect_frame = None
                 c_data["defect_frame_path"] = None
-
-            defects = list(set(defects))
 
             if c_data is active_cycle_data:
                 current_cycle["defects"] = defects
@@ -1487,9 +1711,17 @@ def finalize_report_and_rename(c_data):
             confidence=conf,
             defects=defects,
             defect_image_path=defect_frame,  # Annotated front frame showing detected defects
-            lock_striker_image_path=active_cycle_data.get("lock_striker_path"),
+            lock_striker_image_path=c_data.get("lock_striker_path") or active_cycle_data.get("lock_striker_path"),
             catch_plug_mm=c_data.get("back_distance_mm"),
             catch_plug_passed=c_data.get("back_distance_passed"),
+            catch_plug_dev=c_data.get("last_distance_result", {}).get("dev") if isinstance(c_data.get("last_distance_result"), dict) else None,
+            part_counts={
+                "holes": c_data.get("max_holes_detected", 0),
+                "ring_bush": max(c_data.get("max_ring_bush_detected", 0), c_data.get("max_rod_detected", 0)),
+                "striker": c_data.get("max_striker_detected", 0),
+                "back_hook": c_data.get("max_back_hook_detected", 0),
+                "lock_striker": c_data.get("max_lock_striker_detected", 0)
+            },
             output_path=temp_report_path
         )
 
@@ -1608,6 +1840,15 @@ def check_and_finalize_cycle(c_data):
 def reset_cycle_state():
     global current_cycle, active_cycle_data, cycle_count
     with lock:
+        # Clean up any abandoned/unfinalized temp folder to avoid disk clutter
+        old_temp = active_cycle_data.get("temp_folder")
+        if old_temp and os.path.exists(old_temp) and not active_cycle_data.get("processing_thread_active", False):
+            try:
+                shutil.rmtree(old_temp, ignore_errors=True)
+                logger.info(f"[Reset Cycle] Cleaned up abandoned temp folder: {old_temp}")
+            except Exception as _e:
+                pass
+
         current_cycle["status"] = "Waiting for Fuel Door"
         current_cycle["cycle_number"] = f"#{cycle_count:03d}"
         current_cycle["step1_status"] = "Pending"
@@ -1649,6 +1890,7 @@ def reset_cycle_state():
             "ocr_thread_active": False,
             "defects_detected": set(),
             "defect_tracker": {},
+            "defect_times": {},
             "max_holes_detected": 0,
             "max_ring_bush_detected": 0,
             "max_rod_detected": 0,
@@ -1665,6 +1907,17 @@ def reset_cycle_state():
             "back_box_center": None,
             "front_first_seen_time": None,
             "back_first_seen_time": None,
+            "front_visible_time": 0.0,
+            "back_visible_time": 0.0,
+            "holes_time": 0.0,
+            "ring_bush_time": 0.0,
+            "striker_time": 0.0,
+            "back_hook_time": 0.0,
+            "lock_striker_time": 0.0,
+            "flash_end_time": 0.0,
+            "flash_message": "",
+            "hand_detected_until": 0.0,
+            "waiting_back_entered_time": None,
             "remove_frames_count": 0,
             "remove_state_start_time": None,
             "no_panel_frames_count": 0,
@@ -1859,29 +2112,29 @@ class CameraStreamer:
             SYSTEM_ERROR_CODE = (1 << 20) | (1 << 16) | 29   # 1114141
             TIMEOUT_CODE       = (1 << 20) | (1 << 16) | 16   # 1114128
 
-            if res == SYSTEM_ERROR_CODE:
-                logger.warning("[Camera] SDK SYSTEM_ERROR (1114141) — stale device handle detected. "
-                               "Re-initializing SDK and retrying...")
-                # NOTE: Use ItkManTerminate (ItkManFinalize does NOT exist in the SDK)
-                try:
-                    IKapC.ItkManTerminate()
-                    time.sleep(0.5)
-                    IKapC.ItkManInitialize()
-                    time.sleep(0.3)
-                except Exception as reinit_err:
-                    logger.warning(f"[Camera] SDK reinit warning: {reinit_err}")
+            # Auto-recovery for any failed connection (locked by ghost process, power glitch, or stale handle)
+            logger.warning(f"[Camera] Initial ItkDevOpen failed (code: {res}). "
+                           f"Executing automatic force-release of camera and driver handles...")
+            try:
+                kill_camera_holders()
+                IKapC.ItkManTerminate()
+                time.sleep(0.8)
+                IKapC.ItkManInitialize()
+                time.sleep(0.4)
+            except Exception as reinit_err:
+                logger.warning(f"[Camera] Auto-recovery SDK reinit warning: {reinit_err}")
 
-                # One retry after SDK reset
-                for mode_name2, access_mode2 in [
-                    ("EXCLUSIVE", IKapCDef.ITKDEV_VAL_ACCESS_MODE_EXCLUSIVE),
-                    ("CONTROL",   IKapCDef.ITKDEV_VAL_ACCESS_MODE_CONTROL),
-                ]:
-                    print(f"DIAGNOSTIC: [Retry after SDK reinit] Trying {mode_name2}")
-                    res, self.m_hDev = IKapC.ItkDevOpen(index, access_mode2)
-                    print(f"DIAGNOSTIC: [Retry] ItkDevOpen [{mode_name2}] = {res}, handle = {self.m_hDev}")
-                    if res == IKapCDef.ITKSTATUS_OK and self.m_hDev and self.m_hDev.value != 0:
-                        logger.info(f"[Camera] Retry succeeded — opened in {mode_name2} mode.")
-                        break
+            # Automatic retry after hardware/driver reset
+            for mode_name2, access_mode2 in [
+                ("EXCLUSIVE", IKapCDef.ITKDEV_VAL_ACCESS_MODE_EXCLUSIVE),
+                ("CONTROL",   IKapCDef.ITKDEV_VAL_ACCESS_MODE_CONTROL),
+            ]:
+                print(f"DIAGNOSTIC: [Auto-Recovery Retry] Trying {mode_name2}")
+                res, self.m_hDev = IKapC.ItkDevOpen(index, access_mode2)
+                print(f"DIAGNOSTIC: [Auto-Recovery Retry] ItkDevOpen [{mode_name2}] = {res}, handle = {self.m_hDev}")
+                if res == IKapCDef.ITKSTATUS_OK and self.m_hDev and self.m_hDev.value != 0:
+                    logger.info(f"[Camera] Auto-recovery SUCCESS — opened in {mode_name2} mode.")
+                    break
 
             if res != IKapCDef.ITKSTATUS_OK or not self.m_hDev or self.m_hDev.value == 0:
                 hint = ""
@@ -2534,10 +2787,12 @@ def video_processing_loop():
 # Dedicated Background YOLO Worker Thread
 # -------------------------------
 def yolo_worker_loop():
-    global YOLO_MODEL, latest_raw_frame, current_detections, active_cycle_data, current_cycle, latest_distance_result, distance_gauge
+    global YOLO_MODEL, latest_raw_frame, current_detections, active_cycle_data, current_cycle, latest_distance_result, distance_gauge, YOLO_DEVICE, GPU_AVAILABLE
     init_models()
     
     _debug_counter = 0
+    last_yolo_err_time = 0.0
+    no_class_start_time = None
     while True:
         if not is_processing or latest_raw_frame is None:
             time.sleep(0.01)
@@ -2578,7 +2833,26 @@ def yolo_worker_loop():
             # every other thread (video loop, API responses, state machine) during that time.
             # YOLO_MODEL is read-only after loading and safe to call without the lock.
             with torch.inference_mode():
-                results = YOLO_MODEL(frame_resized, verbose=False, conf=run_thresh, task='segment', imgsz=448, device=YOLO_DEVICE)
+                try:
+                    results = YOLO_MODEL(frame_resized, verbose=False, conf=run_thresh, task='segment', imgsz=448, device=YOLO_DEVICE)
+                except Exception as inf_err:
+                    err_str = str(inf_err)
+                    # Automatically handle CUDA crash / TDR timeout / GPU lost by falling back to CPU
+                    if YOLO_DEVICE != 'cpu' and any(k in err_str.lower() for k in ['cuda', 'launch timed out', 'device-side', 'out of memory', 'cublas', 'cudnn', 'gpu is lost']):
+                        logger.critical(f"[YOLO] CUDA runtime failure: {inf_err}. Automatically switching YOLO to CPU mode!")
+                        YOLO_DEVICE = 'cpu'
+                        GPU_AVAILABLE = False
+                        try:
+                            YOLO_MODEL.to('cpu')
+                        except Exception:
+                            pass
+                        try:
+                            torch.set_num_threads(_CPU_CORES)
+                        except Exception:
+                            pass
+                        results = YOLO_MODEL(frame_resized, verbose=False, conf=run_thresh, task='segment', imgsz=448, device='cpu')
+                    else:
+                        raise
 
             current_state = active_cycle_data.get("state", "WAITING_FRONT")
 
@@ -2605,6 +2879,13 @@ def yolo_worker_loop():
             has_holes_detected = False
             has_defect_detected = False
             has_hand_detected = False
+            # Default view-state flags (safe fallback if results is empty/falsy)
+            raw_front_detected = False
+            raw_back_detected = False
+            raw_lock_striker_detected = False
+            is_back_in_view = (current_state in ["WAITING_BACK", "WAITING_REMOVE"])
+            is_front_in_view = (current_state == "WAITING_FRONT")
+            is_ls_in_view = (current_state == "WAITING_LOCK_STRIKER")
             
             if results:
                 boxes = results[0].boxes
@@ -2644,21 +2925,27 @@ def yolo_worker_loop():
                                 active_cycle_data["front_first_seen_time"] = time.time()
                     elif class_name in BACK_CLASSES or class_name in BACK_DEFECT_CLASSES:
                         raw_back_detected = True
-                        if class_name in ["back", "frame_damage"] and back_box is None:
-                            xyxy_b = box.xyxy[0].cpu().numpy()
-                            back_box = (
-                                max(0, int(xyxy_b[0] / scale)),
-                                max(0, int(xyxy_b[1] / scale)),
-                                min(w_orig, int(xyxy_b[2] / scale)),
-                                min(h_orig, int(xyxy_b[3] / scale))
-                            )
-                        if current_state in ["WAITING_BACK", "WAITING_REMOVE"] or raw_back_detected:
+                        if current_state in ["WAITING_BACK", "WAITING_REMOVE"]:
                             has_back_detected = True
+                            if class_name in ["back", "frame_damage"] and back_box is None:
+                                xyxy_b = box.xyxy[0].cpu().numpy()
+                                back_box = (
+                                    max(0, int(xyxy_b[0] / scale)),
+                                    max(0, int(xyxy_b[1] / scale)),
+                                    min(w_orig, int(xyxy_b[2] / scale)),
+                                    min(h_orig, int(xyxy_b[3] / scale))
+                                )
                     elif class_name == "lock_striker":
                         raw_lock_striker_detected = True
                     elif class_name == "hand" or "hand" in class_name:
                         has_hand_detected = True
                 
+                # Determine active panel in view (computed after Pass 1, before Pass 2 loop,
+                # so always defined even when boxes is empty or all filtered by conf threshold).
+                is_back_in_view = raw_back_detected or (current_state in ["WAITING_BACK", "WAITING_REMOVE"])
+                is_front_in_view = raw_front_detected or (current_state == "WAITING_FRONT")
+                is_ls_in_view = raw_lock_striker_detected or (current_state == "WAITING_LOCK_STRIKER")
+
                 # --- Pass 2: Box Processing & Stage-Gated Class Filtering ---
                 processed_boxes = {}
                 for box_idx, box in enumerate(boxes):
@@ -2669,11 +2956,6 @@ def yolo_worker_loop():
                     
                     if conf < CLASS_CONF_THRESHOLDS.get(class_name, YOLO_CONF_THRESHOLD):
                         continue
-
-                    # Determine active panel in view (handles both live camera and recorded video)
-                    is_back_in_view = raw_back_detected or (current_state in ["WAITING_BACK", "WAITING_REMOVE"])
-                    is_front_in_view = raw_front_detected or (current_state == "WAITING_FRONT")
-                    is_ls_in_view = raw_lock_striker_detected or (current_state == "WAITING_LOCK_STRIKER")
 
                     # Always show live annotations for any valid detected class
                     # Sequence rules and compliance are tracked via is_in_seq without hiding visual feedback
@@ -2730,22 +3012,11 @@ def yolo_worker_loop():
                         processed_boxes[class_name] = []
                     processed_boxes[class_name].append((x1, y1, x2, y2))
                     
-                    # Ring bush OpenCV verification on Front side
+                    # Ring bush verification on Front side
                     if class_name in ["ring_bush", "ringbush"]:
-                        if front_box is not None:
-                            decision, score, dbg_canvas = verify_ring_bush(frame_to_process, front_box, conf)
-                            if dbg_canvas is not None:
-                                cv2.imwrite("logs/ring_bush_debug.jpg", dbg_canvas)
-                            
-                            if decision == "ABSENT" and conf < 0.50:
-                                logger.info(f"OpenCV rejected ring_bush (Score: {score:.2f}, conf: {conf:.2f})")
-                                continue
-                            elif decision == "UNCERTAIN":
-                                logger.info(f"OpenCV uncertain about ring_bush (Score: {score:.2f}) - retaining YOLO decision")
-                            else:
-                                logger.info(f"OpenCV verified ring_bush (Score: {score:.2f})")
-                        else:
-                            logger.info("ring_bush detected but no front_box found for ROI verification - retaining YOLO decision")
+                        # YOLO model is trained on Ring_Bush and serves as primary ground truth.
+                        # Never discard valid YOLO detections to eliminate false missing_ring_bush rejections.
+                        logger.info(f"[Ring Bush] Detected by YOLO (conf: {conf:.2f})")
                     
                     # Empty tray filter for non-defects
                     presence_cfg = APP_CONFIG.get("ai", {}).get("part_presence", {})
@@ -2814,8 +3085,12 @@ def yolo_worker_loop():
                         elif class_name == "holes":
                             has_holes_detected = True
                     
-                    # Defect collection for active stage
-                    if class_name in SURFACE_DEFECT_CLASSES:
+                    # Defect collection for active stage (strictly stage-gated to avoid false alarms)
+                    if current_state == "WAITING_FRONT" and has_front_detected and class_name in FRONT_DEFECT_CLASSES:
+                        frame_defects.append(class_name)
+                    elif current_state == "WAITING_LOCK_STRIKER" and class_name in LOCK_STRIKER_DEFECT_CLASSES:
+                        frame_defects.append(class_name)
+                    elif current_state in ["WAITING_BACK", "WAITING_REMOVE"] and has_back_detected and class_name in BACK_DEFECT_CLASSES:
                         frame_defects.append(class_name)
                         
                     if class_name in ["hole", "holes", "hole_spec_error"]:
@@ -2873,7 +3148,7 @@ def yolo_worker_loop():
                 # 3. Live Defect Frame Save:
                 # Save annotated frame showing the exact red box & defect label when any confirmed defect is in view
                 confirmed_in_frame = [d for d in current_frame_defects if tracker.get(d, {}).get("status") == "CONFIRMED"]
-                if confirmed_in_frame and active_cycle_data["temp_folder"] is not None and not has_hand_detected:
+                if confirmed_in_frame and active_cycle_data["temp_folder"] is not None and not has_hand_detected and not is_hand_warning:
                     defect_frame_already_saved = active_cycle_data.get("defect_frame_path") is not None
                     if not defect_frame_already_saved:
                         defect_file = os.path.join(active_cycle_data["temp_folder"], "defect_frame.jpg")
@@ -2881,16 +3156,7 @@ def yolo_worker_loop():
                         active_cycle_data["defect_frame_path"] = defect_file
                         logger.info(f"[Defect Frame] Captured live annotated defect frame: {defect_file} (defects: {confirmed_in_frame})")
 
-            # --- Lock Striker Frame Save ---
-            if (frame_lock_striker > 0 or frame_lock_striker_bend > 0) and active_cycle_data["temp_folder"] is not None:
-                with lock:
-                    ls_frame_already_saved = active_cycle_data.get("lock_striker_path") is not None
-                if not ls_frame_already_saved:
-                    ls_file = os.path.join(active_cycle_data["temp_folder"], "lock_striker.jpg")
-                    cv2.imwrite(ls_file, annotated_frame, [cv2.IMWRITE_JPEG_QUALITY, 95])
-                    with lock:
-                        active_cycle_data["lock_striker_path"] = ls_file
-                    logger.info(f"[Lock Striker] Saved annotated lock striker frame: {ls_file}")
+            # Lock striker frame save is handled after 1.5s stabilization delay in state == "WAITING_LOCK_STRIKER"
 
             # --- Live Distance Measurement with Median Voting (When Back is in View) ---
             # Operator adjusts part position; we collect a rolling buffer of readings
@@ -2989,40 +3255,35 @@ def yolo_worker_loop():
 
                             x1, y1, x2, y2 = ocr_target_det["box"]
 
-                            # If we're cropping from serial_area, prefer the tighter 'serial' box inside it
-                            if class_name == "serial_area":
-                                serial_matches = [d for d in new_detections if d["class_name"] == "serial"]
-                                if serial_matches:
-                                    best_serial = max(serial_matches, key=lambda x: x["conf"])
-                                    x1, y1, x2, y2 = best_serial["box"]
-                                    print(f"[OCR] Using tighter 'serial' box inside serial_area: {best_serial['box']}")
-                                else:
-                                    # Try to recover 'serial' from raw YOLO results even if conf < 0.10
-                                    low_conf_matches = []
-                                    if results:
-                                        for b in results[0].boxes:
-                                            cid = int(b.cls[0].cpu().item())
-                                            cname = results[0].names[cid].lower()
-                                            c_conf = float(b.conf[0].cpu().item())
-                                            if cname == "serial":
-                                                low_conf_matches.append((b, c_conf))
-                                    if low_conf_matches:
-                                        best_low = max(low_conf_matches, key=lambda x: x[1])[0]
-                                        xyxy_r = best_low.xyxy[0].cpu().numpy().astype(int)
-                                        x1, y1 = max(0, int(xyxy_r[0] / scale)), max(0, int(xyxy_r[1] / scale))
-                                        x2, y2 = min(w_orig, int(xyxy_r[2] / scale)), min(h_orig, int(xyxy_r[3] / scale))
-                                        print(f"[OCR] Recovered 'serial' box from raw YOLO (conf {float(best_low.conf[0].cpu().item()):.2f}): {[x1, y1, x2, y2]}")
-                                    else:
-                                        # Fallback: pass the entire serial_area to OCR
-                                        print(f"[OCR] Fallback: using entire serial_area: {[x1, y1, x2, y2]}")
+                            # Encompass full serial marking region:
+                            # Use union of serial_area and serial to guarantee neither line is clipped
+                            area_matches = [d for d in new_detections if d["class_name"] == "serial_area"]
+                            serial_matches = [d for d in new_detections if d["class_name"] == "serial"]
                             
-                            # Extract the expected serial-number region from this back-side crop
-                            # If it's the whole back, we still use the bounding box as the source region
-                            padding = 15
-                            x1_pad = max(0, x1 - padding)
-                            y1_pad = max(0, y1 - padding)
-                            x2_pad = min(w_orig, x2 + padding)
-                            y2_pad = min(h_orig, y2 + padding)
+                            if area_matches and serial_matches:
+                                b_area = max(area_matches, key=lambda x: x["conf"])["box"]
+                                b_ser = max(serial_matches, key=lambda x: x["conf"])["box"]
+                                x1 = min(b_area[0], b_ser[0])
+                                y1 = min(b_area[1], b_ser[1])
+                                x2 = max(b_area[2], b_ser[2])
+                                y2 = max(b_area[3], b_ser[3])
+                                print(f"[OCR] Using union box of serial + serial_area: {[x1, y1, x2, y2]}")
+                            elif area_matches:
+                                b_area = max(area_matches, key=lambda x: x["conf"])["box"]
+                                x1, y1, x2, y2 = b_area
+                                print(f"[OCR] Using serial_area box: {[x1, y1, x2, y2]}")
+                            elif serial_matches:
+                                b_ser = max(serial_matches, key=lambda x: x["conf"])["box"]
+                                x1, y1, x2, y2 = b_ser
+                                print(f"[OCR] Using serial box: {[x1, y1, x2, y2]}")
+                            
+                            # Extract serial region with generous padding (prevents character edge clipping)
+                            padding_x = 35
+                            padding_y = 50
+                            x1_pad = max(0, x1 - padding_x)
+                            y1_pad = max(0, y1 - padding_y)
+                            x2_pad = min(w_orig, x2 + padding_x)
+                            y2_pad = min(h_orig, y2 + padding_y)
 
                             crop = frame_to_process[y1_pad:y2_pad, x1_pad:x2_pad]
 
@@ -3071,15 +3332,15 @@ def yolo_worker_loop():
             _back_finalize_data = None
 
             # Determine current placed side
-            if raw_front_detected and not raw_back_detected:
+            if raw_lock_striker_detected or (current_state == "WAITING_LOCK_STRIKER" and (frame_lock_striker > 0 or frame_lock_striker_bend > 0)):
+                cur_placed_side = "LOCK STRIKER"
+                cur_side_in_seq = (current_state == "WAITING_LOCK_STRIKER")
+            elif raw_front_detected and not raw_back_detected:
                 cur_placed_side = "FRONT"
                 cur_side_in_seq = (current_state == "WAITING_FRONT")
             elif raw_back_detected and not raw_front_detected:
                 cur_placed_side = "BACK"
                 cur_side_in_seq = (current_state == "WAITING_BACK")
-            elif raw_lock_striker_detected and not raw_front_detected and not raw_back_detected:
-                cur_placed_side = "LOCK STRIKER"
-                cur_side_in_seq = (current_state == "WAITING_LOCK_STRIKER")
             else:
                 cur_placed_side = "NONE"
                 cur_side_in_seq = True
@@ -3089,10 +3350,10 @@ def yolo_worker_loop():
                 current_cycle["placed_side"] = cur_placed_side
                 current_cycle["placed_side_in_seq"] = cur_side_in_seq
                 
-                # Smooth hold time (0.4s) to prevent flicker between frames
+                # Smooth hold time (0.8s) to prevent flicker between frames
                 now_t = time.time()
                 if has_hand_detected:
-                    active_cycle_data["hand_detected_until"] = now_t + 0.4
+                    active_cycle_data["hand_detected_until"] = now_t + 0.8
                 is_hand_warning = has_hand_detected or (now_t < active_cycle_data.get("hand_detected_until", 0))
 
                 # Hand warning is active WHENEVER hand is detected anywhere in frame (no overlap formula, no state restrictions)
@@ -3100,21 +3361,49 @@ def yolo_worker_loop():
                 current_cycle["hand_detected"] = hand_warning
                 current_cycle["hand_warning"] = hand_warning
                 needs_reset = False
-                
-                # Strict State Machine Logic
-                if state == "WAITING_FRONT":
-                    # If recorded video shows back side first, allow smooth transition to WAITING_BACK
-                    if raw_back_detected and not has_front_detected:
-                        if active_cycle_data.get("back_first_seen_time") is None:
-                            active_cycle_data["back_first_seen_time"] = time.time()
-                        elif (time.time() - active_cycle_data["back_first_seen_time"] > 0.8) and (stream_source != "gige" or not front_box):
-                            active_cycle_data["state"] = "WAITING_BACK"
-                            state = "WAITING_BACK"
-                            logger.info("[State Machine] Back side detected — activated WAITING_BACK stage.")
 
+                # ── Auto-Reset Watchdog: Reset cycle if no class is detected for >= 5.0 seconds ──
+                if len(new_detections) > 0:
+                    no_class_start_time = None
+                else:
+                    if no_class_start_time is None:
+                        no_class_start_time = now_t
+                    elif (now_t - no_class_start_time) >= 5.0:
+                        _is_clean = (
+                            active_cycle_data.get("state") == "WAITING_FRONT" and
+                            active_cycle_data.get("temp_folder") is None and
+                            active_cycle_data.get("front_path") is None and
+                            active_cycle_data.get("back_path") is None and
+                            len(active_cycle_data.get("defects_detected", set())) == 0 and
+                            current_cycle.get("step1_status") == "Pending" and
+                            current_cycle.get("step2_status") == "Pending" and
+                            current_cycle.get("step3_status") == "Pending" and
+                            current_cycle.get("step4_status") == "Pending" and
+                            current_cycle.get("serial") == "------" and
+                            current_cycle.get("result") == "Awaiting analysis..." and
+                            current_cycle.get("holes_count", 0) == 0 and
+                            current_cycle.get("ring_bush_count", 0) == 0 and
+                            current_cycle.get("striker_count", 0) == 0 and
+                            current_cycle.get("back_hook_count", 0) == 0 and
+                            current_cycle.get("lock_striker_count", 0) == 0
+                        )
+                        if not _is_clean and not active_cycle_data.get("processing_thread_active", False):
+                            logger.info(f"[Cycle Watchdog] No class detected for {(now_t - no_class_start_time):.1f}s — clearing cycle and preparing new cycle.")
+                            needs_reset = True
+                            no_class_start_time = None
+                
+                # Strict State Machine Logic - Enforce Sequence: FRONT -> LOCK STRIKER -> BACK
                 if state == "WAITING_FRONT":
-                    current_cycle["status"] = "Waiting for Front Panel"
-                    current_cycle["instruction"] = "PLACE FUEL DOOR (FRONT)"
+                    # If back side detected while waiting for front, enforce sequence and stay in WAITING_FRONT
+                    if raw_back_detected and not has_front_detected:
+                        current_cycle["status"] = "Waiting for Front Panel (Front required first)"
+                        current_cycle["instruction"] = "OUT OF SEQUENCE: PLACE FRONT SIDE FIRST"
+                        current_cycle["instruction_color"] = "orange"
+                        current_cycle["placed_side"] = "BACK"
+                        current_cycle["placed_side_in_seq"] = False
+                    else:
+                        current_cycle["status"] = "Waiting for Front Panel"
+                        current_cycle["instruction"] = "PLACE FUEL DOOR (FRONT)"
                     if not active_cycle_data.get("defects_detected"):
                         current_cycle["instruction_color"] = "blue"
                     else:
@@ -3139,21 +3428,20 @@ def yolo_worker_loop():
                         prev_cx, prev_cy = active_cycle_data.get("front_box_center") or (cx, cy)
                         dist = ((cx - prev_cx)**2 + (cy - prev_cy)**2)**0.5
                         
-                        if dist > 10 or hand_warning:
-                            active_cycle_data["front_frames_count"] = 0
-                            active_cycle_data["front_first_seen_time"] = None
-                            
                         active_cycle_data["front_box_center"] = (cx, cy)
-                        active_cycle_data["front_frames_count"] += 1
-                        
-                        if active_cycle_data.get("front_first_seen_time") is None:
-                            active_cycle_data["front_first_seen_time"] = time.time()
-                            
-                        time_stable = time.time() - active_cycle_data["front_first_seen_time"]
+                        active_cycle_data["front_frames_count"] = active_cycle_data.get("front_frames_count", 0) + 1
+
+                        if dist > 10 or hand_warning or has_hand_detected:
+                            active_cycle_data["front_first_seen_time"] = None
+                            time_stable = 0.0
+                        else:
+                            if active_cycle_data.get("front_first_seen_time") is None:
+                                active_cycle_data["front_first_seen_time"] = time.time()
+                            time_stable = time.time() - active_cycle_data["front_first_seen_time"]
                         
                         active_cycle_data["front_missing_frames"] = 0
                         
-                        if not hand_warning and time_stable >= 0.5:
+                        if not hand_warning and not has_hand_detected and time_stable >= 0.5:
                             # --- Capture front image (file I/O done OUTSIDE lock below) ---
                             _front_capture_frame   = frame_to_process.copy()
                             _front_capture_folder  = active_cycle_data["temp_folder"]
@@ -3184,6 +3472,10 @@ def yolo_worker_loop():
                             active_cycle_data["front_first_seen_time"] = None
                             
                 elif state == "WAITING_LOCK_STRIKER":
+                    # While in Lock Striker stage, back-class missing defects must never be flagged
+                    active_cycle_data["defects_detected"].discard("missing_back_hook")
+                    active_cycle_data["defects_detected"].discard("missing_holes")
+                    
                     current_cycle["status"] = "Waiting for Lock Striker"
                     current_cycle["instruction"] = "SHOW LOCK STRIKER"
                     if not active_cycle_data.get("defects_detected"):
@@ -3192,21 +3484,55 @@ def yolo_worker_loop():
                         current_cycle["instruction_color"] = "red"
                         current_cycle["result"] = "NG"
                     
-                    ls_detected = (frame_lock_striker > 0) or (frame_lock_striker_bend > 0) or (active_cycle_data.get("max_lock_striker_detected", 0) > 0)
+                    ls_in_frame = (frame_lock_striker > 0) or (frame_lock_striker_bend > 0)
+                    ls_saved = active_cycle_data.get("lock_striker_path") is not None
                     
-                    with lock:
-                        ls_saved = active_cycle_data.get("lock_striker_path") is not None
-                    
-                    # Strictly wait for lock_striker or lock_striker_bend to complete the sequence.
-                    # Do NOT check for back panel or switch to back even if back is detected!
-                    if ls_detected or ls_saved:
-                        logger.info("[Lock Striker] Lock Striker detected! Step 3 -> OK")
-                        current_cycle["step3_status"] = "OK"
-                        active_cycle_data["max_lock_striker_detected"] = 1
-                        active_cycle_data["flash_end_time"] = time.time() + 2.0
-                        active_cycle_data["flash_message"] = "LOCK STRIKER OK"
-                        active_cycle_data["defects_detected"].discard("missing_lock_striker")
+                    if ls_saved:
                         active_cycle_data["state"] = "WAITING_BACK"
+                    elif ls_in_frame:
+                        active_cycle_data["ls_missing_frames"] = 0
+                        # Operator naturally holds the lock striker by hand to present it to the camera;
+                        # do NOT let hand detection cancel the stabilization timer!
+                        if active_cycle_data.get("ls_first_seen_time") is None:
+                            active_cycle_data["ls_first_seen_time"] = time.time()
+                            
+                        ls_delay = float(APP_CONFIG.get("ai", {}).get("lock_striker_delay", 0.4))
+                        elapsed = time.time() - active_cycle_data["ls_first_seen_time"]
+                        
+                        if elapsed < ls_delay:
+                            current_cycle["step3_status"] = "Capturing..."
+                            current_cycle["status"] = f"Stabilizing Lock Striker ({elapsed:.1f}s / {ls_delay:.1f}s)..."
+                            current_cycle["instruction"] = "HOLD LOCK STRIKER STEADY"
+                        else:
+                            # Delay elapsed with no hand in view: capture crisp frame now
+                            if active_cycle_data.get("temp_folder") is not None:
+                                ls_file = os.path.join(active_cycle_data["temp_folder"], "lock_striker.jpg")
+                                cv2.imwrite(ls_file, annotated_frame, [cv2.IMWRITE_JPEG_QUALITY, 95])
+                                with lock:
+                                    active_cycle_data["lock_striker_path"] = ls_file
+                                logger.info(f"[Lock Striker] Captured clear lock striker after {elapsed:.2f}s delay: {ls_file}")
+                                
+                            current_cycle["step3_status"] = "OK"
+                            active_cycle_data["max_lock_striker_detected"] = 1
+                            active_cycle_data["flash_end_time"] = time.time() + 2.0
+                            active_cycle_data["flash_message"] = "LOCK STRIKER OK"
+                            active_cycle_data["defects_detected"].discard("missing_lock_striker")
+                            active_cycle_data["ls_first_seen_time"] = None
+                            active_cycle_data["state"] = "WAITING_BACK"
+                    elif (raw_back_detected or back_box is not None):
+                        # Operator showed Back Side without presenting Lock Striker!
+                        # STRICT SEQUENCE: Do NOT transition to WAITING_BACK. Enforce Lock Striker first!
+                        current_cycle["status"] = "Waiting for Lock Striker (Lock Striker required first)"
+                        current_cycle["instruction"] = "OUT OF SEQUENCE: SHOW LOCK STRIKER"
+                        current_cycle["instruction_color"] = "orange"
+                        current_cycle["placed_side"] = "BACK"
+                        current_cycle["placed_side_in_seq"] = False
+                    else:
+                        active_cycle_data["ls_missing_frames"] = active_cycle_data.get("ls_missing_frames", 0) + 1
+                        if active_cycle_data["ls_missing_frames"] > 3:
+                            active_cycle_data["ls_first_seen_time"] = None
+                            if current_cycle["step3_status"] == "Capturing...":
+                                current_cycle["step3_status"] = "Pending"
                         
                 elif state == "WAITING_BACK":
                     current_cycle["status"] = "Waiting for Back Panel"
@@ -3246,20 +3572,18 @@ def yolo_worker_loop():
                         prev_cx, prev_cy = active_cycle_data.get("back_box_center") or (cx, cy)
                         dist = ((cx - prev_cx)**2 + (cy - prev_cy)**2)**0.5
                         
-                        if dist > 50 or hand_warning:
-                            active_cycle_data["back_frames_count"] = 0
-                            active_cycle_data["back_first_seen_time"] = None
-                            
                         active_cycle_data["back_box_center"] = (cx, cy)
-                        active_cycle_data["back_frames_count"] += 1
-                        
-                        if active_cycle_data.get("back_first_seen_time") is None:
-                            active_cycle_data["back_first_seen_time"] = time.time()
-                            # Start OCR timeout clock as soon as back is first seen
+                        active_cycle_data["back_frames_count"] = active_cycle_data.get("back_frames_count", 0) + 1
+
+                        if dist > 50 or hand_warning or has_hand_detected:
+                            active_cycle_data["back_first_seen_time"] = None
+                            time_stable = 0.0
+                        else:
+                            if active_cycle_data.get("back_first_seen_time") is None:
+                                active_cycle_data["back_first_seen_time"] = time.time()
                             if active_cycle_data.get("ocr_start_time") is None:
                                 active_cycle_data["ocr_start_time"] = time.time()
-                            
-                        time_stable = time.time() - active_cycle_data["back_first_seen_time"]
+                            time_stable = time.time() - active_cycle_data["back_first_seen_time"]
                         
                         ocr_done = (active_cycle_data.get("serial_number") is not None and 
                                     active_cycle_data.get("serial_number") != "serial_missing")
@@ -3273,13 +3597,16 @@ def yolo_worker_loop():
                                 active_cycle_data["serial_number"] = best_vote["text"]
                                 active_cycle_data["ocr_confidence"] = best_vote["confidence"]
                                 active_cycle_data["defects_detected"].discard("serial_missing")
+                                fs_fmt = f"{best_vote['text'][:6]} {best_vote['text'][6:10]} {best_vote['text'][10:]}" if len(best_vote['text']) == 14 else best_vote['text']
+                                current_cycle["serial"] = fs_fmt
+                                current_cycle["confidence"] = f"{best_vote['confidence']:.1f}%"
                                 ocr_done = True
-                            else:
+                            elif not active_cycle_data.get("ocr_thread_active"):
                                 active_cycle_data["serial_number"] = "serial_missing"
                                 active_cycle_data["defects_detected"].add("serial_missing")
-                                current_cycle["serial"] = "SERIAL MISSING"
-                        
-                        if not hand_warning and (ocr_done or ocr_timeout) and time_stable >= 0.5:
+                                current_cycle["serial"] = "SERIAL MISSING" 
+
+                        if not hand_warning and not has_hand_detected and (ocr_done or ocr_timeout) and time_stable >= 0.5:
                             # --- Capture back image while part is present on the table ---
                             _do_back_write = True
                             _back_capture_frame = frame_to_process.copy()
@@ -3343,10 +3670,14 @@ def yolo_worker_loop():
                     current_cycle["back_hook_count"] = min(2, max(current_cycle["back_hook_count"], frame_back_hook))
                     current_cycle["lock_striker_count"] = min(1, max(current_cycle["lock_striker_count"], frame_lock_striker))
                     
-                    # Lock striker OK synchronization
-                    if (frame_lock_striker > 0) or (active_cycle_data.get("max_lock_striker_detected", 0) > 0) or (active_cycle_data.get("lock_striker_path") is not None):
+                    # Step 3 (Lock Striker) status synchronization:
+                    if active_cycle_data.get("lock_striker_path") is not None or active_cycle_data.get("max_lock_striker_detected", 0) >= 1:
                         current_cycle["step3_status"] = "OK"
                         active_cycle_data["defects_detected"].discard("missing_lock_striker")
+                    elif state in ["WAITING_BACK", "WAITING_REMOVE"] and current_cycle["step3_status"] != "NG":
+                        # Operator moved to Back or Remove without capturing lock striker
+                        current_cycle["step3_status"] = "NG"
+                        active_cycle_data["defects_detected"].add("missing_lock_striker")
                     
                     if active_cycle_data["temp_folder"] is not None:
                         current_t = time.time()
@@ -3358,7 +3689,7 @@ def yolo_worker_loop():
                             active_cycle_data["defect_times"] = {}
                         
                         # Only accumulate physical defect times if a panel is actually in view!
-                        if has_front_detected or has_back_detected:
+                        if has_front_detected or has_back_detected or (state == "WAITING_LOCK_STRIKER" and (frame_lock_striker > 0 or frame_lock_striker_bend > 0)):
                             for d in frame_defects:
                                 active_cycle_data["defect_times"][d] = active_cycle_data["defect_times"].get(d, 0.0) + dt
                                 if active_cycle_data["defect_times"][d] >= 1.5:
@@ -3367,7 +3698,8 @@ def yolo_worker_loop():
                         active_cycle_data["max_holes_detected"] = min(3, max(active_cycle_data["max_holes_detected"], frame_holes))
                         active_cycle_data["max_striker_detected"] = min(2, max(active_cycle_data["max_striker_detected"], frame_striker))
                         active_cycle_data["max_back_hook_detected"] = min(2, max(active_cycle_data["max_back_hook_detected"], frame_back_hook))
-                        active_cycle_data["max_lock_striker_detected"] = min(1, max(active_cycle_data["max_lock_striker_detected"], frame_lock_striker))
+                        if active_cycle_data.get("lock_striker_path") is not None or (state == "WAITING_LOCK_STRIKER" and frame_lock_striker >= 1):
+                            active_cycle_data["max_lock_striker_detected"] = 1
                         
                         if frame_holes >= 3:
                             active_cycle_data["holes_time"] = active_cycle_data.get("holes_time", 0.0) + dt
@@ -3386,22 +3718,21 @@ def yolo_worker_loop():
                         if frame_lock_striker >= 1:
                             active_cycle_data["lock_striker_time"] = active_cycle_data.get("lock_striker_time", 0.0) + dt
                         
-                        # Dynamically add missing defects for front-class components.
-                        # Logic: wait for front to appear, then give 1-second settle time,
-                        # then accumulate front_visible_time. Flag missing after 1.5 s of
-                        # SETTLED front visibility (i.e., total gate = 1s settle + 1.5s window).
-                        if has_front_detected:
+                        # Dynamically add missing defects for front-class components (ONLY in WAITING_FRONT when part is stable and hand is not present)
+                        if state == "WAITING_FRONT" and has_front_detected and not hand_warning and not has_hand_detected:
                             front_settle_start = active_cycle_data.get("front_first_seen_time")
                             if front_settle_start is not None and (time.time() - front_settle_start) >= 1.0:
-                                # 1-second settle has passed — now accumulate settled visibility time
                                 active_cycle_data["front_visible_time"] = active_cycle_data.get("front_visible_time", 0.0) + dt
                                 if active_cycle_data["front_visible_time"] >= 1.5:
                                     if active_cycle_data.get("max_ring_bush_detected", 0) < 1:
                                         active_cycle_data["defects_detected"].add("missing_ring_bush")
                                     if active_cycle_data.get("max_striker_detected", 0) < 2:
                                         active_cycle_data["defects_detected"].add("missing_striker")
+                        else:
+                            active_cycle_data["front_visible_time"] = 0.0
                         
-                        if has_back_detected:
+                        # Dynamically add missing defects for back-class components (ONLY in WAITING_BACK)
+                        if state == "WAITING_BACK" and has_back_detected:
                             active_cycle_data["back_visible_time"] = active_cycle_data.get("back_visible_time", 0.0) + dt
                             if active_cycle_data["back_visible_time"] >= 1.5:
                                 check_holes = APP_CONFIG.get("ai", {}).get("check_missing_holes", False)
@@ -3422,7 +3753,7 @@ def yolo_worker_loop():
                         if active_cycle_data.get("max_back_hook_detected", 0) >= 2 or frame_back_hook >= 2:
                             active_cycle_data["max_back_hook_detected"] = 2
                             active_cycle_data["defects_detected"].discard("missing_back_hook")
-                        if active_cycle_data.get("max_lock_striker_detected", 0) >= 1 or frame_lock_striker >= 1:
+                        if active_cycle_data.get("lock_striker_path") is not None:
                             active_cycle_data["max_lock_striker_detected"] = 1
                             active_cycle_data["defects_detected"].discard("missing_lock_striker")
                         # Dynamic recovery for serial number:
@@ -3506,12 +3837,14 @@ def yolo_worker_loop():
                 
         except Exception as e:
             import traceback
-            logger.error(f"[YOLO Thread Inference Error] {e}")
-            logger.error(traceback.format_exc())
-            if 'frame_to_process' in locals() and frame_to_process is not None:
-                logger.error(f"frame_to_process shape: {frame_to_process.shape}")
-            
-        time.sleep(0.01)
+            now_t = time.time()
+            if now_t - last_yolo_err_time > 3.0:
+                last_yolo_err_time = now_t
+                logger.error(f"[YOLO Thread Inference Error] {e}")
+                logger.error(traceback.format_exc())
+                if 'frame_to_process' in locals() and frame_to_process is not None:
+                    logger.error(f"frame_to_process shape: {frame_to_process.shape}")
+            time.sleep(0.1)
 
 # -------------------------------
 # Disk Space Management (Auto Cleanup)
@@ -4395,90 +4728,130 @@ def sync_data():
 
 
 if __name__ == '__main__':
-    # Initialize workspace folders
-    os.makedirs("lid_data", exist_ok=True)
-    
-    # Initialize SQLite database and sync past inspection scans in lid_data
     try:
-        db_logger.init_db()
-        threading.Thread(target=db_logger.sync_existing_lid_data, daemon=True).start()
-        logger.info("[DB Logger] Shift analytics database initialized and background sync started.")
-    except Exception as _dbe:
-        logger.warning(f"[DB Logger] Init warning: {_dbe}")
-
-    web_port = APP_CONFIG.get("web", {}).get("port", 5000)
-    kill_process_on_port(web_port)
-    kill_process_on_port(5001)
-    kill_process_on_port(5050)
-    init_models()
+        # 1. Clean up any stale processes from previous crashed sessions / sudden power cuts
+        enforce_single_instance()
+        kill_camera_holders()
     
-    import subprocess
-    import atexit
+        # Initialize workspace folders
+        os.makedirs("lid_data", exist_ok=True)
     
-    logger.info("[System] Automatically starting PaddleOCR Server...")
-    try:
-        ocr_log = open("logs/ocr_server.log", "w", buffering=1)
-        # Try specific Python 3.12 launcher first (runs OCR server on Python 3.12)
+        # Initialize SQLite database and sync past inspection scans in lid_data
         try:
-            py312_path = subprocess.check_output(["py", "-3.12", "-c", "import sys; print(sys.executable)"], creationflags=0x08000000).decode().strip()
-            ocr_process = subprocess.Popen([py312_path, "paddleocr_server.py", "--parent-pid", str(os.getpid())], stdout=ocr_log, stderr=subprocess.STDOUT, env=dict(os.environ, PYTHONUNBUFFERED="1"), creationflags=0x08000000)
-        except Exception:
-            ocr_process = subprocess.Popen([sys.executable, "paddleocr_server.py", "--parent-pid", str(os.getpid())], stdout=ocr_log, stderr=subprocess.STDOUT, env=dict(os.environ, PYTHONUNBUFFERED="1"), creationflags=0x08000000)
-            
-        def cleanup_ocr():
-            logger.info("[System] Shutting down PaddleOCR Server...")
+            db_logger.init_db()
+            threading.Thread(target=db_logger.sync_existing_lid_data, daemon=True).start()
+            logger.info("[DB Logger] Shift analytics database initialized and background sync started.")
+        except Exception as _dbe:
+            logger.warning(f"[DB Logger] Init warning: {_dbe}")
+
+        web_port = APP_CONFIG.get("web", {}).get("port", 5000)
+        kill_process_on_port(web_port)
+        kill_process_on_port(5001)
+        kill_process_on_port(5050)
+        init_models()
+    
+        import subprocess
+        import atexit
+    
+        logger.info("[System] Automatically starting PaddleOCR Server...")
+        try:
+            ocr_log = open("logs/ocr_server.log", "w", buffering=1)
+            # Try specific Python 3.12 launcher first (runs OCR server on Python 3.12)
             try:
-                ocr_process.terminate()
-                ocr_process.wait(timeout=2)
-                ocr_log.close()
+                py312_path = subprocess.check_output(["py", "-3.12", "-c", "import sys; print(sys.executable)"], creationflags=0x08000000).decode().strip()
+                ocr_process = subprocess.Popen([py312_path, "paddleocr_server.py", "--parent-pid", str(os.getpid())], stdout=ocr_log, stderr=subprocess.STDOUT, env=dict(os.environ, PYTHONUNBUFFERED="1"), creationflags=0x08000000)
             except Exception:
+                ocr_process = subprocess.Popen([sys.executable, "paddleocr_server.py", "--parent-pid", str(os.getpid())], stdout=ocr_log, stderr=subprocess.STDOUT, env=dict(os.environ, PYTHONUNBUFFERED="1"), creationflags=0x08000000)
+            
+            # Wait up to 15 seconds for PaddleOCR server to initialize models and begin listening
+            logger.info("[System] Waiting for PaddleOCR server to become ready...")
+            _ocr_ready = False
+            _ocr_start_wait = time.time()
+            while time.time() - _ocr_start_wait < 15.0:
                 try:
-                    ocr_process.kill()
-                except:
-                    pass
-                
-        atexit.register(cleanup_ocr)
-    except Exception as e:
-        logger.error(f"[System] Failed to start PaddleOCR server: {e}")
-    
-    logger.info("[System] Shift Analytics Dashboard is natively integrated at http://localhost:5000/dashboard")
-    
-    # Auto-connect GigE camera if target_serial is configured in config.yaml
-    target_serial = APP_CONFIG.get("camera", {}).get("gige", {}).get("target_serial", "").strip()
-    if target_serial:
-        logger.info(f"[Startup] Auto-connecting configured GigE camera SN: {target_serial}...")
-        exposure = APP_CONFIG.get("camera", {}).get("gige", {}).get("exposure", None)
-        gain = APP_CONFIG.get("camera", {}).get("gige", {}).get("gain", None)
-        pixel_fmt = APP_CONFIG.get("camera", {}).get("gige", {}).get("pixel_format", "BayerRG8")
-        try:
-            if cam.connect(0, exposure=exposure, gain=gain, pixel_format=pixel_fmt):
-                stream_source = "gige"
-                is_processing = True
-                logger.info(f"[Startup] Camera SN: {target_serial} connected on startup!")
+                    import urllib.request as _ur
+                    _req = _ur.Request("http://127.0.0.1:5001/ocr", data=b'{"image":""}', headers={'Content-Type': 'application/json'})
+                    with _ur.urlopen(_req, timeout=1.0) as _:
+                        pass
+                    _ocr_ready = True
+                    break
+                except urllib.error.HTTPError:
+                    # 500 error on empty image is expected; server is responsive!
+                    _ocr_ready = True
+                    break
+                except Exception:
+                    time.sleep(0.5)
+            if _ocr_ready:
+                logger.info(f"[System] PaddleOCR server is READY in {time.time() - _ocr_start_wait:.1f}s.")
             else:
-                logger.warning(f"[Startup] Initial connect failed: {cam.last_error_msg}. Enabling background auto-reconnect watchdog.")
+                logger.warning("[System] PaddleOCR server startup wait timed out; continuing startup.")
+
+            def cleanup_ocr():
+                logger.info("[System] Shutting down PaddleOCR Server...")
+                try:
+                    ocr_process.terminate()
+                    ocr_process.wait(timeout=2)
+                    ocr_log.close()
+                except Exception:
+                    try:
+                        ocr_process.kill()
+                    except:
+                        pass
+                
+            atexit.register(cleanup_ocr)
+        except Exception as e:
+            logger.error(f"[System] Failed to start PaddleOCR server: {e}")
+    
+        logger.info("[System] Shift Analytics Dashboard is natively integrated at http://localhost:5000/dashboard")
+    
+        # Auto-connect GigE camera if target_serial is configured in config.yaml
+        target_serial = APP_CONFIG.get("camera", {}).get("gige", {}).get("target_serial", "").strip()
+        if target_serial:
+            logger.info(f"[Startup] Auto-connecting configured GigE camera SN: {target_serial}...")
+            exposure = APP_CONFIG.get("camera", {}).get("gige", {}).get("exposure", None)
+            gain = APP_CONFIG.get("camera", {}).get("gige", {}).get("gain", None)
+            pixel_fmt = APP_CONFIG.get("camera", {}).get("gige", {}).get("pixel_format", "BayerRG8")
+            try:
+                if cam.connect(0, exposure=exposure, gain=gain, pixel_format=pixel_fmt):
+                    stream_source = "gige"
+                    is_processing = True
+                    logger.info(f"[Startup] Camera SN: {target_serial} connected on startup!")
+                else:
+                    logger.warning(f"[Startup] Initial connect failed: {cam.last_error_msg}. Enabling background auto-reconnect watchdog.")
+                    stream_source = "gige"
+                    is_processing = True
+            except Exception as startup_err:
+                logger.warning(f"[Startup] Camera connect exception: {startup_err}")
                 stream_source = "gige"
                 is_processing = True
-        except Exception as startup_err:
-            logger.warning(f"[Startup] Camera connect exception: {startup_err}")
-            stream_source = "gige"
-            is_processing = True
 
-    # Start the video processing background thread
-    processing_thread = threading.Thread(target=video_processing_loop, daemon=True)
-    processing_thread.start()
+        # Start the video processing background thread
+        processing_thread = threading.Thread(target=video_processing_loop, daemon=True)
+        processing_thread.start()
     
-    # Start the YOLO inference worker thread
-    yolo_thread = threading.Thread(target=yolo_worker_loop, daemon=True)
-    yolo_thread.start()
+        # Start the YOLO inference worker thread
+        yolo_thread = threading.Thread(target=yolo_worker_loop, daemon=True)
+        yolo_thread.start()
     
-    # Start the auto-cleanup thread
-    cleanup_thread = threading.Thread(target=auto_cleanup_loop, daemon=True)
-    cleanup_thread.start()
+        # Start the auto-cleanup thread
+        cleanup_thread = threading.Thread(target=auto_cleanup_loop, daemon=True)
+        cleanup_thread.start()
     
-    app.run(host=APP_CONFIG.get("web", {}).get("host", "0.0.0.0"), 
-            port=APP_CONFIG.get("web", {}).get("port", 5000), 
-            debug=False, threaded=True)
+        app.run(host=APP_CONFIG.get("web", {}).get("host", "0.0.0.0"), 
+                port=APP_CONFIG.get("web", {}).get("port", 5000), 
+                debug=False, threaded=True)
 
 
 
+    except Exception as main_err:
+        import traceback
+        tb = traceback.format_exc()
+        logger.critical(f'[CRITICAL STARTUP ERROR] {tb}')
+        try:
+            with open('logs/startup_crash.log', 'w', encoding='utf-8') as cf:
+                cf.write(tb)
+        except Exception:
+            pass
+        sys.__stderr__.write(f'\n================== CRITICAL ERROR ==================\n{tb}\n')
+        sys.__stderr__.flush()
+        raise

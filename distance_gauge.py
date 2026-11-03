@@ -103,7 +103,7 @@ class DistanceGauge:
         pt = (float(sx + px + dx + ox), float(sy + py + dy + oy))
         return pt, float(max_val)
 
-    def measure(self, frame: np.ndarray, back_box=None, min_score: float = 0.60) -> dict:
+    def measure(self, frame: np.ndarray, back_box=None, min_score: float = 0.50) -> dict:
         """
         Measures Catch Plug -> Trimline distance on the frame.
         Handles both 5MP industrial camera frames and resized video files seamlessly.
