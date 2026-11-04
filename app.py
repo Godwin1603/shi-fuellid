@@ -82,7 +82,7 @@ CLASS_CONF_THRESHOLDS = {}
 def reload_config_if_modified():
     """Reloads config.yaml dynamically if modified on disk without restarting the server."""
     global APP_CONFIG, _CONFIG_LAST_MTIME, OCR_CONF_THRESHOLD, OCR_FALLBACK_TIMEOUT
-    global MODEL_PATH, RETENTION_DAYS, YOLO_CONF_THRESHOLD, CLASS_CONF_THRESHOLDS
+    global MODEL_PATH, RETENTION_DAYS, YOLO_CONF_THRESHOLD, CLASS_CONF_THRESHOLDS, YOLO_MODEL
     try:
         if os.path.exists(CONFIG_PATH):
             mtime = os.path.getmtime(CONFIG_PATH)
@@ -93,7 +93,18 @@ def reload_config_if_modified():
                 _CONFIG_LAST_MTIME = mtime
                 OCR_CONF_THRESHOLD = APP_CONFIG.get("ai", {}).get("ocr_confidence_threshold", 0.10)
                 OCR_FALLBACK_TIMEOUT = APP_CONFIG.get("ai", {}).get("ocr_fallback_timeout", 3.5)
-                MODEL_PATH = APP_CONFIG.get("ai", {}).get("model_path", "best_SHI_FUELDOOR.pt")
+                new_model_path = APP_CONFIG.get("ai", {}).get("model_path", "best_SHI_FUELDOOR.pt")
+                if 'YOLO_MODEL' in globals() and YOLO_MODEL is not None and new_model_path != MODEL_PATH and os.path.exists(new_model_path):
+                    try:
+                        logger.info(f"[Config] Model path changed to {new_model_path}. Reloading model...")
+                        new_model = YOLO(new_model_path)
+                        if GPU_AVAILABLE:
+                            new_model.to(YOLO_DEVICE)
+                        YOLO_MODEL = new_model
+                        logger.info(f"[Config] Successfully reloaded {new_model_path} on {YOLO_DEVICE if GPU_AVAILABLE else 'cpu'}")
+                    except Exception as mod_err:
+                        logger.error(f"[Config] Failed to reload model from {new_model_path}: {mod_err}")
+                MODEL_PATH = new_model_path
                 RETENTION_DAYS = APP_CONFIG.get("storage", {}).get("retention_days", 30)
                 YOLO_CONF_THRESHOLD = APP_CONFIG.get("ai", {}).get("default_yolo_confidence", 0.10)
                 CLASS_CONF_THRESHOLDS = APP_CONFIG.get("ai", {}).get("class_confidences", {})
@@ -512,7 +523,7 @@ FRONT_DEFECT_CLASSES = {"striker_bend", "dent", "buldge", "bulge", "defect", "da
 LOCK_STRIKER_CLASSES = {"lock_striker"}
 LOCK_STRIKER_DEFECT_CLASSES = {"lock_striker_bend"}
 
-BACK_CLASSES = {"back", "back_hook", "hole", "holes", "serial", "serial_area"}
+BACK_CLASSES = {"back", "back_hook", "hole", "holes", "serial", "serial_area", "punch_mark"}
 BACK_DEFECT_CLASSES = {"frame_damage", "back_hook_bend", "hole_spec_error", "dimension_out_of_spec", "dimension_not_found"}
 
 # Defect class names used for surface defect tracking, overlays, and reports
@@ -1535,6 +1546,11 @@ def finalize_report_and_rename(c_data):
                                     c_data["back_distance_mm"] = still_dist.get("mm")
                                     c_data["last_distance_result"] = still_dist
                                     logger.info(f"[Still Verification] Settled catch plug distance on still: {still_dist.get('mm')}mm (PASS)")
+                                elif still_dist.get("passed") is False:
+                                    c_data["back_distance_passed"] = False
+                                    c_data["back_distance_mm"] = still_dist.get("mm")
+                                    c_data["last_distance_result"] = still_dist
+                                    logger.info(f"[Still Verification] Settled catch plug distance on still: {still_dist.get('mm')}mm (NG)")
                             except Exception as _g_err:
                                 logger.warning(f"[Still Verification] Distance gauge on still warning: {_g_err}")
 
@@ -1804,21 +1820,18 @@ def finalize_report_and_rename(c_data):
                 cycle_count += 1
 
             if defects:
-                current_cycle["instruction"] = "NG"  
+                current_cycle["instruction"] = "REMOVE THE PLATE (NG)"  
                 current_cycle["instruction_color"] = "red"
                 current_cycle["result"] = "NG"
                 current_cycle["status"] = f"Finished Cycle: NG ({serial})"
             else:
-                current_cycle["instruction"] = "OK"  
+                current_cycle["instruction"] = "REMOVE THE PLATE"  
                 current_cycle["instruction_color"] = "green"
                 current_cycle["result"] = "OK"
                 current_cycle["status"] = f"Finished Cycle: OK ({serial})"
             
-        # Hold the final result on screen for 4 seconds so the operator can read it
-        time.sleep(4.0)
-        
-        # Automatically reset all values for the next cycle
-        reset_cycle_state()
+        # Keep result on screen until operator physically removes the part
+        c_data["report_saved"] = True
 
     except Exception as e:
         import traceback
@@ -2918,7 +2931,7 @@ def yolo_worker_loop():
                             min(w_orig, int(xyxy_f[2] / scale)),
                             min(h_orig, int(xyxy_f[3] / scale))
                         )
-                        if current_state in ["WAITING_FRONT", "WAITING_REMOVE"]:
+                        if current_state in ["WAITING_FRONT", "WAITING_LOCK_STRIKER", "WAITING_REMOVE"]:
                             has_front_detected = True
                             front_box = f_box
                             if active_cycle_data.get("front_first_seen_time") is None:
@@ -3097,10 +3110,10 @@ def yolo_worker_loop():
                         if has_back_detected:
                             frame_holes += 1
                     elif class_name in ["ring_bush", "ringbush"]:
-                        if has_front_detected or current_state == "WAITING_FRONT":
+                        if has_front_detected or current_state in ["WAITING_FRONT", "WAITING_LOCK_STRIKER"]:
                             frame_ring_bush += 1
                     elif class_name == "striker":
-                        if has_front_detected or current_state == "WAITING_FRONT":
+                        if has_front_detected or current_state in ["WAITING_FRONT", "WAITING_LOCK_STRIKER"]:
                             frame_striker += 1
                     elif class_name == "back_hook":
                         if has_back_detected or current_state == "WAITING_BACK":
@@ -3195,6 +3208,16 @@ def yolo_worker_loop():
                         current_cycle["distance_status"] = stable_dist["status"]
                         active_cycle_data["back_distance_mm"] = stable_dist["mm"]
                         active_cycle_data["back_distance_passed"] = stable_dist["passed"]
+                        gauge_cfg = APP_CONFIG.get("ai", {}).get("distance_measurement", {})
+                        if gauge_cfg.get("flag_as_ng", False):
+                            if not _passed:
+                                active_cycle_data["defects_detected"].add("dimension_out_of_spec")
+                            else:
+                                active_cycle_data["defects_detected"].discard("dimension_out_of_spec")
+                                active_cycle_data["defects_detected"].discard("dimension_not_found")
+                                for _d in list(active_cycle_data.get("defects_detected", set())):
+                                    if "dimension" in _d:
+                                        active_cycle_data["defects_detected"].discard(_d)
                     elif now_t > active_cycle_data.get("distance_hold_until", 0):
                         current_cycle["distance_status"] = "NOT_FOUND"
             elif not back_visible and raw_front_detected:
@@ -3346,6 +3369,7 @@ def yolo_worker_loop():
                 cur_side_in_seq = True
 
             with lock:
+                state = active_cycle_data.get("state", "WAITING_FRONT")
                 current_detections = new_detections
                 current_cycle["placed_side"] = cur_placed_side
                 current_cycle["placed_side_in_seq"] = cur_side_in_seq
@@ -3404,12 +3428,12 @@ def yolo_worker_loop():
                     else:
                         current_cycle["status"] = "Waiting for Front Panel"
                         current_cycle["instruction"] = "PLACE FUEL DOOR (FRONT)"
-                    if not active_cycle_data.get("defects_detected"):
-                        current_cycle["instruction_color"] = "blue"
-                    else:
-                        # current_cycle["instruction"] = "NG"  # Removed per user request to keep operator instructions
-                        current_cycle["instruction_color"] = "red"
-                        current_cycle["result"] = "NG"
+                        if not active_cycle_data.get("defects_detected"):
+                            current_cycle["instruction_color"] = "blue"
+                        else:
+                            # current_cycle["instruction"] = "NG"  # Removed per user request to keep operator instructions
+                            current_cycle["instruction_color"] = "red"
+                            current_cycle["result"] = "NG"
                     
 
 
@@ -3441,7 +3465,9 @@ def yolo_worker_loop():
                         
                         active_cycle_data["front_missing_frames"] = 0
                         
-                        if not hand_warning and not has_hand_detected and time_stable >= 0.5:
+                        # Wait 0.5s if all front components are detected, or up to 1.2s to allow second striker to appear
+                        min_front_settle = 0.5 if (frame_striker >= 2 and frame_ring_bush >= 1) else 1.2
+                        if not hand_warning and not has_hand_detected and time_stable >= min_front_settle:
                             # --- Capture front image (file I/O done OUTSIDE lock below) ---
                             _front_capture_frame   = frame_to_process.copy()
                             _front_capture_folder  = active_cycle_data["temp_folder"]
@@ -3450,18 +3476,35 @@ def yolo_worker_loop():
                             _front_unenhanced      = latest_unenhanced_frame.copy() if latest_unenhanced_frame is not None else None
 
                             logger.info("[State] Front captured as type='standard'")
-                            current_cycle["step2_status"] = "OK"
                             
-                            active_cycle_data["flash_end_time"] = time.time() + 2.0
-                            active_cycle_data["flash_message"] = "FRONT OK"
-                            active_cycle_data["state"] = "WAITING_LOCK_STRIKER"
+                            # Check front components upon capture
+                            front_missing_defects = []
+                            if active_cycle_data.get("max_ring_bush_detected", 0) < 1 and frame_ring_bush < 1:
+                                active_cycle_data["defects_detected"].add("missing_ring_bush")
+                                front_missing_defects.append("RING BUSH")
+                            if active_cycle_data.get("max_striker_detected", 0) < 2 and frame_striker < 2:
+                                active_cycle_data["defects_detected"].add("missing_striker")
+                                front_missing_defects.append("STRIKER")
+
                             tracker_state = active_cycle_data.get("defect_tracker", {})
                             for d in frame_defects:
                                 if tracker_state.get(d, {}).get("status") == "CONFIRMED" or active_cycle_data.get("defect_times", {}).get(d, 0.0) >= 1.0:
                                     active_cycle_data["defects_detected"].add(d)
+
                             if active_cycle_data.get("defects_detected"):
+                                current_cycle["step2_status"] = "NG"
                                 current_cycle["instruction_color"] = "red"
                                 current_cycle["result"] = "NG"
+                                if front_missing_defects:
+                                    active_cycle_data["flash_message"] = f"FRONT NG: MISSING {', '.join(front_missing_defects)}"
+                                else:
+                                    active_cycle_data["flash_message"] = "FRONT DEFECT DETECTED"
+                            else:
+                                current_cycle["step2_status"] = "OK"
+                                active_cycle_data["flash_message"] = "FRONT OK"
+
+                            active_cycle_data["flash_end_time"] = time.time() + 2.0
+                            active_cycle_data["state"] = "WAITING_LOCK_STRIKER"
                             # Flag that we need to write the front image (done outside lock after the block)
                             _do_front_write = True
 
@@ -3521,12 +3564,26 @@ def yolo_worker_loop():
                             active_cycle_data["state"] = "WAITING_BACK"
                     elif (raw_back_detected or back_box is not None):
                         # Operator showed Back Side without presenting Lock Striker!
-                        # STRICT SEQUENCE: Do NOT transition to WAITING_BACK. Enforce Lock Striker first!
-                        current_cycle["status"] = "Waiting for Lock Striker (Lock Striker required first)"
-                        current_cycle["instruction"] = "OUT OF SEQUENCE: SHOW LOCK STRIKER"
-                        current_cycle["instruction_color"] = "orange"
-                        current_cycle["placed_side"] = "BACK"
-                        current_cycle["placed_side_in_seq"] = False
+                        if active_cycle_data.get("ls_skip_start_time") is None:
+                            active_cycle_data["ls_skip_start_time"] = time.time()
+                        
+                        skip_elapsed = time.time() - active_cycle_data["ls_skip_start_time"]
+                        if skip_elapsed >= 1.5:
+                            # Operator bypassed Lock Striker — latch missing_lock_striker NG and proceed to WAITING_BACK
+                            current_cycle["step3_status"] = "NG"
+                            active_cycle_data["defects_detected"].add("missing_lock_striker")
+                            current_cycle["instruction_color"] = "red"
+                            current_cycle["result"] = "NG"
+                            active_cycle_data["flash_end_time"] = time.time() + 2.0
+                            active_cycle_data["flash_message"] = "LOCK STRIKER NG: MISSING"
+                            active_cycle_data["state"] = "WAITING_BACK"
+                            logger.info("[Lock Striker] Lock striker skipped by operator — flagged missing_lock_striker (NG) and transitioned to WAITING_BACK")
+                        else:
+                            current_cycle["status"] = "Waiting for Lock Striker (Lock Striker required first)"
+                            current_cycle["instruction"] = "SHOW LOCK STRIKER"
+                            current_cycle["instruction_color"] = "orange"
+                            current_cycle["placed_side"] = "BACK"
+                            current_cycle["placed_side_in_seq"] = False
                     else:
                         active_cycle_data["ls_missing_frames"] = active_cycle_data.get("ls_missing_frames", 0) + 1
                         if active_cycle_data["ls_missing_frames"] > 3:
@@ -3656,9 +3713,9 @@ def yolo_worker_loop():
                         needs_reset = True
                     else:
                         active_cycle_data["remove_frames_count"] = 0
-                        # Fail-safe: if operator removed part but ghost noise persists for > 8s after finalization, force reset
-                        if time.time() - active_cycle_data["remove_state_start_time"] > 8.0 and not active_cycle_data.get("processing_thread_active", False):
-                            logger.warning("[State Watchdog] Part removal timeout (8s elapsed). Auto-resetting for next cycle.")
+                        # Fail-safe: ONLY if actual panel is gone but ghost sub-feature noise persists for > 15s, reset
+                        if (not has_back_detected and not has_front_detected) and (time.time() - active_cycle_data["remove_state_start_time"] > 15.0) and not active_cycle_data.get("processing_thread_active", False):
+                            logger.warning("[State Watchdog] Ghost noise timeout (15s elapsed). Auto-resetting for next cycle.")
                             needs_reset = True
                         
                 # Update UI data outside state transitions
@@ -3674,7 +3731,7 @@ def yolo_worker_loop():
                     if active_cycle_data.get("lock_striker_path") is not None or active_cycle_data.get("max_lock_striker_detected", 0) >= 1:
                         current_cycle["step3_status"] = "OK"
                         active_cycle_data["defects_detected"].discard("missing_lock_striker")
-                    elif state in ["WAITING_BACK", "WAITING_REMOVE"] and current_cycle["step3_status"] != "NG":
+                    elif state in ["WAITING_BACK", "WAITING_REMOVE"] and current_cycle["step3_status"] != "NG" and active_cycle_data.get("front_path") is not None:
                         # Operator moved to Back or Remove without capturing lock striker
                         current_cycle["step3_status"] = "NG"
                         active_cycle_data["defects_detected"].add("missing_lock_striker")
@@ -3718,16 +3775,14 @@ def yolo_worker_loop():
                         if frame_lock_striker >= 1:
                             active_cycle_data["lock_striker_time"] = active_cycle_data.get("lock_striker_time", 0.0) + dt
                         
-                        # Dynamically add missing defects for front-class components (ONLY in WAITING_FRONT when part is stable and hand is not present)
+                        # Dynamically add missing defects for front-class components (in WAITING_FRONT when part is stable and hand is not present)
                         if state == "WAITING_FRONT" and has_front_detected and not hand_warning and not has_hand_detected:
                             front_settle_start = active_cycle_data.get("front_first_seen_time")
-                            if front_settle_start is not None and (time.time() - front_settle_start) >= 1.0:
-                                active_cycle_data["front_visible_time"] = active_cycle_data.get("front_visible_time", 0.0) + dt
-                                if active_cycle_data["front_visible_time"] >= 1.5:
-                                    if active_cycle_data.get("max_ring_bush_detected", 0) < 1:
-                                        active_cycle_data["defects_detected"].add("missing_ring_bush")
-                                    if active_cycle_data.get("max_striker_detected", 0) < 2:
-                                        active_cycle_data["defects_detected"].add("missing_striker")
+                            if front_settle_start is not None and (time.time() - front_settle_start) >= 0.4:
+                                if active_cycle_data.get("max_ring_bush_detected", 0) < 1 and frame_ring_bush < 1:
+                                    active_cycle_data["defects_detected"].add("missing_ring_bush")
+                                if active_cycle_data.get("max_striker_detected", 0) < 2 and frame_striker < 2:
+                                    active_cycle_data["defects_detected"].add("missing_striker")
                         else:
                             active_cycle_data["front_visible_time"] = 0.0
                         
@@ -3750,6 +3805,16 @@ def yolo_worker_loop():
                         if active_cycle_data.get("max_striker_detected", 0) >= 2 or frame_striker >= 2:
                             active_cycle_data["max_striker_detected"] = 2
                             active_cycle_data["defects_detected"].discard("missing_striker")
+                            # If front was snapped before 2nd striker settled, update the saved front.jpg
+                            if active_cycle_data.get("temp_folder") and (has_front_detected or raw_front_detected) and not has_hand_detected:
+                                _f_disk = os.path.join(active_cycle_data["temp_folder"], "front.jpg")
+                                if os.path.exists(_f_disk) and not active_cycle_data.get("front_resaved_with_all_strikers", False):
+                                    try:
+                                        cv2.imwrite(_f_disk, frame_to_process, [cv2.IMWRITE_JPEG_QUALITY, 95])
+                                        active_cycle_data["front_resaved_with_all_strikers"] = True
+                                        logger.info(f"[Dynamic Recovery] Updated front.jpg on disk with all {frame_striker} strikers.")
+                                    except Exception as _e:
+                                        pass
                         if active_cycle_data.get("max_back_hook_detected", 0) >= 2 or frame_back_hook >= 2:
                             active_cycle_data["max_back_hook_detected"] = 2
                             active_cycle_data["defects_detected"].discard("missing_back_hook")
@@ -3767,12 +3832,23 @@ def yolo_worker_loop():
                         current_cycle["instruction"] = "TAKE HAND AWAY FROM THE PART"
                         current_cycle["status"] = "Hand Detected - Please Remove Hand"
                     elif state == "WAITING_REMOVE":
-                        # User request: At the last sequence until they take the part out, flash OK only, don't flash NG
+                        # Hold final cycle result until part is physically removed
+                        gauge_cfg = APP_CONFIG.get("ai", {}).get("distance_measurement", {})
+                        gauge_flag_as_ng = gauge_cfg.get("flag_as_ng", False)
+                        is_dist_ng = (current_cycle.get("distance_status") == "NG" or any("dimension" in d for d in active_cycle_data.get("defects_detected", set()))) and gauge_flag_as_ng
+                        has_any_defects = bool(active_cycle_data.get("defects_detected")) or is_dist_ng
+
                         if active_cycle_data.get("remove_frames_count", 0) == 0:
-                            current_cycle["instruction_color"] = "green"
-                            current_cycle["instruction"] = "REMOVE THE PLATE"
-                            if not active_cycle_data["defects_detected"]:
+                            if has_any_defects:
+                                current_cycle["instruction_color"] = "red"
+                                current_cycle["instruction"] = "REMOVE THE PLATE (NG)"
+                                current_cycle["result"] = "NG"
+                                current_cycle["status"] = "Finished Cycle: NG - DEFECT DETECTED"
+                            else:
+                                current_cycle["instruction_color"] = "green"
+                                current_cycle["instruction"] = "REMOVE THE PLATE"
                                 current_cycle["result"] = "OK"
+                                current_cycle["status"] = "Finished Cycle: OK"
                     else:
                         if active_cycle_data["defects_detected"]:
                             current_cycle["instruction_color"] = "red"

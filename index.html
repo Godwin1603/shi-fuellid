@@ -1840,6 +1840,14 @@
                     });
                 }
                 
+                // Catch plug distance status check
+                const isDistNG = (data.distance_status === 'NG') || (data.defects && data.defects.some(d => d.includes('dimension')));
+                if (isDistNG) {
+                    if (!warningMessages.includes("CATCH PLUG DISTANCE NG")) {
+                        warningMessages.push("CATCH PLUG DISTANCE NG");
+                    }
+                }
+                
                 if (warningMessages.length > 0) {
                     warningEl.textContent = warningMessages.join(" & ");
                     warningEl.style.display = 'block';
@@ -1872,12 +1880,20 @@
                         if (rightDefects) rightDefects.innerHTML = handBadge;
                     }
                 } else {
-                    if (warningMessages.length > 0 || (data.defects && data.defects.length > 0)) {
+                    if (warningMessages.length > 0 || (data.defects && data.defects.length > 0) || isDistNG) {
                         isNG = true;
+                        isOK = false;
                     } else if ((data.instruction_color === 'red' && (!data.instruction || !data.instruction.includes('OUT OF SEQUENCE'))) || data.result === 'NG' || data.result === 'FAIL' || data.instruction === 'NG') {
                         isNG = true;
-                    } else if (data.result === 'OK' || data.result === 'PASS' || data.instruction === 'OK') {
-                        isOK = true;
+                        isOK = false;
+                    } else if (data.result === 'OK' || data.result === 'PASS' || data.instruction === 'OK' || data.instruction === 'REMOVE THE PLATE') {
+                        if (!isDistNG) {
+                            isOK = true;
+                            isNG = false;
+                        } else {
+                            isNG = true;
+                            isOK = false;
+                        }
                     }
 
                     if (leftSignal && rightSignal) {
