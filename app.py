@@ -78,11 +78,12 @@ MODEL_PATH = "best_SHI_FUELDOOR.pt"
 RETENTION_DAYS = 30
 YOLO_CONF_THRESHOLD = 0.10
 CLASS_CONF_THRESHOLDS = {}
+YOLO_INFERENCE_IMGSZ = 1024
 
 def reload_config_if_modified():
     """Reloads config.yaml dynamically if modified on disk without restarting the server."""
     global APP_CONFIG, _CONFIG_LAST_MTIME, OCR_CONF_THRESHOLD, OCR_FALLBACK_TIMEOUT
-    global MODEL_PATH, RETENTION_DAYS, YOLO_CONF_THRESHOLD, CLASS_CONF_THRESHOLDS, YOLO_MODEL
+    global MODEL_PATH, RETENTION_DAYS, YOLO_CONF_THRESHOLD, CLASS_CONF_THRESHOLDS, YOLO_MODEL, YOLO_INFERENCE_IMGSZ
     try:
         if os.path.exists(CONFIG_PATH):
             mtime = os.path.getmtime(CONFIG_PATH)
@@ -91,6 +92,7 @@ def reload_config_if_modified():
                     new_cfg = yaml.safe_load(f) or {}
                 APP_CONFIG = new_cfg
                 _CONFIG_LAST_MTIME = mtime
+                YOLO_INFERENCE_IMGSZ = int(APP_CONFIG.get("ai", {}).get("inference_imgsz", 1024))
                 OCR_CONF_THRESHOLD = APP_CONFIG.get("ai", {}).get("ocr_confidence_threshold", 0.10)
                 OCR_FALLBACK_TIMEOUT = APP_CONFIG.get("ai", {}).get("ocr_fallback_timeout", 3.5)
                 new_model_path = APP_CONFIG.get("ai", {}).get("model_path", "best_SHI_FUELDOOR.pt")
@@ -108,7 +110,7 @@ def reload_config_if_modified():
                 RETENTION_DAYS = APP_CONFIG.get("storage", {}).get("retention_days", 30)
                 YOLO_CONF_THRESHOLD = APP_CONFIG.get("ai", {}).get("default_yolo_confidence", 0.10)
                 CLASS_CONF_THRESHOLDS = APP_CONFIG.get("ai", {}).get("class_confidences", {})
-                logger.info(f"[Config] Loaded/updated configuration from {CONFIG_PATH} (mtime={mtime})")
+                logger.info(f"[Config] Loaded/updated configuration from {CONFIG_PATH} (mtime={mtime}, imgsz={YOLO_INFERENCE_IMGSZ})")
     except Exception as e:
         logger.warning(f"[Config] Error reloading config: {e}")
 
@@ -518,12 +520,12 @@ OCR_ENGINE = None
 
 # Stage-specific class mappings and defect definitions
 FRONT_CLASSES = {"front", "striker", "ring_bush", "ringbush"}
-FRONT_DEFECT_CLASSES = {"striker_bend", "dent", "buldge", "bulge", "defect", "damage", "line_mark", "linemark", "line-mark"}
+FRONT_DEFECT_CLASSES = {"striker_bend", "dent", "buldge", "bulge", "defect", "damage", "line_mark", "linemark", "line-mark", "punch_mark", "punchmark"}
 
 LOCK_STRIKER_CLASSES = {"lock_striker"}
 LOCK_STRIKER_DEFECT_CLASSES = {"lock_striker_bend"}
 
-BACK_CLASSES = {"back", "back_hook", "hole", "holes", "serial", "serial_area", "punch_mark"}
+BACK_CLASSES = {"back", "back_hook", "hole", "holes", "serial", "serial_area"}
 BACK_DEFECT_CLASSES = {"frame_damage", "back_hook_bend", "hole_spec_error", "dimension_out_of_spec", "dimension_not_found"}
 
 # Defect class names used for surface defect tracking, overlays, and reports
@@ -1484,7 +1486,8 @@ def finalize_report_and_rename(c_data):
                 if front and os.path.exists(front):
                     f_img = cv2.imread(front)
                     if f_img is not None:
-                        f_res = YOLO_MODEL(f_img, verbose=False, conf=0.15, imgsz=640, device=YOLO_DEVICE)[0]
+                        verify_sz = int(APP_CONFIG.get("ai", {}).get("inference_imgsz", YOLO_INFERENCE_IMGSZ))
+                        f_res = YOLO_MODEL(f_img, verbose=False, conf=0.15, imgsz=verify_sz, device=YOLO_DEVICE)[0]
                         f_strikers = 0
                         f_ring_bush = 0
                         f_confirmed_surface = []
@@ -1495,7 +1498,7 @@ def finalize_report_and_rename(c_data):
                                 f_ring_bush += 1
                             elif cname == "striker" and cconf >= 0.25:
                                 f_strikers += 1
-                            elif cname in FRONT_DEFECT_CLASSES and cconf >= 0.45:
+                            elif cname in FRONT_DEFECT_CLASSES and cconf >= CLASS_CONF_THRESHOLDS.get(cname, 0.25):
                                 f_confirmed_surface.append(cname)
                         
                         if f_ring_bush >= 1:
@@ -1516,7 +1519,8 @@ def finalize_report_and_rename(c_data):
                 if back and os.path.exists(back):
                     b_img = cv2.imread(back)
                     if b_img is not None:
-                        b_res = YOLO_MODEL(b_img, verbose=False, conf=0.15, imgsz=640, device=YOLO_DEVICE)[0]
+                        verify_sz = int(APP_CONFIG.get("ai", {}).get("inference_imgsz", YOLO_INFERENCE_IMGSZ))
+                        b_res = YOLO_MODEL(b_img, verbose=False, conf=0.15, imgsz=verify_sz, device=YOLO_DEVICE)[0]
                         b_hooks = 0
                         b_holes = 0
                         b_confirmed_surface = []
@@ -1527,7 +1531,7 @@ def finalize_report_and_rename(c_data):
                                 b_hooks += 1
                             elif cname in ["hole", "holes"] and cconf >= 0.20:
                                 b_holes += 1
-                            elif cname in BACK_DEFECT_CLASSES and cconf >= 0.45:
+                            elif cname in BACK_DEFECT_CLASSES and cconf >= CLASS_CONF_THRESHOLDS.get(cname, 0.25):
                                 b_confirmed_surface.append(cname)
                                 
                         if b_hooks >= 2:
@@ -1537,22 +1541,34 @@ def finalize_report_and_rename(c_data):
                         if b_holes >= 3:
                             c_data["max_holes_detected"] = max(c_data.get("max_holes_detected", 0), 3)
 
-                        # Cross-verify Catch Plug distance on the settled, high-resolution still image
+                        # Cross-verify Catch Plug distance on the settled still image
+                        # Do NOT overwrite a valid live-settled PASS! The live 10-frame median on clean frames is more reliable
+                        # than re-measuring on back.jpg which already has visual overlay lines stamped onto it.
                         if distance_gauge is not None and distance_gauge.is_valid:
-                            try:
-                                still_dist = distance_gauge.measure(b_img, back_box=None)
-                                if still_dist.get("passed") is True:
-                                    c_data["back_distance_passed"] = True
-                                    c_data["back_distance_mm"] = still_dist.get("mm")
-                                    c_data["last_distance_result"] = still_dist
-                                    logger.info(f"[Still Verification] Settled catch plug distance on still: {still_dist.get('mm')}mm (PASS)")
-                                elif still_dist.get("passed") is False:
-                                    c_data["back_distance_passed"] = False
-                                    c_data["back_distance_mm"] = still_dist.get("mm")
-                                    c_data["last_distance_result"] = still_dist
-                                    logger.info(f"[Still Verification] Settled catch plug distance on still: {still_dist.get('mm')}mm (NG)")
-                            except Exception as _g_err:
-                                logger.warning(f"[Still Verification] Distance gauge on still warning: {_g_err}")
+                            if c_data.get("back_distance_passed") is True:
+                                logger.info(f"[Still Verification] Catch plug distance already confirmed PASS ({c_data.get('back_distance_mm')}mm)")
+                            else:
+                                try:
+                                    b_back_box = None
+                                    for b in b_res.boxes:
+                                        cname = YOLO_MODEL.names[int(b.cls[0])].lower()
+                                        if cname in ["back", "frame_damage"] and b_back_box is None:
+                                            b_xyxy = b.xyxy[0].cpu().numpy().astype(int)
+                                            b_back_box = (b_xyxy[0], b_xyxy[1], b_xyxy[2], b_xyxy[3])
+                                    still_dist = distance_gauge.measure(b_img, back_box=b_back_box)
+                                    if still_dist.get("mm") is not None:
+                                        if still_dist.get("passed") is True:
+                                            c_data["back_distance_passed"] = True
+                                            c_data["back_distance_mm"] = still_dist.get("mm")
+                                            c_data["last_distance_result"] = still_dist
+                                            logger.info(f"[Still Verification] Settled catch plug distance on still: {still_dist.get('mm')}mm (PASS)")
+                                        else:
+                                            c_data["back_distance_passed"] = False
+                                            c_data["back_distance_mm"] = still_dist.get("mm")
+                                            c_data["last_distance_result"] = still_dist
+                                            logger.info(f"[Still Verification] Settled catch plug distance on still: {still_dist.get('mm')}mm (NG)")
+                                except Exception as _g_err:
+                                    logger.warning(f"[Still Verification] Distance gauge on still warning: {_g_err}")
 
                         # If a back surface defect was flagged by live tracker but is NOT confirmed on the crisp still, discard it
                         for d in list(c_data.get("defects_detected", set())):
@@ -1600,21 +1616,36 @@ def finalize_report_and_rename(c_data):
             else:
                 defects = [d for d in defects if d != "missing_lock_striker"]
 
-            # Distance measurement verification (BC4I: Catch plug -> trimline 128.4 +/- 1.5 mm)
+            # Distance measurement verification (BC4I: Catch plug -> trimline 128.4 +/- 0.7 mm)
             gauge_cfg = APP_CONFIG.get("ai", {}).get("distance_measurement", {})
             gauge_enabled = gauge_cfg.get("enabled", True)
             gauge_flag_as_ng = gauge_cfg.get("flag_as_ng", False)
             if gauge_enabled and gauge_flag_as_ng:
                 dist_passed = c_data.get("back_distance_passed")
                 dist_mm = c_data.get("back_distance_mm")
-                if dist_passed is False:
+                if dist_passed is True:
+                    # Clean PASS: completely purge any dimension defects accumulated earlier in the cycle
+                    defects = [d for d in defects if not ("dimension" in d)]
+                    c_data.get("defects_detected", set()).discard("dimension_out_of_spec")
+                    c_data.get("defects_detected", set()).discard("dimension_not_found")
+                    if "defects_detected" in c_data:
+                        c_data["defects_detected"] = {d for d in c_data["defects_detected"] if not ("dimension" in d)}
+                    if "defects_detected" in active_cycle_data:
+                        active_cycle_data["defects_detected"] = {d for d in active_cycle_data["defects_detected"] if not ("dimension" in d)}
+                elif dist_passed is False:
                     if dist_mm is not None:
                         defects.append(f"dimension_out_of_spec ({dist_mm:.2f}mm)")
                     else:
                         defects.append("dimension_not_found")
             else:
-                # If flag_as_ng is False, purge any dimension defect flags
+                # If gauge disabled or flag_as_ng is False, purge any dimension defect flags
                 defects = [d for d in defects if not ("dimension" in d)]
+                c_data.get("defects_detected", set()).discard("dimension_out_of_spec")
+                c_data.get("defects_detected", set()).discard("dimension_not_found")
+                if "defects_detected" in c_data:
+                    c_data["defects_detected"] = {d for d in c_data["defects_detected"] if not ("dimension" in d)}
+                if "defects_detected" in active_cycle_data:
+                    active_cycle_data["defects_detected"] = {d for d in active_cycle_data["defects_detected"] if not ("dimension" in d)}
                 
             # Serial number check (toggleable via check_missing_serial_ng)
             check_serial_ng = APP_CONFIG.get("ai", {}).get("check_missing_serial_ng", False)
@@ -2685,7 +2716,7 @@ def video_processing_loop():
             overlay = None
             for det in dets:
                 class_name = det["class_name"]
-                if class_name in SURFACE_DEFECT_CLASSES or class_name in ["line_mark", "dent", "buldge", "bulge", "damage", "defect"]:
+                if class_name in SURFACE_DEFECT_CLASSES or class_name in ["line_mark", "dent", "buldge", "bulge", "damage", "defect", "punch_mark", "punchmark"]:
                     mask_pts = det.get("mask")
                     if mask_pts is not None:
                         color = (0, 255, 255) if class_name == "line_mark" else (0, 0, 255)
@@ -2723,12 +2754,12 @@ def video_processing_loop():
                     color = (0, 255, 128)
                 elif class_name in ["line_mark", "linemark", "line-mark"]:
                     color = (0, 255, 255)
-                elif class_name in SURFACE_DEFECT_CLASSES or class_name in ["dent", "buldge", "bulge", "damage", "defect"]:
+                elif class_name in SURFACE_DEFECT_CLASSES or class_name in ["dent", "buldge", "bulge", "damage", "defect", "punch_mark", "punchmark"]:
                     color = (0, 0, 255)
                 elif class_name == "hand":
                     color = (0, 140, 255)
 
-                if (class_name in SURFACE_DEFECT_CLASSES or class_name in ["line_mark", "dent", "buldge", "bulge", "damage", "defect"]) and det.get("mask") is not None:
+                if (class_name in SURFACE_DEFECT_CLASSES or class_name in ["line_mark", "dent", "buldge", "bulge", "damage", "defect", "punch_mark", "punchmark"]) and det.get("mask") is not None:
                     pts = np.array(det["mask"], np.int32)
                     pts[:, 0] = (pts[:, 0] * scale_ann).astype(int)
                     pts[:, 1] = (pts[:, 1] * scale_ann).astype(int)
@@ -2825,17 +2856,18 @@ def yolo_worker_loop():
             
         h_orig, w_orig = frame_to_process.shape[:2]
         
-        # Resize frame for faster YOLO inference (user trained at 432x432, 448 is closest stride-32 multiple)
-        scale = 1.0
-        if w_orig > 448:
-            scale = 448 / w_orig
-            frame_resized = cv2.resize(frame_to_process, (448, int(h_orig * scale)))
-        else:
-            frame_resized = frame_to_process.copy()
-            
         try:
-            # Check for live config updates (thresholds, options) from config.yaml
+            # Check for live config updates (thresholds, options, imgsz) from config.yaml
             reload_config_if_modified()
+            
+            # Target resolution for YOLO inference (native model training resolution: 1024)
+            target_sz = int(APP_CONFIG.get("ai", {}).get("inference_imgsz", YOLO_INFERENCE_IMGSZ))
+            scale = 1.0
+            if w_orig > target_sz:
+                scale = target_sz / float(w_orig)
+                frame_resized = cv2.resize(frame_to_process, (target_sz, int(h_orig * scale)))
+            else:
+                frame_resized = frame_to_process.copy()
             
             # Determine minimum threshold for YOLO to return all relevant boxes
             min_thresh = min(CLASS_CONF_THRESHOLDS.values()) if CLASS_CONF_THRESHOLDS else YOLO_CONF_THRESHOLD
@@ -2847,7 +2879,7 @@ def yolo_worker_loop():
             # YOLO_MODEL is read-only after loading and safe to call without the lock.
             with torch.inference_mode():
                 try:
-                    results = YOLO_MODEL(frame_resized, verbose=False, conf=run_thresh, task='segment', imgsz=448, device=YOLO_DEVICE)
+                    results = YOLO_MODEL(frame_resized, verbose=False, conf=run_thresh, task='segment', imgsz=target_sz, device=YOLO_DEVICE)
                 except Exception as inf_err:
                     err_str = str(inf_err)
                     # Automatically handle CUDA crash / TDR timeout / GPU lost by falling back to CPU
@@ -2863,7 +2895,7 @@ def yolo_worker_loop():
                             torch.set_num_threads(_CPU_CORES)
                         except Exception:
                             pass
-                        results = YOLO_MODEL(frame_resized, verbose=False, conf=run_thresh, task='segment', imgsz=448, device='cpu')
+                        results = YOLO_MODEL(frame_resized, verbose=False, conf=run_thresh, task='segment', imgsz=target_sz, device='cpu')
                     else:
                         raise
 
@@ -3068,10 +3100,10 @@ def yolo_worker_loop():
                     elif class_name in ["serial", "serial_area"]: color = (255, 255, 0)
                     elif class_name == "lock_striker": color = (0, 255, 128)
                     elif class_name in ["line_mark", "linemark", "line-mark"]: color = (0, 255, 255)
-                    elif class_name in SURFACE_DEFECT_CLASSES: color = (0, 0, 255)  # Bright Red for all verified defects
+                    elif class_name in SURFACE_DEFECT_CLASSES or class_name in ["punch_mark", "punchmark"]: color = (0, 0, 255)  # Bright Red for all verified defects
                     elif class_name == "hand": color = (0, 140, 255)
                     
-                    if class_name in SURFACE_DEFECT_CLASSES or class_name == "line_mark":
+                    if class_name in SURFACE_DEFECT_CLASSES or class_name in ["line_mark", "punch_mark", "punchmark"]:
                         if mask_polygon is not None:
                             pts = np.array(mask_polygon, np.int32).reshape((-1, 1, 2))
                             overlay = annotated_frame.copy()
@@ -3171,14 +3203,21 @@ def yolo_worker_loop():
 
             # Lock striker frame save is handled after 1.5s stabilization delay in state == "WAITING_LOCK_STRIKER"
 
-            # --- Live Distance Measurement with Median Voting (When Back is in View) ---
-            # Operator adjusts part position; we collect a rolling buffer of readings
-            # and use the median to pick the stable, settled value.
-            back_visible = is_back_in_view or (back_box is not None) or any(d["class_name"] in BACK_CLASSES or d["class_name"] in BACK_DEFECT_CLASSES for d in new_detections)
+            # --- Live Distance Measurement with Median Voting (Only When Back Panel is Actually Detected) ---
+            # Wait until the back panel is physically in view and hands are clear before measuring distance.
+            actual_back_detected = (back_box is not None) or raw_back_detected or has_back_detected or any(d["class_name"] in BACK_CLASSES or d["class_name"] in BACK_DEFECT_CLASSES for d in new_detections)
+            back_visible_for_gauge = (
+                actual_back_detected
+                and (current_state in ["WAITING_BACK", "WAITING_REMOVE"])
+                and not raw_front_detected
+                and not has_front_detected
+                and not raw_lock_striker_detected
+                and not has_hand_detected
+            )
             gauge_enabled = APP_CONFIG.get("ai", {}).get("distance_measurement", {}).get("enabled", True)
             _gauge_vote_window = APP_CONFIG.get("ai", {}).get("distance_measurement", {}).get("vote_window", 10)
             now_t = time.time()
-            if back_visible and gauge_enabled and distance_gauge is not None and distance_gauge.is_valid:
+            if back_visible_for_gauge and gauge_enabled and distance_gauge is not None and distance_gauge.is_valid:
                 dist_result = distance_gauge.measure(frame_to_process, back_box=back_box)
                 with lock:
                     if dist_result.get("mm") is not None:
@@ -3198,8 +3237,12 @@ def yolo_worker_loop():
                         _dev = round(_median_mm - _nominal, 2)
                         _passed = abs(_dev) <= _tolerance
                         _status = "OK" if _passed else "NG"
-                        stable_dist = {"mm": round(_median_mm, 2), "dev": _dev, "passed": _passed, "status": _status,
-                                       "pt_A": dist_result["pt_A"], "pt_B": dist_result["pt_B"]}
+                        stable_dist = {
+                            "mm": round(_median_mm, 2), "dev": _dev, "passed": _passed, "status": _status,
+                            "pt_A": dist_result["pt_A"], "pt_B": dist_result["pt_B"],
+                            "ref_w": dist_result.get("ref_w", distance_gauge.ref_w),
+                            "ref_h": dist_result.get("ref_h", distance_gauge.ref_h)
+                        }
                         latest_distance_result = stable_dist
                         active_cycle_data["last_distance_result"] = stable_dist
                         active_cycle_data["distance_hold_until"] = now_t + 1.2
@@ -3220,7 +3263,14 @@ def yolo_worker_loop():
                                         active_cycle_data["defects_detected"].discard(_d)
                     elif now_t > active_cycle_data.get("distance_hold_until", 0):
                         current_cycle["distance_status"] = "NOT_FOUND"
-            elif not back_visible and raw_front_detected:
+            elif current_state == "WAITING_BACK" and not actual_back_detected:
+                with lock:
+                    latest_distance_result = None
+                    active_cycle_data["distance_vote_buffer"] = []
+                    current_cycle["distance_status"] = "Pending"
+                    current_cycle["distance_mm"] = None
+                    current_cycle["distance_dev"] = None
+            elif not back_visible_for_gauge and raw_front_detected:
                 with lock:
                     latest_distance_result = None
                     active_cycle_data["distance_vote_buffer"] = []  # Reset buffer when part removed
@@ -3350,6 +3400,7 @@ def yolo_worker_loop():
             _do_back_write = False
             _back_capture_frame = None
             _back_capture_folder = None
+            _back_capture_box = None
             _back_save_debug_raw = False
             _back_unenhanced = None
             _back_finalize_data = None
@@ -3532,6 +3583,13 @@ def yolo_worker_loop():
                     
                     if ls_saved:
                         active_cycle_data["state"] = "WAITING_BACK"
+                        active_cycle_data["distance_vote_buffer"] = []
+                        active_cycle_data["last_distance_result"] = None
+                        latest_distance_result = None
+                        current_cycle["distance_status"] = "Pending"
+                        current_cycle["distance_mm"] = None
+                        current_cycle["distance_dev"] = None
+                        active_cycle_data["waiting_back_entered_time"] = time.time()
                     elif ls_in_frame:
                         active_cycle_data["ls_missing_frames"] = 0
                         # Operator naturally holds the lock striker by hand to present it to the camera;
@@ -3562,6 +3620,13 @@ def yolo_worker_loop():
                             active_cycle_data["defects_detected"].discard("missing_lock_striker")
                             active_cycle_data["ls_first_seen_time"] = None
                             active_cycle_data["state"] = "WAITING_BACK"
+                            active_cycle_data["distance_vote_buffer"] = []
+                            active_cycle_data["last_distance_result"] = None
+                            latest_distance_result = None
+                            current_cycle["distance_status"] = "Pending"
+                            current_cycle["distance_mm"] = None
+                            current_cycle["distance_dev"] = None
+                            active_cycle_data["waiting_back_entered_time"] = time.time()
                     elif (raw_back_detected or back_box is not None):
                         # Operator showed Back Side without presenting Lock Striker!
                         if active_cycle_data.get("ls_skip_start_time") is None:
@@ -3577,6 +3642,13 @@ def yolo_worker_loop():
                             active_cycle_data["flash_end_time"] = time.time() + 2.0
                             active_cycle_data["flash_message"] = "LOCK STRIKER NG: MISSING"
                             active_cycle_data["state"] = "WAITING_BACK"
+                            active_cycle_data["distance_vote_buffer"] = []
+                            active_cycle_data["last_distance_result"] = None
+                            latest_distance_result = None
+                            current_cycle["distance_status"] = "Pending"
+                            current_cycle["distance_mm"] = None
+                            current_cycle["distance_dev"] = None
+                            active_cycle_data["waiting_back_entered_time"] = time.time()
                             logger.info("[Lock Striker] Lock striker skipped by operator — flagged missing_lock_striker (NG) and transitioned to WAITING_BACK")
                         else:
                             current_cycle["status"] = "Waiting for Lock Striker (Lock Striker required first)"
@@ -3663,11 +3735,19 @@ def yolo_worker_loop():
                                 active_cycle_data["defects_detected"].add("serial_missing")
                                 current_cycle["serial"] = "SERIAL MISSING" 
 
-                        if not hand_warning and not has_hand_detected and (ocr_done or ocr_timeout) and time_stable >= 0.5:
+                        BACK_SETTLE_DELAY = 3.0
+                        if time_stable < BACK_SETTLE_DELAY:
+                            rem = max(0.0, BACK_SETTLE_DELAY - time_stable)
+                            if not hand_warning and not has_hand_detected:
+                                current_cycle["instruction"] = f"HOLD BACK PANEL STEADY ({rem:.1f}s)..."
+                                current_cycle["instruction_color"] = "blue"
+
+                        if not hand_warning and not has_hand_detected and (ocr_done or ocr_timeout) and time_stable >= BACK_SETTLE_DELAY:
                             # --- Capture back image while part is present on the table ---
                             _do_back_write = True
                             _back_capture_frame = frame_to_process.copy()
                             _back_capture_folder = active_cycle_data["temp_folder"]
+                            _back_capture_box = back_box
                             _back_save_debug_raw = active_cycle_data.get("save_debug_raw", False) or APP_CONFIG.get("storage", {}).get("save_debug_raw", False)
                             _back_unenhanced = latest_unenhanced_frame.copy() if latest_unenhanced_frame is not None else None
                             _back_finalize_data = active_cycle_data
@@ -3681,7 +3761,9 @@ def yolo_worker_loop():
                             # Go straight to finalization
                             active_cycle_data["state"] = "WAITING_REMOVE"
                         else:
-                            current_cycle["instruction"] = "DETECTING SERIAL NUMBER..."
+                            if time_stable >= BACK_SETTLE_DELAY and not (ocr_done or ocr_timeout):
+                                current_cycle["instruction"] = "DETECTING SERIAL NUMBER..."
+                                current_cycle["instruction_color"] = "blue"
                             active_cycle_data["back_frames_count"] = 1
                     else:
                         active_cycle_data["back_frames_count"] = 0
@@ -3897,9 +3979,27 @@ def yolo_worker_loop():
                     # Stamp distance measurement overlay on saved back frame if available
                     back_to_save = _back_capture_frame.copy()
                     if distance_gauge is not None and distance_gauge.is_valid:
-                        final_dist = distance_gauge.measure(back_to_save, back_box=None)
-                        if final_dist.get("pt_A") is not None:
+                        final_dist = distance_gauge.measure(back_to_save, back_box=_back_capture_box)
+                        if (final_dist.get("pt_A") is None or final_dist.get("pt_B") is None) and latest_distance_result is not None:
+                            final_dist = latest_distance_result
+                            logger.info("[Back Capture] Fallback to latest_distance_result for distance visual overlay")
+                        if final_dist.get("pt_A") is not None and final_dist.get("pt_B") is not None:
                             distance_gauge.draw_overlay(back_to_save, final_dist, scale=1.0)
+                            logger.info(f"[Back Capture] Stamped distance overlay on back.jpg: {final_dist.get('mm')}mm (dev: {final_dist.get('dev')})")
+                        else:
+                            logger.warning("[Back Capture] Reference points pt_A/pt_B not found; overlay not drawn")
+                        
+                        # CRITICAL: Propagate final measurement result to cycle data so finalizer knows the verdict!
+                        if _back_finalize_data is not None and final_dist.get("mm") is not None:
+                            _back_finalize_data["back_distance_mm"] = final_dist.get("mm")
+                            _back_finalize_data["back_distance_passed"] = final_dist.get("passed")
+                            _back_finalize_data["last_distance_result"] = final_dist
+                            if final_dist.get("passed") is True:
+                                _back_finalize_data.get("defects_detected", set()).discard("dimension_out_of_spec")
+                                _back_finalize_data.get("defects_detected", set()).discard("dimension_not_found")
+                                for _d in list(_back_finalize_data.get("defects_detected", set())):
+                                    if "dimension" in _d:
+                                        _back_finalize_data["defects_detected"].discard(_d)
                     cv2.imwrite(back_file, back_to_save, [cv2.IMWRITE_JPEG_QUALITY, 95])
                     with lock:
                         if _back_finalize_data is not None:

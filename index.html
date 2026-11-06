@@ -1094,6 +1094,10 @@
                         <span style="color: var(--text-muted); font-size: 11px;">Striker (Target: 2):</span>
                         <span id="ui-striker-count" style="font-weight: 700; font-size: 12px; color: var(--text-main);">0 / 2</span>
                     </div>
+                    <div id="ui-punch-mark-row" style="display: none; justify-content: space-between; align-items: center; background: rgba(239, 68, 68, 0.08); padding: 3px 6px; border-radius: 4px; border: 1px solid rgba(239, 68, 68, 0.3);">
+                        <span style="color: var(--accent-red); font-size: 11px; font-weight: 600;">Punch Mark (Defect):</span>
+                        <span id="ui-punch-mark-val" style="font-weight: 700; font-size: 11px; color: var(--accent-red);">NG DETECTED</span>
+                    </div>
 
                     <div style="font-weight: 600; font-size: 11px; margin-top: 4px; color: var(--text-muted); border-bottom: 1px solid #e2e8f0; padding-bottom: 4px;">BACK PANEL</div>
                     <div id="ui-holes-row" style="display: none; justify-content: space-between; align-items: center;">
@@ -1809,12 +1813,21 @@
                 backhookEl.textContent = (data.back_hook_count !== undefined ? data.back_hook_count : 0) + ' / 2';
                 lockstrikerEl.textContent = (data.lock_striker_count !== undefined ? data.lock_striker_count : 0) + ' / 1';
                 
+                const punchMarkRow = document.getElementById('ui-punch-mark-row');
+                if (punchMarkRow) {
+                    if (data.defects && (data.defects.includes('punch_mark') || data.defects.includes('punchmark'))) {
+                        punchMarkRow.style.display = 'flex';
+                    } else {
+                        punchMarkRow.style.display = 'none';
+                    }
+                }
+                
                 const warningEl = document.getElementById('ui-defect-warning');
                 const defectsSection = document.getElementById('defects-section');
                 let warningMessages = [];
                 
                 if (data.defects) {
-                    const knownDefects = ['missing_holes', 'missing_ring_bush', 'missing_rod', 'missing_striker', 'missing_back_hook', 'missing_lock_striker', 'dent', 'bulge', 'buldge', 'line_mark', 'linemark', 'line-mark', 'damage', 'frame_damage', 'defect', 'hole_spec_error', 'back_hook_bend', 'lock_striker_bend', 'striker_bend', 'serial_missing'];
+                    const knownDefects = ['missing_holes', 'missing_ring_bush', 'missing_rod', 'missing_striker', 'missing_back_hook', 'missing_lock_striker', 'dent', 'bulge', 'buldge', 'line_mark', 'linemark', 'line-mark', 'damage', 'frame_damage', 'defect', 'hole_spec_error', 'back_hook_bend', 'lock_striker_bend', 'striker_bend', 'punch_mark', 'punchmark', 'serial_missing'];
                     const checkHoles = window.appUiConfig && window.appUiConfig.check_missing_holes;
                     if (checkHoles && data.defects.includes('missing_holes')) warningMessages.push("MISSING HOLES");
                     if (data.defects.includes('missing_ring_bush') || data.defects.includes('missing_rod')) warningMessages.push("MISSING RING BUSH");
@@ -1830,6 +1843,7 @@
                     if (data.defects.includes('back_hook_bend')) warningMessages.push("BACK HOOK BEND");
                     if (data.defects.includes('lock_striker_bend')) warningMessages.push("LOCK STRIKER BEND");
                     if (data.defects.includes('striker_bend')) warningMessages.push("STRIKER BEND");
+                    if (data.defects.includes('punch_mark') || data.defects.includes('punchmark')) warningMessages.push("PUNCH MARK DETECTED");
                     if (data.defects.includes('serial_missing')) warningMessages.push("SERIAL MISSING");
                     
                     data.defects.forEach(defect => {

@@ -3,7 +3,9 @@
 # --- AI & Vision Settings ---
 ai:
   # Path to the trained YOLO model
-  model_path: "SHI_FURL-DOOR_YOLOv8-MODEL.pt"
+  model_path: "SHI_furl_door_05-11-2026-YOLOv8-model.pt"
+  # YOLO inference image resolution (model native training resolution: 1024)
+  inference_imgsz: 1024
   # Confidence threshold for detecting the OCR target regions (serial, back, etc.)
   ocr_confidence_threshold: 0.10
   # Fallback timeout (in seconds) before attempting to read the back panel if serial is missing
@@ -24,10 +26,11 @@ ai:
     ring_bush: 0.20          # Ring bush component
     striker: 0.25            # Striker component (ensures both strikers detected)
     striker_bend: 0.45       # Striker bend defect
-    buldge: 0.10             # Surface bulge defect
-    dent: 0.10               # Surface dent defect
-    defect: 0.10             # General defect
+    buldge: 0.5             # Surface bulge defect
+    dent: 0.5               # Surface dent defect
+    defect: 0.5             # General defect
     frame_damage: 0.45       # Frame damage defect
+    punch_mark: 0.5         # Punch mark defect
     hand: 0.25               # Hand detection (avoids false hand alarms)
   # Minimum bounding box area (in pixels) for a defect to be considered valid to prevent false positives quickly
   min_defect_area: 50

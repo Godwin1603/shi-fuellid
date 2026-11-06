@@ -329,7 +329,7 @@ def create_inspection_report(
     st_ok = ("missing_striker" not in defects_set and striker_cnt >= 2)
     st_detail = f"{striker_cnt} / 2 Detected" if st_ok else f"Missing Striker ({striker_cnt} / 2 Detected)"
     
-    front_defects_found = [d for d in defects_set if d in {"dent", "bulge", "buldge", "line_mark", "linemark", "line-mark", "damage", "defect", "striker_bend"}]
+    front_defects_found = [d for d in defects_set if d in {"dent", "bulge", "buldge", "line_mark", "linemark", "line-mark", "damage", "defect", "striker_bend", "punch_mark", "punchmark"}]
     surf_ok = (len(front_defects_found) == 0)
     surf_detail = "Clean — No Dent, Bulge, Line Mark, or Damage" if surf_ok else f"Defect Detected: {', '.join(d.replace('_', ' ').title() for d in front_defects_found)}"
 
